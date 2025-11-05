@@ -20,7 +20,7 @@ query {
     walkReluctance: 2.0
     walkSpeed: 1.3
     numItineraries: 3
-    date: "2025-10-30T08:00:00+01:00"
+    date: "2025-10-6T08:00:00+01:00"
   ) {
     itineraries {
       duration
