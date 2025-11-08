@@ -12,7 +12,7 @@ query {
 
   plan(
     from: { lat: 39.22294897283518, lon: 9.114625009108789 }
-    to: { lat: 39.23002781302833 , lon: 9.107288497834322 }
+    to: { lat: 39.2312824 , lon: 9.0945547 }
     transportModes: [
       { mode: WALK }
       { mode: BUS }
@@ -124,3 +124,15 @@ for leg in itinerary["legs"]:
 # Salva la mappa su file
 m.save("itinerario_otp2.html")
 print("✅ Mappa salvata come 'itinerario_otp2.html'")
+
+# Recupero codice geometria percorso
+
+geometry_code = leg['legGeometry']['points']
+
+print(geometry_code)
+
+# Decodifico tutti i punti del percorso (itinerario)
+
+punti_percorso = polyline.decode(geometry_code)
+
+print(punti_percorso)

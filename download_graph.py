@@ -78,7 +78,7 @@ grafo_distanza = ox.graph_from_point(center_point, dist=1000, network_type='walk
 
 """ ox.plot_graph(
     grafo_distanza,
-    bgcolor='yellow',
+    bgcolor='blue',
     edge_color='black',
     node_color = 'black',
     edge_linewidth=0.6,
@@ -120,3 +120,4 @@ route_length_m = nx.shortest_path_length(grafo_distanza, nodo_origine, nodo_dest
 print(f"Shortest road distance: {route_length_m/1000:.2f} km")
 
 ox.plot_graph_route(grafo_distanza, route, bgcolor='black', edge_color='white', route_color='yellow', node_size=0, edge_linewidth=0.6, route_linewidth=3)
+print(first_place_geocode)
