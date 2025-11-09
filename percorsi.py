@@ -39,6 +39,14 @@ poi = ox.features_from_place(
     }
 )
 
+restaurant = ox.features_from_place(
+    PLACE_NAME,
+    {
+        'amenity' : 'restaurant'
+    }
+)
+
+print(restaurant["name"])
 # Seleziono un POI casuale per calcolare 3 tipi di percorso
 # 1. WALK
 # 2. DRIVE
@@ -47,7 +55,7 @@ poi = ox.features_from_place(
 # Punto di partenza casuale: lat: 39.22294897283518, lon: 9.114625009108789
 
 first_place = (39.22294897283518, 9.114625009108789)
-destination_poi = "La Balena"
+destination_poi = "Niu Nervi"
 destination = ox.geocode(destination_poi)
 print(destination)
 
@@ -58,48 +66,46 @@ if network_t == 'bus':
 
     query = f"""
     query {{
-
-    plan(
-        from: {{ lat: {first_place[0]}, lon: {first_place[1]} }}
-        to: {{ lat: {destination[0]}, lon: {destination[1]} }}
-        transportModes: [
-        {{ mode: WALK }}
-        {{ mode: BUS }}
-        ]
-        walkReluctance: 2.0
-        walkSpeed: 1.3
-        numItineraries: 3
-        date: "2025-10-6T08:00:00+01:00"
-    ) {{
-        itineraries {{
-        duration
-        walkDistance
-        legs {{
-            mode
-            startTime
-            endTime
-            from {{
-            name
-            lat
-            lon
-            }}
-            to {{
-            name
-            lat
-            lon
-            }}
-            route {{
-            shortName
-            longName
-            }}
-            distance
-            legGeometry {{
-            points
+        plan(
+            from: {{ lat: {first_place[0]}, lon: {first_place[1]} }}
+            to: {{ lat: {destination[0]}, lon: {destination[1]} }}
+            transportModes: [
+                {{ mode: WALK }}
+                {{ mode: BUS }}
+            ]
+            walkReluctance: 2.0
+            walkSpeed: 1.3
+            numItineraries: 3
+            date: "2025-11-09T12:15:00+01:00"
+        ) {{
+            itineraries {{
+                duration
+                walkDistance
+                legs {{
+                    mode
+                    startTime
+                    endTime
+                    from {{
+                        name
+                        lat
+                        lon
+                    }}
+                    to {{
+                        name
+                        lat
+                        lon
+                    }}
+                    route {{
+                        shortName
+                        longName
+                    }}
+                    distance
+                    legGeometry {{
+                        points
+                    }}
+                }}
             }}
         }}
-        }}
-    }}
-
     }}
     """
 
@@ -126,61 +132,80 @@ if network_t == 'bus':
     # 🔹 Seleziona l’itinerario più veloce
     itinerary = min(itineraries, key=lambda i: i["duration"])
 
-    print(f"Itinerario selezionato: durata {itinerary['duration']} secondi, "
-      f"camminata {itinerary['walkDistance']} metri")
-    
-    
-    # Recupero codice geometria percorso
+    print(f"Itinerario selezionato: durata {itinerary['duration']} s, camminata {itinerary['walkDistance']} m")
 
+    # Unisci tutte le polilinee OTP in un’unica lista di coordinate (lat, lon)
     full_route_coords = []
+    for leg in itinerary["legs"]:
+        geometry = leg["legGeometry"]["points"]
+        coords = polyline.decode(geometry)
+        full_route_coords.extend(coords)
 
-    for leg in itinerary['legs']:
-        # decodifica la polyline del leg
-        coords = polyline.decode(leg['legGeometry']['points'])
-        full_route_coords.extend(coords)  # aggiunge tutte le coordinate alla lista completa
-
+    print("GEOMETRIA: ", geometry)
     print("Numero totale di punti nel percorso:", len(full_route_coords))
 
-    route_nodes = []
-    for lat, lon in full_route_coords:
-        node = ox.distance.nearest_nodes(network_graph, X=lon, Y=lat)
-        route_nodes.append(node)
-
-    full_graph_route = []
-    for i in range(len(route_nodes) - 1):
-        # percorso più breve tra nodo i e nodo i+1
-        path = nx.shortest_path(network_graph, route_nodes[i], route_nodes[i+1], weight='length')
-        # aggiungi path al percorso finale (attenzione a non duplicare nodi)
-        if full_graph_route:
-            full_graph_route.extend(path[1:])
-        else:
-            full_graph_route.extend(path)
-    
-    fig, ax = ox.plot_graph_route(
-        network_graph,
-        full_graph_route,
-        route_color='yellow',
-        route_linewidth=3,
+   # 🔹 1️⃣ Plotta il grafo di OSM come sfondo
+    fig, ax = ox.plot_graph(
+        graph,
+        bgcolor="black",
+        edge_color="white",
         node_size=0,
-        edge_linewidth=0.6,
-        bgcolor='black',
+        edge_linewidth=0.5,
         show=False,
         close=False
     )
 
-    # Se vuoi, evidenzia partenza e arrivo
-    origin_node = route_nodes[0]
-    destination_node = route_nodes[-1]
-    # Recupera coordinate dei nodi origine e destinazione
-    origin_x, origin_y = network_graph.nodes[origin_node]['x'], network_graph.nodes[origin_node]['y']
-    dest_x, dest_y     = network_graph.nodes[destination_node]['x'], network_graph.nodes[destination_node]['y']
+    # 🔹 Mappa colori per ogni tipo di trasporto
+    mode_colors = {
+        "WALK": "cyan",
+        "BUS": "orange",
+        "TRAM": "cyan",
+        "RAIL": "blue",
+        "CAR": "red"
+    }
 
-    # Aggiungi marker personalizzati con matplotlib directly
-    ax.scatter(origin_x, origin_y, c='lime', s=100, marker='o', label='Origine', zorder=5)
-    ax.scatter(dest_x, dest_y,     c='red',  s=100, marker='o', label='Destinazione', zorder=5)
+    # 🔹 2️⃣ Disegna ogni tratto (leg) con colore diverso
+    for leg in itinerary["legs"]:
+        geometry = leg["legGeometry"]["points"]
+        coords = polyline.decode(geometry)
+        lats, lons = zip(*coords)
 
-    ax.legend(facecolor='black', labelcolor='white')
-    plt.show()
+        mode = leg["mode"]
+        color = mode_colors.get(mode, "white")
+
+        # 🔸 Costruisci label più informativa
+        label = mode
+        if leg.get("route"):
+            route = leg["route"]
+            short = route.get("shortName", "")
+            long = route.get("longName", "")
+            if short or long:
+                label += f" ({short} - {long})"
+
+        ax.plot(
+            lons,
+            lats,
+            color=color,
+            linewidth=3,
+            label=label,
+            zorder=5
+        )
+
+    # 🔹 3️⃣ Aggiungi marker per partenza e arrivo
+    ax.scatter(first_place[1], first_place[0], c='lime', s=100, marker='o', label='Origine', zorder=6)
+    ax.scatter(destination[1], destination[0], c='red', s=100, marker='o', label='Destinazione', zorder=6)
+
+    # 🔹 4️⃣ Legenda pulita e leggibile
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))  # elimina duplicati
+    ax.legend(
+        by_label.values(),
+        by_label.keys(),
+        facecolor='black',
+        labelcolor='white',
+        loc='lower left'
+    )
+
     plt.show()
 else:
     # Recupero punto mediano tra origine e destinazione e scarico la rete

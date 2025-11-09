@@ -12,7 +12,7 @@ query {
 
   plan(
     from: { lat: 39.22294897283518, lon: 9.114625009108789 }
-    to: { lat: 39.2312824 , lon: 9.0945547 }
+    to: { lat: 39.2012865 , lon: 9.1285401 }
     transportModes: [
       { mode: WALK }
       { mode: BUS }
@@ -20,7 +20,7 @@ query {
     walkReluctance: 2.0
     walkSpeed: 1.3
     numItineraries: 3
-    date: "2025-10-6T08:00:00+01:00"
+    date: "2025-11-9T12:15:00+01:00"
   ) {
     itineraries {
       duration
@@ -92,11 +92,11 @@ folium.Marker(
     icon=folium.Icon(color="green", icon="play")
 ).add_to(m)
 
-end_lat = 39.23002781302833
-end_lon = 9.107288497834322
+end_lat = 39.2012865 
+end_lon = 9.1285401
 folium.Marker(
     [end_lat, end_lon],
-    popup="Arrivo, Biblioteca Ingegneria",
+    popup="Arrivo",
     icon=folium.Icon(color="red", icon="stop")
 ).add_to(m)
 
@@ -135,4 +135,4 @@ print(geometry_code)
 
 punti_percorso = polyline.decode(geometry_code)
 
-print(punti_percorso)
+print(geometry_code)
