@@ -60,7 +60,7 @@ destination = ox.geocode(destination_poi)
 print(destination)
 
 # Scelgo rete da utilizzare
-network_t = 'bus'
+network_t = 'drive'
 
 if network_t == 'bus':
 
