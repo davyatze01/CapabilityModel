@@ -38,15 +38,6 @@ poi = ox.features_from_place(
         'amenity' : True
     }
 )
-
-restaurant = ox.features_from_place(
-    PLACE_NAME,
-    {
-        'amenity' : 'restaurant'
-    }
-)
-
-print(restaurant["name"])
 # Seleziono un POI casuale per calcolare 3 tipi di percorso
 # 1. WALK
 # 2. DRIVE
@@ -54,13 +45,13 @@ print(restaurant["name"])
 
 # Punto di partenza casuale: lat: 39.22294897283518, lon: 9.114625009108789
 
-first_place = (39.22294897283518, 9.114625009108789)
+first_place = (39.22231439353061, 9.113848879825527)
 destination_poi = "Niu Nervi"
 destination = ox.geocode(destination_poi)
 print(destination)
 
 # Scelgo rete da utilizzare
-network_t = 'drive'
+network_t = 'bus'
 
 if network_t == 'bus':
 
@@ -214,7 +205,9 @@ else:
         (first_place[1] + destination[1]) / 2
     )
 
-    network_graph = ox.graph_from_point(center_point, dist=1000,network_type=network_t)
+    print("Scarico grafo...")
+    network_graph = ox.graph_from_point(center_point, dist=10000,network_type=network_t)
+    print("Grafo scaricato!")
 
     origin_node = ox.distance.nearest_nodes(network_graph, first_place[1], first_place[0])
     destination_node = ox.distance.nearest_nodes(network_graph, destination[1], destination[0])
