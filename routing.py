@@ -7,6 +7,10 @@ import matplotlib.pyplot as plt
 import requests
 import json
 import polyline
+from datetime import datetime
+
+def format_time(timestamp_ms):
+    return datetime.fromtimestamp(timestamp_ms / 1000).strftime("%H:%M")
 
 shutup.please()
 
@@ -39,9 +43,9 @@ poi = ox.features_from_place(
     }
 )
 # Seleziono un POI casuale per calcolare 3 tipi di percorso
-# 1. WALK
-# 2. DRIVE
-# 3. BUS
+# 1. walk
+# 2. drive
+# 3. bus
 
 # Punto di partenza casuale: lat: 39.22294897283518, lon: 9.114625009108789
 
@@ -67,7 +71,7 @@ if network_t == 'bus':
             walkReluctance: 2.0
             walkSpeed: 1.3
             numItineraries: 3
-            date: "2025-11-09T12:15:00+01:00"
+            date: "2025-11-12T19:30:00+01:00"
         ) {{
             itineraries {{
                 duration
@@ -163,16 +167,19 @@ if network_t == 'bus':
 
         mode = leg["mode"]
         color = mode_colors.get(mode, "white")
-
+        departure_t = format_time(leg.get("startTime", ""))
+        arrive_t = format_time(leg.get("endTime", ""))
         # 🔸 Costruisci label più informativa
-        label = mode
+        label = ""
         if leg.get("route"):
             route = leg["route"]
             short = route.get("shortName", "")
             long = route.get("longName", "")
-            if short or long:
-                label += f" ({short} - {long})"
 
+            if short or long:
+                label += f"{short} Partenza: {departure_t} - Arrivo: {arrive_t}"
+        else:
+            label += mode + f" Partenza {departure_t} - Arrivo: {arrive_t}"
         ax.plot(
             lons,
             lats,
