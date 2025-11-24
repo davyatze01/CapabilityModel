@@ -131,6 +131,10 @@ if network_t == 'bus':
 
     # Unisci tutte le polilinee OTP in un’unica lista di coordinate (lat, lon)
     full_route_coords = []
+    # Array che contiene tutte le distanze di ogni percorso in pullman e attesa prima di prenderlo
+    full_route_distance = []
+    full_route_waiting = []
+
     for leg in itinerary["legs"]:
         geometry = leg["legGeometry"]["points"]
         coords = polyline.decode(geometry)
@@ -158,20 +162,29 @@ if network_t == 'bus':
         "RAIL": "blue",
         "CAR": "red"
     }
-
+    prec_leg = None
     # 🔹 2️⃣ Disegna ogni tratto (leg) con colore diverso
     for leg in itinerary["legs"]:
         geometry = leg["legGeometry"]["points"]
         coords = polyline.decode(geometry)
         lats, lons = zip(*coords)
-
+        
         mode = leg["mode"]
         color = mode_colors.get(mode, "white")
         departure_t = format_time(leg.get("startTime", ""))
         arrive_t = format_time(leg.get("endTime", ""))
+
+        waiting_time = None
         # 🔸 Costruisci label più informativa
         label = ""
         if leg.get("route"):
+            if leg.get("distance") :
+                full_route_distance.append(leg["distance"])
+            if prec_leg != None:
+                waiting_time = (leg["startTime"] - prec_leg)/60000
+            else:
+                waiting_time = 0
+            full_route_waiting.append(waiting_time)
             route = leg["route"]
             short = route.get("shortName", "")
             long = route.get("longName", "")
@@ -188,6 +201,7 @@ if network_t == 'bus':
             label=label,
             zorder=5
         )
+        prec_leg = leg["endTime"]
 
     # 🔹 3️⃣ Aggiungi marker per partenza e arrivo
     ax.scatter(first_place[1], first_place[0], c='lime', s=100, marker='o', label='Origine', zorder=6)
@@ -203,8 +217,26 @@ if network_t == 'bus':
         labelcolor='white',
         loc='lower left'
     )
-
+    print("DISTANCE = ", full_route_distance)
+    print("WAITING = ", full_route_waiting)
     plt.show()
+
+    #                  DISTANZA DA PUNTO X A Y IN BUS
+    # IMPEDANCE BUS =  ------------------------------  + (tempo di attesa alla fermata)
+    #                             10 km/h
+
+    
+    full_route_impedance = []
+    BUS_SPEED = 10
+    if len(full_route_distance) == len(full_route_waiting):
+        for i,distance in enumerate(full_route_distance):
+            distance = distance/1000
+            waiting = full_route_waiting[i]/60
+            impedance = (distance/BUS_SPEED)+waiting
+            full_route_impedance.append(impedance)
+
+    print("ALL IMPEDANCE:", full_route_impedance)
+    
 else:
     # Recupero punto mediano tra origine e destinazione e scarico la rete
     center_point = (
@@ -255,3 +287,6 @@ else:
 
     ax.legend(facecolor='black', labelcolor='white')
     plt.show()
+
+    
+
