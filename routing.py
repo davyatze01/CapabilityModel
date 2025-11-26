@@ -72,6 +72,7 @@ if network_t == 'bus':
             walkSpeed: 1.3
             numItineraries: 3
             date: "2025-11-12T19:30:00+01:00"
+            boardSlack: 180
         ) {{
             itineraries {{
                 duration
@@ -231,7 +232,7 @@ if network_t == 'bus':
     if len(full_route_distance) == len(full_route_waiting):
         for i,distance in enumerate(full_route_distance):
             distance = distance/1000
-            waiting = full_route_waiting[i]/60
+            waiting = full_route_waiting[i]
             impedance = (distance/BUS_SPEED)+waiting
             full_route_impedance.append(impedance)
 
