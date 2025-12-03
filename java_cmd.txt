@@ -1,0 +1,1 @@
+java -Xmx4G -jar otp-shaded-2.8.1.jar --build --serve otp-data

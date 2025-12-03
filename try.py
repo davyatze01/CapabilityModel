@@ -8,73 +8,76 @@ import requests
 import json
 import polyline
 from datetime import datetime
-from osmnx.routing import route_to_gdf
-
-
 
 def format_time(timestamp_ms):
     return datetime.fromtimestamp(timestamp_ms / 1000).strftime("%H:%M")
 
 shutup.please()
 
-# Nomi file
+# -----------------------------
+# Config
+# -----------------------------
 
 PLACE_NAME = "Cagliari, Sardinia, Italy"
 NAME_FILE = "graph/cagliari.graphml"
 
-# URL del server OTP2
+# URL del server OTP2 (GTFS GraphQL API)
 OTP_URL = "http://localhost:8080/otp/routers/default/index/graphql"
 
+# Data/ora da usare per la pianificazione (⚠︎ FORMATO CORRETTO)
+ROUTE_DATE = "2025-11-12"      # YYYY-MM-DD
+ROUTE_TIME = "19:30:00"        # hh:mm:ss
 
-# Se esiste lo carico altrimenti creo e salvo
+# Punto di partenza e destinazione
+first_place = (39.22231439353061, 9.113848879825527)
+destination_poi = "Niu Nervi"
+
+# -----------------------------
+# Carico / creo grafo OSM
+# -----------------------------
 
 if os.path.exists(NAME_FILE):
     graph = ox.io.load_graphml(NAME_FILE)
-
 else:
     graph = ox.graph_from_place(PLACE_NAME)
-    ox.io.save_graphml(graph,filepath = NAME_FILE)
+    ox.io.save_graphml(graph, filepath=NAME_FILE)
 
-# Genero la matrice del grafo
+# Matrice di adiacenza (non usata dopo ma la lascio perché magari ti serve)
 matrix_graph = nx.adjacency_matrix(graph)
 
-# Recupero i POI (Point Of Interest) del luogo
+# Recupero i POI (non strettamente necessario per la route, ma lo lascio)
 poi = ox.features_from_place(
     PLACE_NAME,
     {
-        'amenity' : True
+        'amenity': True
     }
 )
-# Seleziono un POI casuale per calcolare 3 tipi di percorso
-# 1. walk
-# 2. drive
-# 3. bus
 
-# Punto di partenza casuale: lat: 39.22294897283518, lon: 9.114625009108789
-
-first_place = (39.22231439353061, 9.113848879825527)
-destination_poi = "Niu Nervi"
+# Geocoding destinazione
 destination = ox.geocode(destination_poi)
-print(destination)
+print("DESTINAZIONE GEOCODIFICATA:", destination)
 
 # Scelgo rete da utilizzare
 network_t = 'bus'
 
 if network_t == 'bus':
-
+    # -----------------------------
+    # QUERY GRAPHQL CORRETTA PER OTP 2.8.x
+    # -----------------------------
     query = f"""
     query {{
         plan(
             from: {{ lat: {first_place[0]}, lon: {first_place[1]} }}
             to: {{ lat: {destination[0]}, lon: {destination[1]} }}
+            date: "{ROUTE_DATE}"
+            time: "{ROUTE_TIME}"
             transportModes: [
                 {{ mode: WALK }}
                 {{ mode: BUS }}
             ]
             walkReluctance: 2.0
-            walkSpeed: 5
+            walkSpeed: 1.3
             numItineraries: 3
-            date: "2025-11-12T19:30:00+01:00"
             boardSlack: 180
         ) {{
             itineraries {{
@@ -116,16 +119,27 @@ if network_t == 'bus':
     )
 
     if resp.status_code != 200:
-        print("Errore nella richiesta:", resp.status_code)
+        print("Errore nella richiesta HTTP:", resp.status_code)
         print(resp.text)
         exit()
 
     data = resp.json()
+    # Debug: se OTP torna errori GraphQL li vogliamo vedere
+    if "errors" in data:
+        print("ERRORI GRAPHQL RITORNATI DA OTP:")
+        print(json.dumps(data["errors"], indent=2, ensure_ascii=False))
 
-    # Estrai gli itinerari
-    itineraries = data.get("data", {}).get("plan", {}).get("itineraries", [])
+    plan = data.get("data", {}).get("plan")
+    if plan is None:
+        print("La chiave 'plan' è None. Controlla gli errori sopra (es. NO_TRANSIT_CONNECTION).")
+        exit()
+
+    itineraries = plan.get("itineraries", [])
     if not itineraries:
-        print("Nessun itinerario trovato.")
+        print("Nessun itinerario trovato. Probabili cause:")
+        print("- Nessun servizio bus alla data/ora specificata")
+        print("- GTFS non valido per quella data (feed fuori range)")
+        print("- Coordinate troppo lontane dalla rete di trasporto")
         exit()
 
     # 🔹 Seleziona l’itinerario più veloce
@@ -135,7 +149,8 @@ if network_t == 'bus':
 
     # Unisci tutte le polilinee OTP in un’unica lista di coordinate (lat, lon)
     full_route_coords = []
-    # Array che contiene tutte le distanze di ogni percorso in pullman e attesa prima di prenderlo
+    # Array che contiene tutte le distanze di ogni percorso in bus
+    # e il tempo di attesa prima di prenderlo
     full_route_distance = []
     full_route_waiting = []
 
@@ -144,10 +159,10 @@ if network_t == 'bus':
         coords = polyline.decode(geometry)
         full_route_coords.extend(coords)
 
-    print("GEOMETRIA: ", geometry)
+    print("GEOMETRIA ULTIMA LEG:", geometry)
     print("Numero totale di punti nel percorso:", len(full_route_coords))
 
-   # 🔹 1️⃣ Plotta il grafo di OSM come sfondo
+    # 🔹 1️⃣ Plotta il grafo di OSM come sfondo
     fig, ax = ox.plot_graph(
         graph,
         bgcolor="black",
@@ -166,29 +181,35 @@ if network_t == 'bus':
         "RAIL": "blue",
         "CAR": "red"
     }
-    prec_leg = None
+    prec_leg_end_time = None
+
     # 🔹 2️⃣ Disegna ogni tratto (leg) con colore diverso
     for leg in itinerary["legs"]:
         geometry = leg["legGeometry"]["points"]
         coords = polyline.decode(geometry)
         lats, lons = zip(*coords)
-        
+
         mode = leg["mode"]
         color = mode_colors.get(mode, "white")
-        departure_t = format_time(leg.get("startTime", ""))
-        arrive_t = format_time(leg.get("endTime", ""))
+        departure_t = format_time(leg.get("startTime", 0))
+        arrive_t = format_time(leg.get("endTime", 0))
 
         waiting_time = None
-        # 🔸 Costruisci label più informativa
         label = ""
+
+        # Se è una leg di trasporto pubblico, ha "route"
         if leg.get("route"):
-            if leg.get("distance") :
+            # distanza del tratto in metri
+            if leg.get("distance"):
                 full_route_distance.append(leg["distance"])
-            if prec_leg != None:
-                waiting_time = (leg["startTime"] - prec_leg)/60000
+
+            # tempo di attesa prima di questo mezzo (in minuti)
+            if prec_leg_end_time is not None:
+                waiting_time = (leg["startTime"] - prec_leg_end_time) / 60000.0
             else:
-                waiting_time = 0
+                waiting_time = 0.0
             full_route_waiting.append(waiting_time)
+
             route = leg["route"]
             short = route.get("shortName", "")
             long = route.get("longName", "")
@@ -196,7 +217,9 @@ if network_t == 'bus':
             if short or long:
                 label += f"{short} Partenza: {departure_t} - Arrivo: {arrive_t}"
         else:
+            # tratto a piedi ecc.
             label += mode + f" Partenza {departure_t} - Arrivo: {arrive_t}"
+
         ax.plot(
             lons,
             lats,
@@ -205,7 +228,7 @@ if network_t == 'bus':
             label=label,
             zorder=5
         )
-        prec_leg = leg["endTime"]
+        prec_leg_end_time = leg["endTime"]
 
     # 🔹 3️⃣ Aggiungi marker per partenza e arrivo
     ax.scatter(first_place[1], first_place[0], c='lime', s=100, marker='o', label='Origine', zorder=6)
@@ -221,63 +244,46 @@ if network_t == 'bus':
         labelcolor='white',
         loc='lower left'
     )
-    print("DISTANCE = ", full_route_distance)
-    print("WAITING = ", full_route_waiting)
+
+    print("DISTANCE (m) = ", full_route_distance)
+    print("WAITING (min) = ", full_route_waiting)
     plt.show()
 
     #                  DISTANZA DA PUNTO X A Y IN BUS
-    # IMPEDANCE BUS =  ------------------------------  + (tempo di attesa alla fermata)
+    # IMPEDANCE BUS =  ------------------------------  + (tempo di attesa alla fermata in ORE)
     #                             10 km/h
 
-    
     full_route_impedance = []
-    BUS_SPEED = 10
-    if len(full_route_distance) == len(full_route_waiting):
-        for i,distance in enumerate(full_route_distance):
-            distance = distance/1000
-            waiting = full_route_waiting[i]/60 # in ore
-            impedance = ((distance/BUS_SPEED)+waiting) * 60 # in minuti
-            full_route_impedance.append(impedance)
+    BUS_SPEED_KMH = 10
 
-    print("ALL IMPEDANCE:", full_route_impedance)
-    
+    if len(full_route_distance) == len(full_route_waiting):
+        for i, distance_m in enumerate(full_route_distance):
+            distance_km = distance_m / 1000.0
+            waiting_min = full_route_waiting[i]
+            # porto tutto in ore: distanza/velocità (ore) + attesa (min -> ore)
+            impedance_hours = (distance_km / BUS_SPEED_KMH) + (waiting_min / 60.0)
+            full_route_impedance.append(impedance_hours)
+
+    print("ALL IMPEDANCE (ore):", full_route_impedance)
+
 else:
-    # Recupero punto mediano tra origine e destinazione e scarico la rete
+    # -----------------------------
+    # Parte per walk/drive ecc. – invariata
+    # -----------------------------
     center_point = (
         (first_place[0] + destination[0]) / 2,
         (first_place[1] + destination[1]) / 2
     )
 
     print("Scarico grafo...")
-    network_graph = ox.graph_from_point(center_point, dist=10000,network_type=network_t)
+    network_graph = ox.graph_from_point(center_point, dist=10000, network_type=network_t)
     print("Grafo scaricato!")
 
     origin_node = ox.distance.nearest_nodes(network_graph, first_place[1], first_place[0])
     destination_node = ox.distance.nearest_nodes(network_graph, destination[1], destination[0])
 
-    # Usando il metodo 'shortest_path()' so trova la path piu breve basato sulla distanza tra origine e destinazione con dijkstra
     route = nx.shortest_path(network_graph, origin_node, destination_node, weight='length', method='dijkstra')
 
-    # Ottieni GeoDataFrame del percorso
-    gdf = route_to_gdf(network_graph, route)
-    route_length = gdf["length"].sum() / 1000
-
-    speed = None
-
-    if network_t == "walk":
-        speed = 5
-    elif network_t == "bike":
-        speed = 15
-    else: # network_t == "drive"
-        speed = 25
-    
-    impedance = (route_length / speed) * 60.0 # impedance in minuti
-
-    print("Route Length,", route_length)
-
-    print("Impedance in ",network_t + " :",impedance)
-    # Faccio il plot
-    # Plotta tutto il grafo
     fig, ax = ox.plot_graph(
         network_graph,
         bgcolor='black',
@@ -288,7 +294,6 @@ else:
         close=False
     )
 
-    # Poi traccia il percorso
     fig, ax = ox.plot_graph_route(
         network_graph,
         route,
@@ -299,15 +304,11 @@ else:
         close=False
     )
 
-    # Recupera coordinate dei nodi origine e destinazione
     origin_x, origin_y = network_graph.nodes[origin_node]['x'], network_graph.nodes[origin_node]['y']
-    dest_x, dest_y     = network_graph.nodes[destination_node]['x'], network_graph.nodes[destination_node]['y']
+    dest_x, dest_y = network_graph.nodes[destination_node]['x'], network_graph.nodes[destination_node]['y']
 
-    # Aggiungi marker personalizzati con matplotlib directly
     ax.scatter(origin_x, origin_y, c='lime', s=100, marker='o', label='Origine', zorder=5)
-    ax.scatter(dest_x, dest_y,     c='red',  s=100, marker='o', label='Destinazione', zorder=5)
+    ax.scatter(dest_x, dest_y, c='red', s=100, marker='o', label='Destinazione', zorder=5)
 
     ax.legend(facecolor='black', labelcolor='white')
     plt.show()
-
-
