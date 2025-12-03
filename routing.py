@@ -235,8 +235,8 @@ if network_t == 'bus':
     if len(full_route_distance) == len(full_route_waiting):
         for i,distance in enumerate(full_route_distance):
             distance = distance/1000
-            waiting = full_route_waiting[i]
-            impedance = (distance/BUS_SPEED)+waiting
+            waiting = full_route_waiting[i]/60 # in ore
+            impedance = ((distance/BUS_SPEED)+waiting) * 60 # in minuti
             full_route_impedance.append(impedance)
 
     print("ALL IMPEDANCE:", full_route_impedance)
@@ -271,7 +271,7 @@ else:
     else: # network_t == "drive"
         speed = 25
     
-    impedance = (route_length / speed) * 60.0
+    impedance = (route_length / speed) * 60.0 # impedance in minuti
 
     print("Route Length,", route_length)
 
