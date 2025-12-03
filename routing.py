@@ -8,6 +8,9 @@ import requests
 import json
 import polyline
 from datetime import datetime
+from osmnx.routing import route_to_gdf
+
+
 
 def format_time(timestamp_ms):
     return datetime.fromtimestamp(timestamp_ms / 1000).strftime("%H:%M")
@@ -55,7 +58,7 @@ destination = ox.geocode(destination_poi)
 print(destination)
 
 # Scelgo rete da utilizzare
-network_t = 'bus'
+network_t = 'drive'
 
 if network_t == 'bus':
 
@@ -255,6 +258,22 @@ else:
     # Usando il metodo 'shortest_path()' so trova la path piu breve basato sulla distanza tra origine e destinazione con dijkstra
     route = nx.shortest_path(network_graph, origin_node, destination_node, weight='length', method='dijkstra')
 
+    # Ottieni GeoDataFrame del percorso
+    gdf = route_to_gdf(network_graph, route)
+    route_length = gdf["length"].sum() / 1000
+
+    speed = None
+
+    if network_t == "walk":
+        speed = 5
+    else:
+        speed = 40
+    
+    impedance = route_length / speed
+
+    print("Route Length,", route_length)
+
+    print("Impedance in ",network_t + " :",impedance)
     # Faccio il plot
     # Plotta tutto il grafo
     fig, ax = ox.plot_graph(
