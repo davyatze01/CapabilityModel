@@ -58,7 +58,7 @@ destination = ox.geocode(destination_poi)
 print(destination)
 
 # Scelgo rete da utilizzare
-network_t = 'drive'
+network_t = 'bike'
 
 if network_t == 'bus':
 
@@ -266,10 +266,12 @@ else:
 
     if network_t == "walk":
         speed = 5
-    else:
-        speed = 40
+    elif network_t == "bike":
+        speed = 15
+    else: # network_t == "drive"
+        speed = 25
     
-    impedance = route_length / speed
+    impedance = (route_length / speed) * 60.0
 
     print("Route Length,", route_length)
 
