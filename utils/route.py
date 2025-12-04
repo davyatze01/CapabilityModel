@@ -124,7 +124,8 @@ def get_route(graph, network_type, origin, destination, impedance_flag = False):
             "BUS": "orange",
             "TRAM": "cyan",
             "RAIL": "blue",
-            "CAR": "red"
+            "CAR": "red",
+            "IMPEDANCE": "violet",
         }
         prec_leg = None
         # 🔹 2️⃣ Disegna ogni tratto (leg) con colore diverso
@@ -167,6 +168,11 @@ def get_route(graph, network_type, origin, destination, impedance_flag = False):
             )
             prec_leg = leg["endTime"]
 
+        if impedance_flag:
+            imped = impedance.impedance_bus(full_route_distance, full_route_waiting)
+            imp_label = "Impedance:\n" + "\n".join([f"{i}: {imp}" for i, imp in enumerate(imped)])
+            ax.scatter([], [], color="violet", label=imp_label)
+
         # 🔹 3️⃣ Aggiungi marker per partenza e arrivo
         ax.scatter(origin[1], origin[0], c='lime', s=100, marker='o', label='Origine', zorder=6)
         ax.scatter(destination[1], destination[0], c='red', s=100, marker='o', label='Destinazione', zorder=6)
@@ -183,10 +189,11 @@ def get_route(graph, network_type, origin, destination, impedance_flag = False):
         )
         #print("DISTANCE = ", full_route_distance)
         #print("WAITING = ", full_route_waiting)
+        fig.canvas.manager.set_window_title(f"{network_type}")
+
         plt.show()
 
-        if impedance_flag:
-            return impedance.impedance_bus(full_route_distance,full_route_waiting)
+        return imped
             
     else:
         # Recupero punto mediano tra origine e destinazione e scarico la rete
@@ -205,6 +212,16 @@ def get_route(graph, network_type, origin, destination, impedance_flag = False):
         # Usando il metodo 'shortest_path()' so trova la path piu breve basato sulla distanza tra origine e destinazione con dijkstra
         route = nx.shortest_path(network_graph, origin_node, destination_node, weight='length', method='dijkstra')
 
+        mode_colors = {
+            "walk": "cyan",
+            "drive": "red",
+            "bike": "yellow",
+            "IMPEDANCE": "violet",
+        }
+
+        color = mode_colors.get(network_type, "white")
+
+
         # Faccio il plot
         # Plotta tutto il grafo
         fig, ax = ox.plot_graph(
@@ -221,7 +238,7 @@ def get_route(graph, network_type, origin, destination, impedance_flag = False):
         fig, ax = ox.plot_graph_route(
             network_graph,
             route,
-            route_color='yellow',
+            route_color=color,
             route_linewidth=3,
             ax=ax,
             show=False,
@@ -236,8 +253,14 @@ def get_route(graph, network_type, origin, destination, impedance_flag = False):
         ax.scatter(origin_x, origin_y, c='lime', s=100, marker='o', label='Origine', zorder=5)
         ax.scatter(dest_x, dest_y,     c='red',  s=100, marker='o', label='Destinazione', zorder=5)
 
-        ax.legend(facecolor='black', labelcolor='white')
+        if impedance_flag:
+            imp_value = impedance.impedance_base(network_graph, route, network_type)
+            # Aggiungi voce invisibile in legenda
+            ax.scatter([], [], c='violet', label=f"Impedance: {imp_value}", marker='s')
 
+        ax.legend(facecolor='black', labelcolor='white', loc="lower right")
+
+        fig.canvas.manager.set_window_title(f"{network_type}")
         plt.show()
 
         if impedance_flag:
