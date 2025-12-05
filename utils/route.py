@@ -5,7 +5,7 @@ import osmnx as ox
 import networkx as nx
 from datetime import datetime
 import matplotlib.pyplot as plt
-from utils import impedance
+from utils import get_impedance
 from osmnx.routing import route_to_gdf
 
 def format_time(timestamp_ms):
@@ -128,31 +128,40 @@ def get_route(graph, network_type, origin, destination, impedance_flag = False):
             "IMPEDANCE": "violet",
         }
         prec_leg = None
+        impedance = []
         # 🔹 2️⃣ Disegna ogni tratto (leg) con colore diverso
         for leg in itinerary["legs"]:
             geometry = leg["legGeometry"]["points"]
             coords = polyline.decode(geometry)
             lats, lons = zip(*coords)
-            
+
             mode = leg["mode"]
             color = mode_colors.get(mode, "white")
             departure_t = format_time(leg.get("startTime", ""))
             arrive_t = format_time(leg.get("endTime", ""))
+            leg_distance = leg["distance"] / 1000
+            
 
-            waiting_time = None
+            #print("Leg distance =", leg_distance)
+
+            if impedance_flag and not(leg.get("route")):
+                impedance.append(get_impedance.impedance_base(leg_distance,"walk"))
+
             # 🔸 Costruisci label più informativa
             label = ""
             if leg.get("route"):
-                if leg.get("distance") :
-                    full_route_distance.append(leg["distance"])
+                route = leg["route"]
+                short = route.get("shortName", "")
+                long = route.get("longName", "")
+
+                waiting_time = None
                 if prec_leg != None:
                     waiting_time = (leg["startTime"] - prec_leg)/60000
                 else:
                     waiting_time = 0
-                full_route_waiting.append(waiting_time)
-                route = leg["route"]
-                short = route.get("shortName", "")
-                long = route.get("longName", "")
+
+                #Calcolo impedance in caso di bus
+                impedance.append(get_impedance.impedance_bus(leg_distance,waiting_time))
 
                 if short or long:
                     label += f"{short} Partenza: {departure_t} - Arrivo: {arrive_t}"
@@ -169,8 +178,7 @@ def get_route(graph, network_type, origin, destination, impedance_flag = False):
             prec_leg = leg["endTime"]
 
         if impedance_flag:
-            imped = impedance.impedance_bus(full_route_distance, full_route_waiting)
-            imp_label = "Impedance:\n" + "\n".join([f"{i}: {imp}" for i, imp in enumerate(imped)])
+            imp_label = "Impedance:\n" + "\n".join([f"{i}: {imp}" for i, imp in enumerate(impedance)])
             ax.scatter([], [], color="violet", label=imp_label)
 
         # 🔹 3️⃣ Aggiungi marker per partenza e arrivo
@@ -193,7 +201,7 @@ def get_route(graph, network_type, origin, destination, impedance_flag = False):
 
         plt.show()
 
-        return imped
+        return impedance
             
     else:
         # Recupero punto mediano tra origine e destinazione e scarico la rete
@@ -254,7 +262,11 @@ def get_route(graph, network_type, origin, destination, impedance_flag = False):
         ax.scatter(dest_x, dest_y,     c='red',  s=100, marker='o', label='Destinazione', zorder=5)
 
         if impedance_flag:
-            imp_value = impedance.impedance_base(network_graph, route, network_type)
+            # Ottieni GeoDataFrame del percorso
+            gdf = route_to_gdf(network_graph, route)
+            distance = gdf["length"].sum() / 1000
+
+            imp_value = get_impedance.impedance_base(distance, network_type)
             # Aggiungi voce invisibile in legenda
             ax.scatter([], [], c='violet', label=f"Impedance: {imp_value}", marker='s')
 
@@ -264,6 +276,6 @@ def get_route(graph, network_type, origin, destination, impedance_flag = False):
         plt.show()
 
         if impedance_flag:
-            return impedance.impedance_base(network_graph, route, network_type)
+            return imp_value
         
     
