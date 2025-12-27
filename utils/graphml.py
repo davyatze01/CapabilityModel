@@ -62,3 +62,29 @@ def print_poi(poi, print_start, print_end):
 
     for i, row in subset.iterrows():
         print(f"{i+1}: {row.get('name', 'Senza nome')}")
+
+
+def get_poi_names(poi):
+    return [
+        name for name in poi["name"].dropna().astype(str).values
+    ]
+
+def get_poi_geom(poi):
+    return [
+        geometry for geometry in poi["geometry"].dropna().astype(str).values
+    ]
+
+from shapely import wkt
+
+def geocode_from_geometry_str(geometry_str):
+    """
+    Converte una geometry WKT (stringa) in (lat, lon)
+    """
+    geom = wkt.loads(geometry_str)
+
+    if geom.geom_type != "Point":
+        raise ValueError(f"Geometry type non supportato: {geom.geom_type}")
+
+    lon, lat = geom.x, geom.y
+    return lat, lon
+
