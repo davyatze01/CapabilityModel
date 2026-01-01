@@ -89,26 +89,32 @@ def accessibility(poi_type, origine):
         save_rra(cache_file, RRA)
 
     RRA_desc = sorted(RRA, reverse=True)
+    print("RRA desc=", RRA_desc)
+    
+    def c_from_target(n_target: int, y_target: float) -> float:
+        if n_target <= 0:
+            raise ValueError("n_target must be > 0")
+        if not (0.0 < y_target < 1.0):
+            raise ValueError("y_target must be in (0, 1)")
+        return round(math.log(1.0 - y_target) / n_target, 2)  # negative
+
+    def g(x: int, c: float) -> float:
+        return 1.0 - math.exp(c * x)
+
+    def deltag(x: int, x2: int, c: float) -> float:
+        return g(x, c) - g(x2, c)
     
     accessibility = 0
-    c=0.1
+    c = c_from_target(n_target=2, y_target=0.6)
+
     for i,element in enumerate(RRA_desc):
         if i == 0:
-            accessibility += (element * g(element,c))
+            accessibility += (element * g(i+1, c))
         else:
-            accessibility += (element * deltag(element, RRA_desc[i-1],c))
+            accessibility += (element * deltag(i+1, i,c))
     
     print("Accessibility= ", accessibility)
     return accessibility
-
-
-def g(x, c):
-    return 1 - np.exp(c * x)
-
-
-def deltag(x, x2, c):
-    return g(x, c) - g(x2, c)
-
 
 def save_rra(path, RRA):
     with open(path, "wb") as f:
