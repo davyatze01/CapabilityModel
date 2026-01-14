@@ -76,13 +76,28 @@ def _can_use_base_graph(base_graph, network_type):
     return gtype == network_type
 
 
-def get_route(graph, network_type, origin, destination, impedance_flag=False, ax=None):
+def get_route(
+    graph,
+    network_type,
+    origin,
+    destination,
+    impedance_flag=False,
+    ax=None,
+    distance_only=False,
+    return_geometry=False,
+):
     """
     origin/destination: tuple (lat, lon)
 
     network_type:
       - 'bus' usa OTP2
       - 'walk' / 'drive' / 'bike' usa OSMnx + NetworkX (con cache per non riscaricare)
+
+    distance_only:
+      - True: non disegna nulla, ritorna solo impedenza/distanza
+
+    return_geometry:
+      - True: ritorna anche la geometria della strada (gdf) quando disponibile
     """
 
     # URL del server OTP2
@@ -92,11 +107,13 @@ def get_route(graph, network_type, origin, destination, impedance_flag=False, ax
     ROUTE_DATE = "2025-11-12"   # YYYY-MM-DD
     ROUTE_TIME = "19:30:00"     # hh:mm:ss
 
-    # Se ax non è creato lo creo
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(8, 8))
-    else:
-        fig = ax.figure
+    fig = None
+    if not distance_only:
+        # Se ax non è creato lo creo
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 8))
+        else:
+            fig = ax.figure
 
     # ==========================
     # CASO BUS (OTP2)
@@ -167,18 +184,20 @@ def get_route(graph, network_type, origin, destination, impedance_flag=False, ax
 
         # itinerario più veloce
         itinerary = min(itineraries, key=lambda i: i["duration"])
+        total_distance_m = sum(leg.get("distance", 0) for leg in itinerary["legs"])
 
-        # sfondo: grafo passato in input (es. il tuo graphml di Cagliari)
-        ox.plot_graph(
-            graph,
-            ax=ax,
-            bgcolor="black",
-            edge_color="black",
-            node_size=0,
-            edge_linewidth=0.5,
-            show=False,
-            close=False
-        )
+        if not distance_only:
+            # sfondo: grafo passato in input (es. il tuo graphml di Cagliari)
+            ox.plot_graph(
+                graph,
+                ax=ax,
+                bgcolor="black",
+                edge_color="black",
+                node_size=0,
+                edge_linewidth=0.5,
+                show=False,
+                close=False
+            )
 
         mode_colors = {
             "WALK": "cyan",
@@ -230,31 +249,37 @@ def get_route(graph, network_type, origin, destination, impedance_flag=False, ax
             else:
                 label = f"{mode} Partenza: {departure_t} - Arrivo: {arrive_t}"
 
-            ax.plot(lons, lats, color=color, linewidth=3, label=label, zorder=5)
+            if not distance_only:
+                ax.plot(lons, lats, color=color, linewidth=3, label=label, zorder=5)
             prec_leg_end_time = leg["endTime"]
 
-        if impedance_flag:
+        if impedance_flag and not distance_only:
             imp_label = "Impedance:\n" + "\n".join([f"{i}: {imp:.3f}" if isinstance(imp, (int, float)) else f"{i}: {imp}"
                                                     for i, imp in enumerate(impedance)])
             ax.scatter([], [], color="violet", label=imp_label)
 
-        ax.scatter(origin[1], origin[0], c="lime", s=100, marker="o", label="Origine", zorder=6)
-        ax.scatter(destination[1], destination[0], c="red", s=100, marker="o", label="Destinazione", zorder=6)
+        if not distance_only:
+            ax.scatter(origin[1], origin[0], c="lime", s=100, marker="o", label="Origine", zorder=6)
+            ax.scatter(destination[1], destination[0], c="red", s=100, marker="o", label="Destinazione", zorder=6)
 
-        handles, labels = ax.get_legend_handles_labels()
-        by_label = dict(zip(labels, handles))
-        ax.legend(
-            by_label.values(),
-            by_label.keys(),
-            facecolor="black",
-            labelcolor="white",
-            loc="lower left",
-            fontsize=7,
-            framealpha=0.9
-        )
+            handles, labels = ax.get_legend_handles_labels()
+            by_label = dict(zip(labels, handles))
+            ax.legend(
+                by_label.values(),
+                by_label.keys(),
+                facecolor="black",
+                labelcolor="white",
+                loc="lower left",
+                fontsize=7,
+                framealpha=0.9
+            )
 
-        ax.set_title("bus", color="white")
-        return fig, ax, (impedance if impedance_flag else None)
+            ax.set_title("bus", color="white")
+
+        result_value = impedance if impedance_flag else (total_distance_m if distance_only else None)
+        if return_geometry:
+            return fig, ax, result_value, None
+        return fig, ax, result_value
 
     # ==========================
     # CASO WALK/DRIVE/BIKE
@@ -275,13 +300,35 @@ def get_route(graph, network_type, origin, destination, impedance_flag=False, ax
     origin_node = ox.distance.nearest_nodes(network_graph, origin[1], origin[0])
     destination_node = ox.distance.nearest_nodes(network_graph, destination[1], destination[0])
 
-    route_nodes = nx.shortest_path(
-        network_graph,
-        origin_node,
-        destination_node,
-        weight="length",
-        method="dijkstra"
-    )
+    route_nodes = None
+    route_gdf = None
+    distance_m = None
+
+    if distance_only:
+        distance_m = nx.shortest_path_length(
+            network_graph,
+            origin_node,
+            destination_node,
+            weight="length",
+            method="dijkstra"
+        )
+        if return_geometry:
+            route_nodes = nx.shortest_path(
+                network_graph,
+                origin_node,
+                destination_node,
+                weight="length",
+                method="dijkstra"
+            )
+            route_gdf = route_to_gdf(network_graph, route_nodes)
+    else:
+        route_nodes = nx.shortest_path(
+            network_graph,
+            origin_node,
+            destination_node,
+            weight="length",
+            method="dijkstra"
+        )
 
     mode_colors = {
         "walk": "cyan",
@@ -291,43 +338,55 @@ def get_route(graph, network_type, origin, destination, impedance_flag=False, ax
     }
     color = mode_colors.get(network_type, "white")
 
-    # plot grafo + route
-    ox.plot_graph(
-        network_graph,
-        ax=ax,
-        bgcolor="black",
-        edge_color="black",
-        node_size=0,
-        edge_linewidth=0.6,
-        show=False,
-        close=False
-    )
+    if not distance_only:
+        # plot grafo + route
+        ox.plot_graph(
+            network_graph,
+            ax=ax,
+            bgcolor="black",
+            edge_color="black",
+            node_size=0,
+            edge_linewidth=0.6,
+            show=False,
+            close=False
+        )
 
-    ox.plot_graph_route(
-        network_graph,
-        route_nodes,
-        ax=ax,
-        route_color=color,
-        route_linewidth=3,
-        show=False,
-        close=False
-    )
+        ox.plot_graph_route(
+            network_graph,
+            route_nodes,
+            ax=ax,
+            route_color=color,
+            route_linewidth=3,
+            show=False,
+            close=False
+        )
 
-    # marker origine/destinazione
-    origin_x, origin_y = network_graph.nodes[origin_node]["x"], network_graph.nodes[origin_node]["y"]
-    dest_x, dest_y = network_graph.nodes[destination_node]["x"], network_graph.nodes[destination_node]["y"]
+        # marker origine/destinazione
+        origin_x, origin_y = network_graph.nodes[origin_node]["x"], network_graph.nodes[origin_node]["y"]
+        dest_x, dest_y = network_graph.nodes[destination_node]["x"], network_graph.nodes[destination_node]["y"]
 
-    ax.scatter(origin_x, origin_y, c="lime", s=100, marker="o", label="Origine", zorder=5)
-    ax.scatter(dest_x, dest_y, c="red", s=100, marker="o", label="Destinazione", zorder=5)
+        ax.scatter(origin_x, origin_y, c="lime", s=100, marker="o", label="Origine", zorder=5)
+        ax.scatter(dest_x, dest_y, c="red", s=100, marker="o", label="Destinazione", zorder=5)
 
     imp_value = None
     if impedance_flag:
-        gdf = route_to_gdf(network_graph, route_nodes)
-        distance_km = gdf["length"].sum() / 1000.0
+        if distance_m is None:
+            gdf = route_to_gdf(network_graph, route_nodes)
+            distance_km = gdf["length"].sum() / 1000.0
+        else:
+            distance_km = distance_m / 1000.0
         imp_value = get_impedance.impedance_base(distance_km, network_type)
-        ax.scatter([], [], c="violet", label=f"Impedance: {imp_value}", marker="s")
+        if not distance_only:
+            ax.scatter([], [], c="violet", label=f"Impedance: {imp_value}", marker="s")
 
-    ax.legend(facecolor="black", labelcolor="white", loc="lower right", fontsize=8, framealpha=0.9)
-    ax.set_title(network_type, color="white")
+    if not distance_only:
+        ax.legend(facecolor="black", labelcolor="white", loc="lower right", fontsize=8, framealpha=0.9)
+        ax.set_title(network_type, color="white")
 
-    return fig, ax, imp_value if impedance_flag else None
+    result_value = imp_value if impedance_flag else (distance_m if distance_only else None)
+
+    if return_geometry:
+        if route_gdf is None and route_nodes is not None:
+            route_gdf = route_to_gdf(network_graph, route_nodes)
+        return fig, ax, result_value, route_gdf
+    return fig, ax, result_value
