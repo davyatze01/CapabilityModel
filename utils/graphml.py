@@ -1,6 +1,7 @@
 import osmnx as ox
 import os
 import geopandas as gpd
+import pandas as pd
 
 
 def get_graph():
@@ -24,13 +25,41 @@ def get_graph():
 
     return graph
 
-def get_poi(feature,value):
+def get_poi(feature=None,value=None):
 
     # Nomi file
     PLACE_NAME = "Cagliari, Sardinia, Italy"
-    NAME_FILE = f"poi/{feature}_{value}.geojson"
 
     os.makedirs("poi", exist_ok=True)
+
+    if feature is None or value is None:
+        poi_files = [
+            os.path.join("poi", name)
+            for name in os.listdir("poi")
+            if name.lower().endswith(".geojson")
+        ]
+
+        if poi_files:
+            frames = []
+            for path in poi_files:
+                try:
+                    frames.append(gpd.read_file(path))
+                except Exception:
+                    continue
+
+            if frames:
+                poi = gpd.GeoDataFrame(
+                    pd.concat(frames, ignore_index=True),
+                    crs=frames[0].crs
+                )
+                print(f"POI caricati correttamente da {len(frames)} file in poi/")
+                return poi
+
+        # Fallback: scarica tutti gli amenity se non ci sono file locali
+        feature = "amenity"
+        value = True
+
+    NAME_FILE = f"poi/{feature}_{value}.geojson"
 
     try:
         # Provo a caricare i POI gia salvati
@@ -73,6 +102,16 @@ def get_poi_geom(poi):
     return [
         geometry for geometry in poi["geometry"].dropna().astype(str).values
     ]
+
+def get_poi_geometries(poi):
+    return [
+        geometry for geometry in poi["geometry"].dropna().values
+    ]
+
+def get_poi_amenity_types(poi):
+    if "amenity" not in poi.columns:
+        return []
+    return sorted(poi["amenity"].dropna().astype(str).unique().tolist())
 
 from shapely import wkt
 

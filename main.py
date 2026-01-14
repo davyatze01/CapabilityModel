@@ -1,10 +1,17 @@
-from utils import graphml, route, decay, delta_g
+from utils import graphml, route, decay, delta_g, capabilities
 import osmnx as ox
 import math
 import matplotlib.pyplot as plt
 import shutup
 
 shutup.please()
+
+# (opzionale ma utile: riduce log/overhead OSMnx)
+ox.settings.use_cache = True
+ox.settings.log_console = False
+
+capabilities.test()
+exit()
 
 grafo = graphml.get_graph()
 
