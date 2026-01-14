@@ -1,8 +1,11 @@
-from utils import graphml, route, decay, delta_g, capabilities
+from utils import graphml, route, decay, delta_g, capabilities as cap
+import csv
+import os
 import osmnx as ox
 import math
 import matplotlib.pyplot as plt
 import shutup
+from tqdm import tqdm
 
 shutup.please()
 
@@ -10,14 +13,52 @@ shutup.please()
 ox.settings.use_cache = True
 ox.settings.log_console = False
 
-capabilities.test()
-exit()
+graph = graphml.get_graph()
+nodes = list(graph.nodes(data=True))
 
-grafo = graphml.get_graph()
+os.makedirs("outputs", exist_ok=True)
+output_path = os.path.join("outputs", "capability_to_eat.csv")
 
-origine = (39.22231439353061, 9.113848879825527)
+with open(output_path, "w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f)
+    writer.writerow([
+        "node_id",
+        "lat",
+        "lon",
+        "capability_to_eat",
+        "dining_out_service",
+        "on_the_go_service",
+    ])
 
-delta_g.accessibility("healthcare", origine)
+    for node_id, data in tqdm(nodes, desc="Nodes"):
+        if "y" not in data or "x" not in data:
+            continue
+        origin = (data["y"], data["x"])
+
+        dining_out_accessibility = []
+        on_the_go_accessibility = []
+        services = []
+
+        for poi_type in cap.dining_out_list:
+            dining_out_accessibility.append(delta_g.accessibility(poi_type, origin))
+        services.append(cap.choquet_integral(dining_out_accessibility, cap.cap_dining_out))
+
+        for poi_type in cap.on_the_go_list:
+            on_the_go_accessibility.append(delta_g.accessibility(poi_type, origin))
+        services.append(cap.choquet_integral(on_the_go_accessibility, cap.cap_on_the_go))
+
+        capability_to_eat = cap.choquet_integral(services, cap.cap_eat)
+
+        writer.writerow([
+            node_id,
+            origin[0],
+            origin[1],
+            capability_to_eat,
+            services[0],
+            services[1],
+        ])
+
+print(f"Wrote results to: {output_path}")
 
 """ poi = graphml.get_poi('amenity', True)
 
