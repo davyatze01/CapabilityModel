@@ -70,6 +70,9 @@ def _can_use_base_graph(base_graph, network_type):
         gtype = None
 
     # Se non sappiamo il tipo, lo usiamo comunque per "walk" (caso più comune)
+    if gtype in {"all", "all_private"}:
+        return network_type in {"walk", "bike", "drive"}
+
     if gtype is None:
         return network_type == "walk"
 

@@ -16,11 +16,27 @@ def get_graph():
 
     try:
         graph = ox.io.load_graphml(NAME_FILE)
-        print(f"Grafo caricato correttamente da: {NAME_FILE}")
     except Exception as e:
         print("Grafo non presente, scarico il grafo di Cagliari..")
         graph = ox.graph_from_place(PLACE_NAME)
         ox.io.save_graphml(graph,filepath = NAME_FILE)
+        print("Grafo scaricato e salvato correttamente!")
+
+    return graph
+
+
+def get_mode_graph(network_type):
+    # Cache per-mode graphs on disk to avoid repeated Overpass downloads.
+    PLACE_NAME = "Cagliari, Sardinia, Italy"
+    NAME_FILE = f"graph/cagliari_{network_type}.graphml"
+
+    graph = None
+    try:
+        graph = ox.io.load_graphml(NAME_FILE)
+    except Exception:
+        print(f"Grafo {network_type} non presente, scarico da OSM..")
+        graph = ox.graph_from_place(PLACE_NAME, network_type=network_type)
+        ox.io.save_graphml(graph, filepath=NAME_FILE)
         print("Grafo scaricato e salvato correttamente!")
 
     return graph
@@ -52,7 +68,6 @@ def get_poi(feature=None,value=None):
                     pd.concat(frames, ignore_index=True),
                     crs=frames[0].crs
                 )
-                print(f"POI caricati correttamente da {len(frames)} file in poi/")
                 return poi
 
         # Fallback: scarica tutti gli amenity se non ci sono file locali
@@ -64,7 +79,6 @@ def get_poi(feature=None,value=None):
     try:
         # Provo a caricare i POI gia salvati
         poi = gpd.read_file(NAME_FILE)
-        print(f"POI caricati correttamente da: {NAME_FILE}")
     except Exception:
         # Scarico POI da OSM
         print("Scarico POI da OSM...")

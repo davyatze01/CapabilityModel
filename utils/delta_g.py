@@ -18,6 +18,7 @@ os.makedirs(CACHE_FOLDER, exist_ok=True)
 # ==========================
 _G_CACHE = None
 _POI_GEOM_CACHE = {}  # chiave: (feature, value) -> list geom
+_MODE_GRAPH_CACHE = {}  # chiave: network_type -> graph
 
 
 def _resolve_feature(poi_type, feature):
@@ -40,7 +41,11 @@ def _haversine_m(lat1, lon1, lat2, lon2):
 def _get_mode_graph(base_graph, origin, network_type, radius_m):
     if route._can_use_base_graph(base_graph, network_type):
         return base_graph
-    dist = 3000 if radius_m is None else max(500, int(radius_m))
+    if radius_m is None:
+        if network_type not in _MODE_GRAPH_CACHE:
+            _MODE_GRAPH_CACHE[network_type] = graphml.get_mode_graph(network_type)
+        return _MODE_GRAPH_CACHE[network_type]
+    dist = max(500, int(radius_m))
     return route._get_cached_graph(origin, dist, network_type)
 
 
@@ -113,17 +118,12 @@ def accessibility(poi_type, origine, feature=None, radius_m=None):
             )
             mode_distances[mode] = [lengths.get(node) for node in poi_nodes]
 
-        for i, geom in tqdm(enumerate(poi_points), total=len(poi_points), desc="POI", unit="POI", mininterval=0.5):
+        for i, geom in enumerate(poi_points):
             destinazione = (geom.y, geom.x)
 
             decay_walk = decay_bike = decay_drive = decay_bus = None
 
-            for mode in tqdm(
-                ["walk", "bike", "drive", "bus"],
-                desc="Modalita",
-                leave=False,
-                mininterval=0.5
-            ):
+            for mode in ["walk", "bike", "drive", "bus"]:
                 if mode == "bus":
                     try:
                         _, _, imp_bus = route.get_route(
@@ -142,6 +142,8 @@ def accessibility(poi_type, origine, feature=None, radius_m=None):
 
                     if imp_bus:
                         decay_bus = decay.distance_decay(beta, imp_bus)
+                    else:
+                        decay_bus = 0.0
                     continue
 
                 dist_m = mode_distances[mode][i]
