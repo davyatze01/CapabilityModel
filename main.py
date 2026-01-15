@@ -6,6 +6,12 @@ import math
 import matplotlib.pyplot as plt
 import shutup
 from tqdm import tqdm
+import multiprocessing as mp
+import threading
+import time
+
+# Set to None to use (cpu_count - 1)
+CAP_WORKERS = 8
 
 shutup.please()
 
@@ -13,52 +19,92 @@ shutup.please()
 ox.settings.use_cache = True
 ox.settings.log_console = False
 
-graph = graphml.get_graph()
-nodes = list(graph.nodes(data=True))
+def _process_node(node_item):
+    node_id, data = node_item
+    if "y" not in data or "x" not in data:
+        return None
+    origin = (data["y"], data["x"])
 
-os.makedirs("outputs", exist_ok=True)
-output_path = os.path.join("outputs", "capability_to_eat.csv")
+    dining_out_accessibility = []
+    on_the_go_accessibility = []
+    services = []
 
-with open(output_path, "w", newline="", encoding="utf-8") as f:
-    writer = csv.writer(f)
-    writer.writerow([
-        "node_id",
-        "lat",
-        "lon",
-        "capability_to_eat",
-        "dining_out_service",
-        "on_the_go_service",
-    ])
+    for poi_type in cap.dining_out_list:
+        dining_out_accessibility.append(delta_g.accessibility(poi_type, origin))
+    services.append(cap.choquet_integral(dining_out_accessibility, cap.cap_dining_out))
 
-    for node_id, data in tqdm(nodes, desc="Nodes"):
-        if "y" not in data or "x" not in data:
-            continue
-        origin = (data["y"], data["x"])
+    for poi_type in cap.on_the_go_list:
+        on_the_go_accessibility.append(delta_g.accessibility(poi_type, origin))
+    services.append(cap.choquet_integral(on_the_go_accessibility, cap.cap_on_the_go))
 
-        dining_out_accessibility = []
-        on_the_go_accessibility = []
-        services = []
+    capability_to_eat = cap.choquet_integral(services, cap.cap_eat)
 
-        for poi_type in cap.dining_out_list:
-            dining_out_accessibility.append(delta_g.accessibility(poi_type, origin))
-        services.append(cap.choquet_integral(dining_out_accessibility, cap.cap_dining_out))
+    return [
+        node_id,
+        origin[0],
+        origin[1],
+        capability_to_eat,
+        services[0],
+        services[1],
+    ]
 
-        for poi_type in cap.on_the_go_list:
-            on_the_go_accessibility.append(delta_g.accessibility(poi_type, origin))
-        services.append(cap.choquet_integral(on_the_go_accessibility, cap.cap_on_the_go))
 
-        capability_to_eat = cap.choquet_integral(services, cap.cap_eat)
+def main():
+    graph = graphml.get_graph()
+    nodes = list(graph.nodes(data=True))
 
+    os.makedirs("outputs", exist_ok=True)
+    output_path = os.path.join("outputs", "capability_to_eat.csv")
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
         writer.writerow([
-            node_id,
-            origin[0],
-            origin[1],
-            capability_to_eat,
-            services[0],
-            services[1],
+            "node_id",
+            "lat",
+            "lon",
+            "capability_to_eat",
+            "dining_out_service",
+            "on_the_go_service",
         ])
 
-print(f"Wrote results to: {output_path}")
+        workers = max(1, mp.cpu_count() - 1) if CAP_WORKERS is None else max(1, int(CAP_WORKERS))
+        last_row_lock = threading.Lock()
+        last_row_time = [time.time()]
+        stop_event = threading.Event()
+
+        pbar = tqdm(total=len(nodes), desc="Nodes", mininterval=0)
+
+        def _monitor():
+            while not stop_event.wait(60):
+                pbar.refresh()
+                with last_row_lock:
+                    idle_s = time.time() - last_row_time[0]
+                if idle_s >= 300:
+                    print("Warning: no rows written in the last 5 minutes.")
+
+        monitor_thread = threading.Thread(target=_monitor, daemon=True)
+        monitor_thread.start()
+
+        try:
+            with mp.Pool(processes=workers) as pool:
+                for row in pool.imap_unordered(_process_node, nodes, chunksize=20):
+                    if row is None:
+                        continue
+                    writer.writerow(row)
+                    f.flush()
+                    pbar.update(1)
+                    with last_row_lock:
+                        last_row_time[0] = time.time()
+        finally:
+            stop_event.set()
+            monitor_thread.join(timeout=2)
+            pbar.close()
+
+    print(f"Wrote results to: {output_path}")
+
+
+if __name__ == "__main__":
+    main()
 
 """ poi = graphml.get_poi('amenity', True)
 
@@ -103,7 +149,3 @@ rra = decay.calculate_rra(decay_walk, decay_bike, decay_drive, decay_bus)
 print("RRA = ", rra)
 
 plt.show() """
-
-
-
-
