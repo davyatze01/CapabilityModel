@@ -1,11 +1,10 @@
 from tqdm import tqdm
-from shapely import wkt
-from utils import graphml, route, decay
+from utils import graphml, route, decay, get_impedance
 import math
-import numpy as np
 import os
 import pickle
 import networkx as nx  # per catturare NetworkXNoPath / NodeNotFound
+import osmnx as ox
 
 # ==========================
 # CONFIG
@@ -21,22 +20,57 @@ os.makedirs(CACHE_FOLDER, exist_ok=True)
 _G_CACHE = None
 _POI_GEOM_CACHE = {}  # chiave: poi_type -> list geom WKT
 
+# ==========================
+# CACHE (in-memory) per evitare reload ripetuti
+# ==========================
+_G_CACHE = None
+_POI_GEOM_CACHE = {}  # chiave: (feature, value) -> list geom
+_MODE_GRAPH_CACHE = {}  # chiave: network_type -> graph
 
-def accessibility(poi_type, origine):
-    # nome file cache: meglio arrotondare per evitare migliaia di file quasi identici per float
-    # (non cambia la logica del calcolo, solo il "nome" della cache)
+
+def _resolve_feature(poi_type, feature):
+    if feature is None:
+        if poi_type in {"healthcare"}:
+            return poi_type, True
+        return "amenity", poi_type
+    return feature, poi_type
+
+
+def _haversine_m(lat1, lon1, lat2, lon2):
+    r = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+    return 2.0 * r * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+
+def _get_mode_graph(base_graph, origin, network_type, radius_m):
+    if route._can_use_base_graph(base_graph, network_type):
+        return base_graph
+    if radius_m is None:
+        if network_type not in _MODE_GRAPH_CACHE:
+            _MODE_GRAPH_CACHE[network_type] = graphml.get_mode_graph(network_type)
+        return _MODE_GRAPH_CACHE[network_type]
+    dist = max(500, int(radius_m))
+    return route._get_cached_graph(origin, dist, network_type)
+
+
+def accessibility(poi_type, origine, feature=None, radius_m=None):
+    feature, value = _resolve_feature(poi_type, feature)
+
+    # nome file cache: arrotonda per evitare migliaia di file quasi identici
     lat_key = f"{origine[0]:.6f}"
     lon_key = f"{origine[1]:.6f}"
+    radius_key = "all" if radius_m is None else f"r{int(radius_m)}"
 
     cache_file = os.path.join(
         CACHE_FOLDER,
-        f"RRA_v{CACHE_VERSION}_{poi_type}_{lat_key}_{lon_key}.pkl"
+        f"RRA_v{CACHE_VERSION}_{feature}_{poi_type}_{radius_key}_{lat_key}_{lon_key}.pkl"
     )
 
     # ---- Load from cache if exists ----
     if os.path.exists(cache_file):
-        # print più leggero (puoi toglierlo se vuoi)
-        # print("📦 Carico RRA dalla cache")
         RRA = load_rra(cache_file)
     else:
         global _G_CACHE, _POI_GEOM_CACHE
@@ -47,71 +81,98 @@ def accessibility(poi_type, origine):
         grafo = _G_CACHE
 
         # carica geometrie POI una sola volta per tipo (in RAM)
-        if poi_type not in _POI_GEOM_CACHE:
-            poi = graphml.get_poi(poi_type, True)
-            _POI_GEOM_CACHE[poi_type] = graphml.get_poi_geom(poi)
-        poi_geometry = _POI_GEOM_CACHE[poi_type]
+        cache_key = (feature, value)
+        if cache_key not in _POI_GEOM_CACHE:
+            poi = graphml.get_poi(feature, value)
+            _POI_GEOM_CACHE[cache_key] = graphml.get_poi_geometries(poi)
+
+        poi_geometry = _POI_GEOM_CACHE[cache_key]
+
+        poi_points = []
+        for geom in poi_geometry:
+            if geom is None:
+                continue
+            if geom.geom_type != "Point":
+                geom = geom.representative_point()
+            poi_points.append(geom)
+
+        if radius_m is not None:
+            poi_points = [
+                geom for geom in poi_points
+                if _haversine_m(origine[0], origine[1], geom.y, geom.x) <= radius_m
+            ]
 
         RRA = []
         beta = math.log(2) / 20.0
 
-        for geom_value in tqdm(poi_geometry, desc="POI", unit="POI", mininterval=0.5):
-            geom = wkt.loads(geom_value)
+        mode_distances = {}
+        xs = [geom.x for geom in poi_points]
+        ys = [geom.y for geom in poi_points]
 
-            # Se non è un Point (es. Polygon), convertilo in un punto
-            if geom.geom_type != "Point":
-                geom = geom.representative_point()  # oppure geom.centroid
+        for mode in ["walk", "bike", "drive"]:
+            mode_graph = _get_mode_graph(grafo, origine, mode, radius_m)
+            origin_node = ox.distance.nearest_nodes(mode_graph, origine[1], origine[0])
+            poi_nodes = ox.distance.nearest_nodes(mode_graph, xs, ys)
+            try:
+                poi_nodes = list(poi_nodes)
+            except TypeError:
+                poi_nodes = [poi_nodes]
 
+            lengths = nx.single_source_dijkstra_path_length(
+                mode_graph,
+                origin_node,
+                weight="length"
+            )
+            mode_distances[mode] = [lengths.get(node) for node in poi_nodes]
+
+        for i, geom in enumerate(poi_points):
             destinazione = (geom.y, geom.x)
 
             decay_walk = decay_bike = decay_drive = decay_bus = None
 
-            for mode in tqdm(
-                ["walk", "bike", "drive", "bus"],
-                desc="Modalità",
-                leave=False,
-                mininterval=0.5
-            ):
-                try:
-                    _, _, imp = route.get_route(
-                        grafo,
-                        mode,
-                        origine,
-                        destinazione,
-                        impedance_flag=True,
-                        ax=None
-                    )
-                except (nx.NetworkXNoPath, nx.NodeNotFound):
-                    imp = None  # nessun percorso / nodo non trovato
-                except Exception:
-                    imp = None
+            for mode in ["walk", "bike", "drive", "bus"]:
+                if mode == "bus":
+                    try:
+                        _, _, imp_bus = route.get_route(
+                            grafo,
+                            "bus",
+                            origine,
+                            destinazione,
+                            impedance_flag=True,
+                            ax=None,
+                            distance_only=True
+                        )
+                    except (nx.NetworkXNoPath, nx.NodeNotFound):
+                        imp_bus = None
+                    except Exception:
+                        imp_bus = None
 
-                # se imp è None o vuoto, saltiamo
-                if not imp:
+                    if imp_bus:
+                        decay_bus = decay.distance_decay(beta, imp_bus)
+                    else:
+                        decay_bus = 0.0
                     continue
 
+                dist_m = mode_distances[mode][i]
+                if dist_m is None:
+                    continue
+                imp = get_impedance.impedance_base(dist_m / 1000.0, mode)
                 d = decay.distance_decay(beta, imp)
-
                 if mode == "walk":
                     decay_walk = d
                 elif mode == "bike":
                     decay_bike = d
                 elif mode == "drive":
                     decay_drive = d
-                elif mode == "bus":
-                    decay_bus = d
 
             # Calcola RRA solo se HO TUTTO per questo POI
             if None not in (decay_walk, decay_bike, decay_drive, decay_bus):
                 rra_poi = decay.calculate_rra(decay_walk, decay_bike, decay_drive, decay_bus)
                 RRA.append(rra_poi)
-            else:
-                pass
 
         save_rra(cache_file, RRA)
 
     RRA_desc = sorted(RRA, reverse=True)
-    # print("RRA desc=", RRA_desc)
 
     def c_from_target(n_target: int, y_target: float) -> float:
         if n_target <= 0:
@@ -135,7 +196,6 @@ def accessibility(poi_type, origine):
         else:
             accessibility_value += (element * deltag(i + 1, i, c))
 
-    # print("Accessibility= ", accessibility_value)
     return accessibility_value
 
 
