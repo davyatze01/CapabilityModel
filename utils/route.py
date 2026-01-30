@@ -1,5 +1,7 @@
 import os
 import json
+import pickle
+import hashlib
 import requests
 import polyline
 import osmnx as ox
@@ -8,13 +10,125 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 from osmnx.routing import route_to_gdf
 
-from utils import get_impedance
+from utils import get_impedance, graphml
 
 
 # =========================
 # Cache grafi (RAM + Disco)
 # =========================
-_GRAPH_CACHE = {}  # cache in memoria
+_GRAPH_CACHE = {}  # cache in memoria per il grafo osm
+_MODE_GRAPH_CACHE = {}  # cache in memoria per grafi full-area per modalitÃ 
+_ROUTE_CACHE = {}  # cache in memoria per distanze/impeance
+_ROUTE_GEOM_CACHE = {}  # cache in memoria per geometrie
+_ROUTE_CACHE_FOLDER = "route_cache"
+_ROUTE_COORD_ROUND = 6  # arrotondamento coordinate per chiave cache
+
+# Data/ora per pianificazione (OTP)
+ROUTE_DATE = "2025-11-12"   # YYYY-MM-DD
+ROUTE_TIME = "19:30:00"     # hh:mm:ss
+
+
+def _round_coord(coord):
+    # arrotonda coordinate per occupare meno spazio in memoria
+    return (round(coord[0], _ROUTE_COORD_ROUND), round(coord[1], _ROUTE_COORD_ROUND))
+
+
+def _route_cache_key(
+    network_type,
+    origin,
+    destination,
+    route_date=None,
+    route_time=None,
+    dist=None,
+    center_point=None,
+):
+    # chiave minima per identificare un routing univoco -> questo è l'indice utilizzato in cache per recuperare i dati relativi a un routing già eseguito
+    origin_key = _round_coord(origin)
+    dest_key = _round_coord(destination)
+    center_key = _round_coord(center_point) if center_point else None
+    return (
+        network_type,
+        origin_key,
+        dest_key,
+        route_date,
+        route_time,
+        dist,
+        center_key,
+    )
+
+
+def _route_cache_path(key, suffix):
+    # crea il path su disco per il file che conterrà il routing. Il suffisso differenzia tra distanza ("dist") e geometria ("geom")
+    os.makedirs(_ROUTE_CACHE_FOLDER, exist_ok=True)
+    key_bytes = pickle.dumps(key)
+    key_hash = hashlib.sha1(key_bytes).hexdigest() # hash per evitare nomi file troppo lunghi
+    return os.path.join(_ROUTE_CACHE_FOLDER, f"{key_hash}.{suffix}.pkl") #ad esempio: route_cache/abc123.dist.pkl
+
+
+def _route_cache_get(key):
+    # cerca se il dato è già stato caricato e quindi si trova nel dictionary di cache in RAM, oppure sul file corrispondente su disco
+    if key in _ROUTE_CACHE:
+        return _ROUTE_CACHE[key]
+    path = _route_cache_path(key, "dist")
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+            _ROUTE_CACHE[key] = data
+            return data
+        except Exception:
+            return None
+    return None
+
+
+def _route_cache_set(key, value):
+    # si occupa di salvare il dato sia in RAM (dict di esecuzione) che su un file pickle su disco
+    _ROUTE_CACHE[key] = value
+    path = _route_cache_path(key, "dist")
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp_path, path)
+
+
+def _route_geom_cache_get(key):
+    # Cerca se la geometria del percorso breve (solo bus) è gia in cache (RAM) oppure la carica sul file corrispondente su disco.
+    if key in _ROUTE_GEOM_CACHE:
+        return _ROUTE_GEOM_CACHE[key]
+    path = _route_cache_path(key, "geom")
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+            _ROUTE_GEOM_CACHE[key] = data
+            return data
+        except Exception:
+            return None
+    return None
+
+
+def _route_geom_cache_set(key, value):
+    # Quando viene eseguito un bus routing, la geometria viene salvata in RAM e su disco (scrittura atomica)
+    _ROUTE_GEOM_CACHE[key] = value
+    path = _route_cache_path(key, "geom")
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp_path, path)
+
+
+def bus_cache_exists(origin, destination, route_date=None, route_time=None):
+    # verifica se cache bus (distanza + geometria) è già disponibile
+    cache_key = _route_cache_key(
+        "bus",
+        origin,
+        destination,
+        route_date=route_date or ROUTE_DATE,
+        route_time=route_time or ROUTE_TIME,
+    )
+    dist_cached = _route_cache_get(cache_key) is not None
+    geom_cached = _route_geom_cache_get(cache_key) is not None
+    return dist_cached and geom_cached
 
 
 def _format_time(timestamp_ms):
@@ -22,61 +136,12 @@ def _format_time(timestamp_ms):
     return datetime.fromtimestamp(timestamp_ms / 1000).strftime("%H:%M")
 
 
-def _graph_cache_filename(center_point, dist, network_type, folder="graph_cache"):
-    os.makedirs(folder, exist_ok=True)
-    lat = round(center_point[0], 4)
-    lon = round(center_point[1], 4)
-    return os.path.join(folder, f"{network_type}_{dist}_{lat}_{lon}.graphml")
+def _get_mode_graph(network_type):
+    # carica un grafo full-area per modalita e salva in RAM
+    if network_type not in _MODE_GRAPH_CACHE:
+        _MODE_GRAPH_CACHE[network_type] = graphml.get_mode_graph(network_type)
+    return _MODE_GRAPH_CACHE[network_type]
 
-
-def _get_cached_graph(center_point, dist, network_type):
-    """
-    Restituisce un grafo OSMnx con:
-    - cache RAM
-    - cache su disco (graph_cache/)
-    - download da Overpass solo se necessario
-    """
-    key = (network_type, dist, round(center_point[0], 4), round(center_point[1], 4))
-    if key in _GRAPH_CACHE:
-        return _GRAPH_CACHE[key]
-
-    fname = _graph_cache_filename(center_point, dist, network_type)
-
-    if os.path.exists(fname):
-        G = ox.load_graphml(fname)
-        _GRAPH_CACHE[key] = G
-        return G
-
-    # Download solo la prima volta
-    G = ox.graph_from_point(center_point, dist=dist, network_type=network_type)
-    ox.save_graphml(G, fname)
-    _GRAPH_CACHE[key] = G
-    return G
-
-
-def _can_use_base_graph(base_graph, network_type):
-    """
-    Heuristica: se il grafo base ha network_type compatibile, usalo direttamente.
-    Non è perfetta, ma evita download inutili.
-    """
-    if base_graph is None:
-        return False
-
-    # Molti grafi OSMnx hanno info in base_graph.graph
-    gtype = None
-    try:
-        gtype = base_graph.graph.get("network_type", None)
-    except Exception:
-        gtype = None
-
-    # Se non sappiamo il tipo, lo usiamo comunque per "walk" (caso più comune)
-    if gtype in {"all", "all_private"}:
-        return network_type in {"walk", "bike", "drive"}
-
-    if gtype is None:
-        return network_type == "walk"
-
-    return gtype == network_type
 
 
 def get_route(
@@ -88,6 +153,7 @@ def get_route(
     ax=None,
     distance_only=False,
     return_geometry=False,
+    quiet=False,
 ):
     """
     origin/destination: tuple (lat, lon)
@@ -106,10 +172,6 @@ def get_route(
     # URL del server OTP2
     OTP_URL = "http://localhost:8080/otp/routers/default/index/graphql"
 
-    # Data/ora per pianificazione (OTP)
-    ROUTE_DATE = "2025-11-12"   # YYYY-MM-DD
-    ROUTE_TIME = "19:30:00"     # hh:mm:ss
-
     fig = None
     if not distance_only:
         # Se ax non è creato lo creo
@@ -122,6 +184,21 @@ def get_route(
     # CASO BUS (OTP2)
     # ==========================
     if network_type == "bus":
+        # cache solo per richieste bus distance_only
+        cache_key = _route_cache_key(
+            network_type,
+            origin,
+            destination,
+            route_date=ROUTE_DATE,
+            route_time=ROUTE_TIME,
+        )
+        cached = _route_cache_get(cache_key)
+        if cached is not None and distance_only:
+            cached_value = cached.get("result_value")
+            if return_geometry:
+                return fig, ax, cached_value, None
+            return fig, ax, cached_value
+
         query = f"""
         query {{
           plan(
@@ -169,8 +246,9 @@ def get_route(
             return fig, ax, ([] if impedance_flag else None)
 
         if resp.status_code != 200:
-            print("Errore nella richiesta OTP:", resp.status_code)
-            print(resp.text)
+            if not quiet:
+                print("Errore nella richiesta OTP:", resp.status_code)
+                print(resp.text)
             return fig, ax, ([] if impedance_flag else None)
 
         try:
@@ -182,7 +260,8 @@ def get_route(
 
         itineraries = data.get("data", {}).get("plan", {}).get("itineraries", [])
         if not itineraries:
-            print("Nessun itinerario trovato (OTP).")
+            if not quiet:
+                print("Nessun itinerario trovato (OTP).")
             return fig, ax, ([] if impedance_flag else None)
 
         # itinerario più veloce
@@ -213,10 +292,12 @@ def get_route(
 
         prec_leg_end_time = None
         impedance = []
+        bus_geom = []
 
         for leg in itinerary["legs"]:
             geometry = leg["legGeometry"]["points"]
             coords = polyline.decode(geometry)  # [(lat, lon), ...]
+            bus_geom.append(coords)
             lats, lons = zip(*coords)
 
             mode = leg["mode"]
@@ -280,25 +361,76 @@ def get_route(
             ax.set_title("bus", color="white")
 
         result_value = impedance if impedance_flag else (total_distance_m if distance_only else None)
+        # salva sempre geometria bus per riuso futuro
+        _route_geom_cache_set(cache_key, bus_geom)
+        if distance_only:
+            # salva risultato bus per riuso futuro
+            _route_cache_set(cache_key, {"result_value": result_value})
         if return_geometry:
-            return fig, ax, result_value, None
+            return fig, ax, result_value, bus_geom
         return fig, ax, result_value
 
     # ==========================
     # CASO WALK/DRIVE/BIKE
     # ==========================
-    # 1) se il grafo passato è compatibile, lo uso direttamente
-    if _can_use_base_graph(graph, network_type):
-        network_graph = graph
-    else:
-        # 2) altrimenti: cache su disco + RAM con center_point
-        center_point = ((origin[0] + destination[0]) / 2.0, (origin[1] + destination[1]) / 2.0)
+    # usa sempre il grafo full-area per la modalita richiesta
+    center_point = None
+    dist = None
+    network_graph = _get_mode_graph(network_type)
 
-        # dist più piccolo = molto più veloce
-        # (se vuoi puoi aumentarlo, ma 10km è spesso troppo)
-        dist = 3000
+    # colori per il plotting
+    mode_colors = {
+        "walk": "cyan",
+        "drive": "red",
+        "bike": "yellow",
+        "IMPEDANCE": "violet",
+    }
+    color = mode_colors.get(network_type, "white")
 
-        network_graph = _get_cached_graph(center_point, dist, network_type)
+    # chiave cache per walk/bike/drive
+    cache_key = _route_cache_key(
+        network_type,
+        origin,
+        destination,
+        dist=dist,
+        center_point=center_point,
+    )
+    # tenta cache del routing già calcolato
+    cached = _route_cache_get(cache_key)
+    if cached is not None:
+        route_nodes = cached.get("route_nodes")
+        distance_m = cached.get("distance_m")
+        imp_value = cached.get("imp_value")
+        if return_geometry:
+            route_gdf = None
+            if route_nodes is not None:
+                route_gdf = route_to_gdf(network_graph, route_nodes)
+            result_value = imp_value if impedance_flag else (distance_m if distance_only else None)
+            return fig, ax, result_value, route_gdf
+        if not distance_only and route_nodes is not None:
+            # in caso di cache hit, plottiamo direttamente la route salvata
+            # plot grafo + route
+            ox.plot_graph(
+                network_graph,
+                ax=ax,
+                bgcolor="black",
+                edge_color="black",
+                node_size=0,
+                edge_linewidth=0.6,
+                show=False,
+                close=False
+            )
+            ox.plot_graph_route(
+                network_graph,
+                route_nodes,
+                ax=ax,
+                route_color=color,
+                route_linewidth=3,
+                show=False,
+                close=False
+            )
+        result_value = imp_value if impedance_flag else (distance_m if distance_only else None)
+        return fig, ax, result_value
 
     origin_node = ox.distance.nearest_nodes(network_graph, origin[1], origin[0])
     destination_node = ox.distance.nearest_nodes(network_graph, destination[1], destination[0])
@@ -332,14 +464,6 @@ def get_route(
             weight="length",
             method="dijkstra"
         )
-
-    mode_colors = {
-        "walk": "cyan",
-        "drive": "red",
-        "bike": "yellow",
-        "IMPEDANCE": "violet",
-    }
-    color = mode_colors.get(network_type, "white")
 
     if not distance_only:
         # plot grafo + route
@@ -386,7 +510,14 @@ def get_route(
         ax.legend(facecolor="black", labelcolor="white", loc="lower right", fontsize=8, framealpha=0.9)
         ax.set_title(network_type, color="white")
 
+    # valore finale del routing (impedenza o distanza)
     result_value = imp_value if impedance_flag else (distance_m if distance_only else None)
+    # salva distanza/nodi/impedenza per riuso futuro
+    _route_cache_set(cache_key, {
+        "distance_m": distance_m,
+        "route_nodes": route_nodes,
+        "imp_value": imp_value,
+    })
 
     if return_geometry:
         if route_gdf is None and route_nodes is not None:
