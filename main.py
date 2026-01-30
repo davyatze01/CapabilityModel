@@ -39,17 +39,33 @@ def _load_non_bus_cache(path):
         return pickle.load(f)
 
 
-def _init_worker(poi_coords_by_type):
+def _init_worker(
+    poi_coords_by_type,
+    graph=None,
+    mode_graphs=None,
+    poi_geom_cache=None,
+    poi_points_cache=None,
+):
     global _POI_COORDS_FILTER
     _POI_COORDS_FILTER = {}
     for poi_type, coords in poi_coords_by_type.items():
         _POI_COORDS_FILTER[poi_type] = {
             (round(lat, 6), round(lon, 6)) for lat, lon in coords
         }
+    if graph is not None and delta_g._G_CACHE is None:
+        delta_g._G_CACHE = graph
+    if mode_graphs:
+        for mode, mode_graph in mode_graphs.items():
+            if mode not in delta_g._MODE_GRAPH_CACHE:
+                delta_g._MODE_GRAPH_CACHE[mode] = mode_graph
+    if poi_geom_cache:
+        delta_g._POI_GEOM_CACHE = poi_geom_cache
+    if poi_points_cache:
+        delta_g._POI_POINTS_CACHE = poi_points_cache
 
 
 def empty_cache():
-    for folder in ["route_cache", "rra_cache", NON_BUS_CACHE_DIR]:
+    for folder in ["route_cache", "rra_cache", "poi_geom_cache", NON_BUS_CACHE_DIR]:
         if not os.path.isdir(folder):
             continue
         for name in os.listdir(folder):
@@ -126,16 +142,6 @@ def _compute_capability_from_cache(item):
         services[0],
         services[1],
     ]
-
-def init_worker(shared_graph, shared_pois):
-    """
-    Questa funzione viene lanciata all'avvio di ogni processo worker.
-    Serve a iniettare il Grafo e i POI direttamente nella memoria del worker,
-    evitando di doverli ricaricare o riscaricare ogni volta.
-    """
-    from utils import delta_g
-    delta_g._G_CACHE = shared_graph
-    delta_g._POI_GEOM_CACHE = shared_pois
 
 def _process_node(node_item):
     node_id, data = node_item
@@ -320,17 +326,23 @@ def run_pipeline(max_nodes=None, max_pois=None, seed=42, enable_progress=True):
 
         try:
             poi_coords_by_type = {}
+            poi_points_by_type = {}
             non_bus_poi_counts = {}
             rng = random.Random(seed)
-            for poi_type in serv.dining_out_list:
+            all_poi_types = list(dict.fromkeys(serv.dining_out_list + serv.on_the_go_list))
+            # Preload POI geometries on disk to avoid parallel downloads.
+            delta_g.preload_all_pois(all_poi_types)
+            # Load graphs once in parent.
+            shared_graph = graph
+            shared_mode_graphs = {
+                "walk": graphml.get_mode_graph("walk"),
+                "bike": graphml.get_mode_graph("bike"),
+                "drive": graphml.get_mode_graph("drive"),
+            }
+            shared_poi_geoms = dict(delta_g._POI_GEOM_CACHE)
+            for poi_type in all_poi_types:
                 poi_points = delta_g.get_poi_points(poi_type, (0.0, 0.0))
-                coords = [(geom.y, geom.x) for geom in poi_points]
-                if max_pois is not None:
-                    coords = rng.sample(coords, min(max_pois, len(coords)))
-                poi_coords_by_type[poi_type] = coords
-                non_bus_poi_counts[poi_type] = len(coords)
-            for poi_type in serv.on_the_go_list:
-                poi_points = delta_g.get_poi_points(poi_type, (0.0, 0.0))
+                poi_points_by_type[poi_type] = poi_points
                 coords = [(geom.y, geom.x) for geom in poi_points]
                 if max_pois is not None:
                     coords = rng.sample(coords, min(max_pois, len(coords)))
@@ -371,7 +383,17 @@ def run_pipeline(max_nodes=None, max_pois=None, seed=42, enable_progress=True):
                     continue
                 nodes_to_compute.append((node_id, data))
 
-            with mp.Pool(processes=workers, initializer=_init_worker, initargs=(poi_coords_by_type,)) as pool:
+            with mp.Pool(
+                processes=workers,
+                initializer=_init_worker,
+                initargs=(
+                    poi_coords_by_type,
+                    shared_graph,
+                    shared_mode_graphs,
+                    shared_poi_geoms,
+                    poi_points_by_type,
+                ),
+            ) as pool:
                 total_non_bus_pois = sum(non_bus_poi_counts[poi_type] for poi_type in serv.dining_out_list)
                 total_non_bus_pois += sum(non_bus_poi_counts[poi_type] for poi_type in serv.on_the_go_list)
                 total_non_bus_tasks = len(nodes_with_coords) * total_non_bus_pois

@@ -210,3 +210,5 @@ rra_cache/
 poi/
 cache/
 route_cache/
+poi_geom_cache/
+graph_cache/
