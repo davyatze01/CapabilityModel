@@ -39,17 +39,12 @@ def _haversine_m(lat1, lon1, lat2, lon2):
     a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
     return 2.0 * r * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
 
-def _get_mode_graph(base_graph, origin, network_type, radius_m):
+def _get_mode_graph(network_type):
     # Recupera il grafo stradale specifico per il mezzo di trasporto (piedi, bici, auto)
     # Se esiste già in cache lo restituisce, altrimenti lo calcola.
-    if route._can_use_base_graph(base_graph, network_type):
-        return base_graph
-    if radius_m is None:
-        if network_type not in _MODE_GRAPH_CACHE:
-            _MODE_GRAPH_CACHE[network_type] = graphml.get_mode_graph(network_type)
-        return _MODE_GRAPH_CACHE[network_type]
-    dist = max(500, int(radius_m))
-    return route._get_cached_graph(origin, dist, network_type)
+    if network_type not in _MODE_GRAPH_CACHE:
+        _MODE_GRAPH_CACHE[network_type] = graphml.get_mode_graph(network_type)
+    return _MODE_GRAPH_CACHE[network_type]
 
 def precompute_distances(origin, radius_m=None):
     # Calcola le distanze stradali
@@ -64,7 +59,7 @@ def precompute_distances(origin, radius_m=None):
     
     for mode in ["walk", "bike", "drive"]:
         try:
-            mode_graph = _get_mode_graph(grafo, origin, mode, radius_m)
+            mode_graph = _get_mode_graph(mode)
             origin_node = ox.distance.nearest_nodes(mode_graph, origin[1], origin[0])
             
             # Calcola la distanza da 'origin_node' verso TUTTI gli altri nodi del grafo
@@ -109,7 +104,7 @@ def _get_mode_lengths(grafo, origin, network_type, radius_m):
         # ritorna distanze già calcolate per questa origine/modo
         return _MODE_LENGTHS_CACHE[key]
 
-    mode_graph = _get_mode_graph(grafo, origin, network_type, radius_m)
+    mode_graph = _get_mode_graph(network_type)
     origin_node = ox.distance.nearest_nodes(mode_graph, origin[1], origin[0])
     lengths = nx.single_source_dijkstra_path_length(
         mode_graph,
@@ -218,7 +213,7 @@ def accessibility_non_bus(poi_type, origine, feature=None, radius_m=None):
     mode_distances = {}
     for mode in ["walk", "bike", "drive"]:
         # trova nodi POI e distanze shortest-path cached per ogni modo
-        mode_graph = _get_mode_graph(grafo, origine, mode, radius_m)
+        mode_graph = _get_mode_graph(mode)
         poi_nodes = ox.distance.nearest_nodes(mode_graph, xs, ys)
         try:
             poi_nodes = list(poi_nodes)

@@ -275,7 +275,7 @@ def _precompute_bus_routes(graph, nodes, poi_coords_by_type, pbar=None, pbar_loc
                         pbar.update(1)
 
 
-def run_pipeline(max_nodes=None, max_pois=20, seed=42, enable_progress=True):
+def run_pipeline(max_nodes=None, max_pois=None, seed=42, enable_progress=True):
     graph = graphml.get_graph()
     nodes = list(graph.nodes(data=True))
     nodes_with_coords = [item for item in nodes if "y" in item[1] and "x" in item[1]]
