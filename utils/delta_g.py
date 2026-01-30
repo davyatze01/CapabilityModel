@@ -29,7 +29,7 @@ def _resolve_feature(poi_type, feature):
 
 
 def _haversine_m(lat1, lon1, lat2, lon2):
-    # Calcola la distanza in metri tra due coordinate geografiche (formula dell'emisenoverso)
+    # Calcola la distanza in metri tra due coordinate geografiche
     r = 6371000.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
@@ -51,7 +51,7 @@ def _get_mode_graph(base_graph, origin, network_type, radius_m):
     return route._get_cached_graph(origin, dist, network_type)
 
 def precompute_distances(origin, radius_m=None):
-    # Questa funzione è il cuore dell'ottimizzazione: calcola le distanze stradali
+    # Calcola le distanze stradali
     # (Dijkstra) per walk/bike/drive UNA volta sola per il nodo di origine.
     # I risultati vengono poi riutilizzati per tutti i tipi di POI (ristoranti, bar, ecc.)
     global _G_CACHE

@@ -12,7 +12,6 @@ import time
 
 # --- Configurazione ---
 # Numero di processi paralleli da avviare.
-# Consiglio: se noti rallentamenti dovuti al calcolo del BUS o alla rete, riduci questo numero.
 CAP_WORKERS = 8  
 
 # Silenzia warning non critici per mantenere la console pulita
@@ -55,7 +54,7 @@ def _process_node(node_item):
         val = delta_g.accessibility(poi_type, origin, network_cache=dist_cache)
         dining_out_accessibility.append(val)
     
-    # Aggreghiamo i punteggi parziali usando l'Integrale di Choquet (gestisce le sinergie tra servizi)
+    # Aggreghiamo i punteggi parziali usando l'Integrale di Choquet
     services.append(cap.choquet_integral(dining_out_accessibility, cap.cap_dining_out))
 
     # Facciamo lo stesso per i servizi "al volo" (fast food, bar...)
@@ -133,10 +132,10 @@ def main():
                 with last_row_lock:
                     idle_s = time.time() - last_row_time[0]
                 
-                # Se non scriviamo righe nel CSV da più di 10 minuti, avvisiamo l'utente.
+                # Se non scriviamo righe nel CSV da più di 5 minuti, avvisiamo l'utente.
                 # Spesso accade se il server di routing (OTP) per i BUS non risponde.
-                if idle_s >= 600: 
-                    print("\nWarning: no rows written in the last 10 minutes. Possible OTP/Bus timeout.")
+                if idle_s >= 300: 
+                    print("\nWarning: no rows written in the last 5 minutes. Possible OTP/Bus timeout.")
 
         monitor_thread = threading.Thread(target=_monitor, daemon=True)
         monitor_thread.start()
