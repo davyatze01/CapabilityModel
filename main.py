@@ -13,7 +13,9 @@ import pickle
 import random
 
 # Set to None to use (cpu_count - 1)
-CAP_WORKERS = 8
+CAP_WORKERS = None
+CAP_OTP = None # None => usa tutti i thread bus disponibili
+BUS_TIMEOUT_S = 15
 NON_BUS_CACHE_DIR = os.path.join("cache", "non_bus")
 _POI_COORDS_FILTER = None
 
@@ -90,18 +92,21 @@ def _compute_capability_from_cache(item):
         beta = math.log(2) / 20.0
         decay_bus = []
         for coord in entry["poi_coords"]:
-            try:
-                _, _, imp_bus = route.get_route(
-                    None,
-                    "bus",
-                    origin,
-                    coord,
-                    impedance_flag=True,
-                    ax=None,
-                    distance_only=True,
-                    quiet=True,
-                )
-            except Exception:
+            if route.bus_cache_exists(origin, coord):
+                try:
+                    _, _, imp_bus = route.get_route(
+                        None,
+                        "bus",
+                        origin,
+                        coord,
+                        impedance_flag=True,
+                        ax=None,
+                        distance_only=True,
+                        quiet=True,
+                    )
+                except Exception:
+                    imp_bus = None
+            else:
                 imp_bus = None
 
             if imp_bus:
@@ -234,7 +239,33 @@ def _process_node(node_item):
     }
 
 
-def _precompute_bus_routes(graph, nodes, poi_coords_by_type, pbar=None, pbar_lock=None):
+def _request_bus_route(graph, origin, coord, otp_semaphore):
+    try:
+        with otp_semaphore:
+            route.get_route(
+                graph,
+                "bus",
+                origin,
+                coord,
+                impedance_flag=True,
+                ax=None,
+                distance_only=True,
+                return_geometry=False,
+                quiet=True,
+                timeout_s=BUS_TIMEOUT_S,
+            )
+    except Exception:
+        pass
+
+
+def _precompute_bus_routes(
+    graph,
+    nodes,
+    poi_coords_by_type,
+    otp_semaphore,
+    progress_counter=None,
+    progress_lock=None,
+):
     for node_id, data in nodes:
         if "y" not in data or "x" not in data:
             continue
@@ -242,43 +273,17 @@ def _precompute_bus_routes(graph, nodes, poi_coords_by_type, pbar=None, pbar_loc
         for poi_type in serv.dining_out_list:
             for coord in poi_coords_by_type[poi_type]:
                 if not route.bus_cache_exists(origin, coord):
-                    route.get_route(
-                        graph,
-                        "bus",
-                        origin,
-                        coord,
-                        impedance_flag=True,
-                        ax=None,
-                        distance_only=True,
-                        return_geometry=True,
-                        quiet=True
-                    )
-                if pbar:
-                    if pbar_lock:
-                        with pbar_lock:
-                            pbar.update(1)
-                    else:
-                        pbar.update(1)
+                    _request_bus_route(graph, origin, coord, otp_semaphore)
+                if progress_counter is not None and progress_lock is not None:
+                    with progress_lock:
+                        progress_counter[0] += 1
         for poi_type in serv.on_the_go_list:
             for coord in poi_coords_by_type[poi_type]:
                 if not route.bus_cache_exists(origin, coord):
-                    route.get_route(
-                        graph,
-                        "bus",
-                        origin,
-                        coord,
-                        impedance_flag=True,
-                        ax=None,
-                        distance_only=True,
-                        return_geometry=True,
-                        quiet=True
-                    )
-                if pbar:
-                    if pbar_lock:
-                        with pbar_lock:
-                            pbar.update(1)
-                    else:
-                        pbar.update(1)
+                    _request_bus_route(graph, origin, coord, otp_semaphore)
+                if progress_counter is not None and progress_lock is not None:
+                    with progress_lock:
+                        progress_counter[0] += 1
 
 
 def run_pipeline(max_nodes=None, max_pois=None, seed=42, enable_progress=True):
@@ -354,23 +359,62 @@ def run_pipeline(max_nodes=None, max_pois=None, seed=42, enable_progress=True):
             total_bus_tasks = len(nodes_with_coords) * total_pois
 
             bus_pbar = tqdm(total=total_bus_tasks, desc="Bus routes", mininterval=0) if enable_progress else None
-            bus_lock = threading.Lock() if bus_pbar else None
-            mid = len(nodes_with_coords) // 2
+            bus_progress_counter = [0] if bus_pbar else None
+            bus_progress_lock = threading.Lock() if bus_pbar else None
+            bus_threads_count = min(workers, len(nodes_with_coords)) if nodes_with_coords else 0
+            otp_limit = bus_threads_count if CAP_OTP is None else max(1, int(CAP_OTP))
+            otp_semaphore = threading.Semaphore(max(1, otp_limit))
             routing_running[0] = True
-            bus_threads = [
-                threading.Thread(
-                    target=_precompute_bus_routes,
-                    args=(graph, nodes_with_coords[:mid], poi_coords_by_type, bus_pbar, bus_lock),
-                    daemon=True
-                ),
-                threading.Thread(
-                    target=_precompute_bus_routes,
-                    args=(graph, nodes_with_coords[mid:], poi_coords_by_type, bus_pbar, bus_lock),
-                    daemon=True
-                ),
-            ]
+            bus_progress_thread = None
+
+            def _flush_bus_progress():
+                if not bus_pbar:
+                    return
+                with bus_progress_lock:
+                    delta = bus_progress_counter[0]
+                    bus_progress_counter[0] = 0
+                if delta:
+                    bus_pbar.update(delta)
+
+            def _refresh_bus_progress():
+                while routing_running[0] and not stop_event.wait(1):
+                    _flush_bus_progress()
+                    bus_pbar.refresh()
+
+            if bus_pbar:
+                bus_progress_thread = threading.Thread(target=_refresh_bus_progress, daemon=True)
+                bus_progress_thread.start()
+
+            bus_threads = []
+            for i in range(bus_threads_count):
+                shard = nodes_with_coords[i::bus_threads_count]
+                if not shard:
+                    continue
+                bus_threads.append(
+                    threading.Thread(
+                        target=_precompute_bus_routes,
+                        args=(
+                            graph,
+                            shard,
+                            poi_coords_by_type,
+                            otp_semaphore,
+                            bus_progress_counter,
+                            bus_progress_lock,
+                        ),
+                        daemon=True
+                    )
+                )
             for t in bus_threads:
                 t.start()
+            for t in bus_threads:
+                t.join()
+            routing_running[0] = False
+            if bus_progress_thread:
+                bus_progress_thread.join(timeout=2)
+            if bus_pbar:
+                _flush_bus_progress()
+                bus_pbar.refresh()
+                bus_pbar.close()
 
             cache_paths = {}
             nodes_to_compute = []
@@ -410,12 +454,6 @@ def run_pipeline(max_nodes=None, max_pois=None, seed=42, enable_progress=True):
                 if pbar_non_bus:
                     pbar_non_bus.close()
 
-            for t in bus_threads:
-                t.join()
-            if bus_pbar:
-                bus_pbar.close()
-            routing_running[0] = False
-
             if enable_progress:
                 pbar = tqdm(total=len(nodes_with_coords), desc="Nodes", mininterval=0)
 
@@ -443,7 +481,7 @@ def run_pipeline(max_nodes=None, max_pois=None, seed=42, enable_progress=True):
 
 
 def main():
-    empty_cache()
+    # empty_cache()
     run_pipeline()
 
 
