@@ -3,12 +3,14 @@ import json
 import pickle
 import hashlib
 import requests
+import threading
 import polyline
 import osmnx as ox
 import networkx as nx
 from datetime import datetime
 import matplotlib.pyplot as plt
 from osmnx.routing import route_to_gdf
+from requests.adapters import HTTPAdapter
 
 from utils import get_impedance, graphml
 
@@ -22,6 +24,7 @@ _ROUTE_CACHE = {}  # cache in memoria per distanze/impeance
 _ROUTE_GEOM_CACHE = {}  # cache in memoria per geometrie
 _ROUTE_CACHE_FOLDER = "route_cache"
 _ROUTE_COORD_ROUND = 6  # arrotondamento coordinate per chiave cache
+_HTTP_LOCAL = threading.local()
 
 # Data/ora per pianificazione (OTP)
 ROUTE_DATE = "2025-11-12"   # YYYY-MM-DD
@@ -143,6 +146,18 @@ def _get_mode_graph(network_type):
     return _MODE_GRAPH_CACHE[network_type]
 
 
+def _get_http_session():
+    # una Session per thread: mantiene connessioni keep-alive senza condivisione cross-thread
+    session = getattr(_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _HTTP_LOCAL.session = session
+    return session
+
+
 
 def get_route(
     graph,
@@ -154,6 +169,8 @@ def get_route(
     distance_only=False,
     return_geometry=False,
     quiet=False,
+    timeout_s=60,
+    otp_url=None,
 ):
     """
     origin/destination: tuple (lat, lon)
@@ -170,7 +187,7 @@ def get_route(
     """
 
     # URL del server OTP2
-    OTP_URL = "http://localhost:8080/otp/routers/default/index/graphql"
+    OTP_URL = otp_url or "http://localhost:8080/otp/routers/default/index/graphql"
 
     fig = None
     if not distance_only:
@@ -234,11 +251,11 @@ def get_route(
         """
 
         try:
-            resp = requests.post(
+            resp = _get_http_session().post(
                 OTP_URL,
                 headers={"Content-Type": "application/json"},
                 data=json.dumps({"query": query}),
-                timeout=60
+                timeout=timeout_s
             )
         except Exception as e:
             print("Non hai avviato correttamente OpenTripPlanner oppure OTP non è raggiungibile.")
