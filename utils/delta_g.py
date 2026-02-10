@@ -9,6 +9,7 @@ import time
 import numpy as np
 import re
 import hashlib
+import json
 
 # Configurazione base per la cache su disco
 CACHE_VERSION = 1
@@ -20,9 +21,31 @@ os.makedirs(POI_GEOM_CACHE_FOLDER, exist_ok=True)
 # Variabili globali per mantenere i dati in memoria (RAM) ed evitare caricamenti ripetuti
 _G_CACHE = None
 _POI_GEOM_CACHE = {}  # chiave: (feature, value) -> list geom
-_POI_POINTS_CACHE = {}  # chiave: poi_type -> list of Point geometries
+_POI_POINTS_CACHE = {}  # chiave: (feature, value) -> list of Point geometries
 _MODE_GRAPH_CACHE = {}  # chiave: network_type -> graph
 _MODE_LENGTHS_CACHE = {}  # chiave: (origin_lat, origin_lon, network_type, radius_key) -> dict node->distance
+
+
+def _entrance_point_for_geom(geom, search_radius_m=50, poi_name=None, poi_lat=None, poi_lon=None):
+    if geom is None:
+        raise ValueError(
+            f"POI geometry is None; cannot infer point. name={poi_name} lat={poi_lat} lon={poi_lon}"
+        )
+    if geom.geom_type == "Point":
+        return geom
+    # Fast path: use centroid only
+    try:
+        return geom.centroid
+    except Exception as e:
+        raise ValueError(
+            f"Cannot compute centroid ({geom.geom_type}): {e}. name={poi_name} lat={poi_lat} lon={poi_lon}"
+        )
+
+
+def _extract_geom_and_name(item):
+    if isinstance(item, tuple) and len(item) == 2:
+        return item[0], item[1]
+    return item, None
 
 
 def _poi_geom_cache_path(feature, value):
@@ -59,6 +82,21 @@ def _resolve_feature(poi_type, feature):
             return poi_type, True
         return "amenity", poi_type
     return feature, poi_type
+
+
+def _tags_cache_key(tags):
+    # Stable key for tag dicts (OSMnx-style), used in caches and filenames.
+    tags_json = json.dumps(tags, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    key_hash = hashlib.sha1(tags_json.encode("utf-8")).hexdigest()
+    return f"tags_{key_hash}"
+
+
+def _resolve_query(poi_type, feature, tags):
+    # Resolve query to a (feature, value) cache key and normalized tags.
+    if tags:
+        return "tags", _tags_cache_key(tags), tags
+    feature, value = _resolve_feature(poi_type, feature)
+    return feature, value, None
 
 
 def _haversine_m(lat1, lon1, lat2, lon2):
@@ -111,19 +149,31 @@ def preload_all_pois(poi_list):
     # per evitare che ogni worker cerchi di scaricare dati simultaneamente.
     global _POI_GEOM_CACHE
     print("Pre-loading POI geometries...")
-    for poi_type in poi_list:
-        feature, value = _resolve_feature(poi_type, None)
+    for item in poi_list:
+        if isinstance(item, str):
+            poi_type = item
+            feature = None
+            tags = None
+        else:
+            poi_type = item.poi_type
+            feature = getattr(item, "feature", None)
+            tags = getattr(item, "tags", None)
+        feature, value, tags = _resolve_query(poi_type, feature, tags)
         cache_key = (feature, value)
         if cache_key not in _POI_GEOM_CACHE:
             try:
-                print(f"  Fetching POI: {poi_type} ({feature}={value})...")
-                poi = graphml.get_poi(feature, value)
+                if tags:
+                    print(f"  Fetching POI: {poi_type} (tags={tags})...")
+                    poi = graphml.get_poi(tags=tags)
+                else:
+                    print(f"  Fetching POI: {poi_type} ({feature}={value})...")
+                    poi = graphml.get_poi(feature, value)
                 geometries = graphml.get_poi_geometries(poi)
                 _POI_GEOM_CACHE[cache_key] = geometries
                 _save_poi_geometries_to_disk(feature, value, geometries)
             except Exception as e:
                 print(f"  Error fetching {poi_type}: {e}")
-                _POI_GEOM_CACHE[cache_key] = []
+                raise
     print("POI pre-loading complete.")
     return _POI_GEOM_CACHE
 
@@ -196,8 +246,8 @@ def accessibility_from_rra(RRA):
     return accessibility_value
 
 
-def accessibility_non_bus(poi_type, origine, feature=None, radius_m=None):
-    feature, value = _resolve_feature(poi_type, feature)
+def accessibility_non_bus(poi_type, origine, feature=None, radius_m=None, tags=None):
+    feature, value, tags = _resolve_query(poi_type, feature, tags)
     cache_file = _cache_file_path(poi_type, origine, feature, radius_m)
 
     if os.path.exists(cache_file):
@@ -224,25 +274,41 @@ def accessibility_non_bus(poi_type, origine, feature=None, radius_m=None):
             _POI_GEOM_CACHE[cache_key] = cached_geom
         else:
             # carica geometrie POI una sola volta per tipo
-            poi = graphml.get_poi(feature, value)
+            if tags:
+                poi = graphml.get_poi(tags=tags)
+            else:
+                poi = graphml.get_poi(feature, value)
             geometries = graphml.get_poi_geometries(poi)
             _POI_GEOM_CACHE[cache_key] = geometries
             _save_poi_geometries_to_disk(feature, value, geometries)
 
     poi_geometry = _POI_GEOM_CACHE[cache_key]
 
-    if radius_m is None and poi_type in _POI_POINTS_CACHE:
-        poi_points = _POI_POINTS_CACHE[poi_type]
+    points_cache_key = (feature, value)
+    if radius_m is None and points_cache_key in _POI_POINTS_CACHE:
+        poi_points = _POI_POINTS_CACHE[points_cache_key]
     else:
         poi_points = []
-        for geom in poi_geometry:
+        for item in poi_geometry:
+            geom, poi_name = _extract_geom_and_name(item)
             if geom is None:
                 continue
-            if geom.geom_type != "Point":
-                geom = geom.representative_point()
+            poi_lat = None
+            poi_lon = None
+            try:
+                if geom.geom_type == "Point":
+                    poi_lat = geom.y
+                    poi_lon = geom.x
+                else:
+                    c = geom.centroid
+                    poi_lat = c.y
+                    poi_lon = c.x
+            except Exception:
+                pass
+            geom = _entrance_point_for_geom(geom, poi_name=poi_name, poi_lat=poi_lat, poi_lon=poi_lon)
             poi_points.append(geom)
         if radius_m is None:
-            _POI_POINTS_CACHE[poi_type] = poi_points
+            _POI_POINTS_CACHE[points_cache_key] = poi_points
 
     if radius_m is not None:
         # filtra POI per raggio per ridurre il lavoro
@@ -304,8 +370,8 @@ def accessibility_non_bus(poi_type, origine, feature=None, radius_m=None):
     }
 
 
-def get_poi_points(poi_type, origine, feature=None, radius_m=None):
-    feature, value = _resolve_feature(poi_type, feature)
+def get_poi_points(poi_type, origine, feature=None, radius_m=None, tags=None, progress=None):
+    feature, value, tags = _resolve_query(poi_type, feature, tags)
 
     global _POI_GEOM_CACHE, _POI_POINTS_CACHE
     cache_key = (feature, value)
@@ -314,25 +380,43 @@ def get_poi_points(poi_type, origine, feature=None, radius_m=None):
         if cached_geom is not None:
             _POI_GEOM_CACHE[cache_key] = cached_geom
         else:
-            poi = graphml.get_poi(feature, value)
+            if tags:
+                poi = graphml.get_poi(tags=tags)
+            else:
+                poi = graphml.get_poi(feature, value)
             geometries = graphml.get_poi_geometries(poi)
             _POI_GEOM_CACHE[cache_key] = geometries
             _save_poi_geometries_to_disk(feature, value, geometries)
 
     poi_geometry = _POI_GEOM_CACHE[cache_key]
 
-    if radius_m is None and poi_type in _POI_POINTS_CACHE:
-        poi_points = _POI_POINTS_CACHE[poi_type]
+    points_cache_key = (feature, value)
+    if radius_m is None and points_cache_key in _POI_POINTS_CACHE:
+        poi_points = _POI_POINTS_CACHE[points_cache_key]
     else:
         poi_points = []
-        for geom in poi_geometry:
+        for item in poi_geometry:
+            geom, poi_name = _extract_geom_and_name(item)
             if geom is None:
                 continue
-            if geom.geom_type != "Point":
-                geom = geom.representative_point()
+            poi_lat = None
+            poi_lon = None
+            try:
+                if geom.geom_type == "Point":
+                    poi_lat = geom.y
+                    poi_lon = geom.x
+                else:
+                    c = geom.centroid
+                    poi_lat = c.y
+                    poi_lon = c.x
+            except Exception:
+                pass
+            geom = _entrance_point_for_geom(geom, poi_name=poi_name, poi_lat=poi_lat, poi_lon=poi_lon)
             poi_points.append(geom)
+            if progress is not None:
+                progress.update(1)
         if radius_m is None:
-            _POI_POINTS_CACHE[poi_type] = poi_points
+            _POI_POINTS_CACHE[points_cache_key] = poi_points
 
     if radius_m is not None:
         poi_points = [
@@ -374,15 +458,15 @@ def merge_rra_and_accessibility(decay_walk, decay_bike, decay_drive, decay_bus):
     return RRA, accessibility_from_rra(RRA)
 
 
-def accessibility(poi_type, origine, feature=None, radius_m=None):
-    feature, value = _resolve_feature(poi_type, feature)
+def accessibility(poi_type, origine, feature=None, radius_m=None, tags=None):
+    feature, value, tags = _resolve_query(poi_type, feature, tags)
     cache_file = _cache_file_path(poi_type, origine, feature, radius_m)
 
     if os.path.exists(cache_file):
         RRA = load_rra(cache_file)
         return accessibility_from_rra(RRA)
 
-    data = accessibility_non_bus(poi_type, origine, feature, radius_m)
+    data = accessibility_non_bus(poi_type, origine, feature, radius_m, tags)
     poi_points = data["poi_points"]
     beta = data["beta"]
     decay_walk = data["decay_walk"]
