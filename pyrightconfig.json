@@ -1,0 +1,19 @@
+{
+  "exclude": [
+    "**/.git",
+    "**/.hg",
+    "**/.svn",
+    "**/__pycache__",
+    "**/access_cache",
+    "**/cache",
+    "**/graph",
+    "**/graph_cache",
+    "**/gtfs-pbf",
+    "**/outputs",
+    "**/poi",
+    "**/poi_geom_cache",
+    "**/route_cache",
+    "**/rra_cache"
+  ],
+  "typeCheckingMode": "basic"
+}

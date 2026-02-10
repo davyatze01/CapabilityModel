@@ -25,6 +25,7 @@ _ROUTE_GEOM_CACHE = {}  # cache in memoria per geometrie
 _ROUTE_CACHE_FOLDER = "route_cache"
 _ROUTE_COORD_ROUND = 6  # arrotondamento coordinate per chiave cache
 _HTTP_LOCAL = threading.local()
+_GRAPH_BOUNDS_CACHE = {}  # cache bounds per grafo (id -> (min_lat, max_lat, min_lon, max_lon))
 
 # Data/ora per pianificazione (OTP)
 ROUTE_DATE = "2025-11-12"   # YYYY-MM-DD
@@ -158,6 +159,50 @@ def _get_http_session():
     return session
 
 
+def _ensure_ax(ax):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 8))
+        return fig, ax
+    return ax.figure, ax
+
+
+def _get_graph_bounds(graph):
+    if graph is None:
+        return None
+    key = id(graph)
+    if key in _GRAPH_BOUNDS_CACHE:
+        return _GRAPH_BOUNDS_CACHE[key]
+    min_lat = min_lon = float("inf")
+    max_lat = max_lon = float("-inf")
+    for _, data in graph.nodes(data=True):
+        if "y" not in data or "x" not in data:
+            continue
+        lat = data["y"]
+        lon = data["x"]
+        if lat < min_lat:
+            min_lat = lat
+        if lat > max_lat:
+            max_lat = lat
+        if lon < min_lon:
+            min_lon = lon
+        if lon > max_lon:
+            max_lon = lon
+    if min_lat == float("inf"):
+        bounds = None
+    else:
+        bounds = (min_lat, max_lat, min_lon, max_lon)
+    _GRAPH_BOUNDS_CACHE[key] = bounds
+    return bounds
+
+
+def coord_in_graph_bounds(graph, coord):
+    bounds = _get_graph_bounds(graph)
+    if bounds is None:
+        return True
+    lat, lon = coord
+    return bounds[0] <= lat <= bounds[1] and bounds[2] <= lon <= bounds[3]
+
+
 
 def get_route(
     graph,
@@ -192,10 +237,7 @@ def get_route(
     fig = None
     if not distance_only:
         # Se ax non è creato lo creo
-        if ax is None:
-            fig, ax = plt.subplots(figsize=(8, 8))
-        else:
-            fig = ax.figure
+        fig, ax = _ensure_ax(ax)
 
     # ==========================
     # CASO BUS (OTP2)
@@ -287,6 +329,7 @@ def get_route(
 
         if not distance_only:
             # sfondo: grafo passato in input (es. il tuo graphml di Cagliari)
+            fig, ax = _ensure_ax(ax)
             ox.plot_graph(
                 graph,
                 ax=ax,
@@ -350,16 +393,20 @@ def get_route(
             else:
                 label = f"{mode} Partenza: {departure_t} - Arrivo: {arrive_t}"
 
+    
             if not distance_only:
+                fig, ax = _ensure_ax(ax)
                 ax.plot(lons, lats, color=color, linewidth=3, label=label, zorder=5)
             prec_leg_end_time = leg["endTime"]
 
         if impedance_flag and not distance_only:
             imp_label = "Impedance:\n" + "\n".join([f"{i}: {imp:.3f}" if isinstance(imp, (int, float)) else f"{i}: {imp}"
                                                     for i, imp in enumerate(impedance)])
+            fig, ax = _ensure_ax(ax)
             ax.scatter([], [], color="violet", label=imp_label)
 
         if not distance_only:
+            fig, ax = _ensure_ax(ax)
             ax.scatter(origin[1], origin[0], c="lime", s=100, marker="o", label="Origine", zorder=6)
             ax.scatter(destination[1], destination[0], c="red", s=100, marker="o", label="Destinazione", zorder=6)
 
@@ -425,6 +472,7 @@ def get_route(
             result_value = imp_value if impedance_flag else (distance_m if distance_only else None)
             return fig, ax, result_value, route_gdf
         if not distance_only and route_nodes is not None:
+            fig, ax = _ensure_ax(ax)
             # in caso di cache hit, plottiamo direttamente la route salvata
             # plot grafo + route
             ox.plot_graph(
@@ -484,6 +532,7 @@ def get_route(
 
     if not distance_only:
         # plot grafo + route
+        fig, ax = _ensure_ax(ax)
         ox.plot_graph(
             network_graph,
             ax=ax,
@@ -509,6 +558,7 @@ def get_route(
         origin_x, origin_y = network_graph.nodes[origin_node]["x"], network_graph.nodes[origin_node]["y"]
         dest_x, dest_y = network_graph.nodes[destination_node]["x"], network_graph.nodes[destination_node]["y"]
 
+        fig, ax = _ensure_ax(ax)
         ax.scatter(origin_x, origin_y, c="lime", s=100, marker="o", label="Origine", zorder=5)
         ax.scatter(dest_x, dest_y, c="red", s=100, marker="o", label="Destinazione", zorder=5)
 
@@ -521,9 +571,11 @@ def get_route(
             distance_km = distance_m / 1000.0
         imp_value = get_impedance.impedance_base(distance_km, network_type)
         if not distance_only:
+            fig, ax = _ensure_ax(ax)
             ax.scatter([], [], c="violet", label=f"Impedance: {imp_value}", marker="s")
 
     if not distance_only:
+        fig, ax = _ensure_ax(ax)
         ax.legend(facecolor="black", labelcolor="white", loc="lower right", fontsize=8, framealpha=0.9)
         ax.set_title(network_type, color="white")
 
