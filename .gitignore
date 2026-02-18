@@ -209,6 +209,7 @@ __marimo__/
 rra_cache/
 poi/
 cache/
+access_cache/
 route_cache/
 poi_geom_cache/
 graph_cache/
