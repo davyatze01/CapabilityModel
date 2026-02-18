@@ -4,6 +4,10 @@ import geopandas as gpd
 import pandas as pd
 import hashlib
 import json
+from typing import TypeAlias
+
+TagValue: TypeAlias = bool | str | list[str]
+TagsDict: TypeAlias = dict[str, TagValue]
 
 # In-memory caches to avoid repeated disk loads
 _GRAPH_CACHE = None
@@ -61,7 +65,11 @@ def _tags_file_name(tags):
     return f"tags_{key_hash}.geojson"
 
 
-def get_poi(feature=None, value=None, tags=None):
+def get_poi(
+    feature: str | None = None,
+    value: TagValue | None = None,
+    tags: TagsDict | None = None,
+):
 
     # Nomi file
     PLACE_NAME = "Cagliari, Sardinia, Italy"
@@ -108,15 +116,15 @@ def get_poi(feature=None, value=None, tags=None):
 
         try:
             if tags:
-                poi = ox.features_from_place(
-                    PLACE_NAME,
-                    tags
-                )
+                query_tags: TagsDict = tags
             else:
-                poi = ox.features_from_place(
-                    PLACE_NAME,
-                    {feature: value}
-                )
+                feature_key = feature if feature is not None else "amenity"
+                value_key: TagValue = value if value is not None else True
+                query_tags = {feature_key: value_key}
+            poi = ox.features_from_place(
+                PLACE_NAME,
+                query_tags
+            )
         except Exception as e:
             # Nessun POI disponibile per questa query: ritorna GDF vuoto
             print(f"Nessun POI trovato per {feature}={value} tags={tags}: {e}")
@@ -170,18 +178,4 @@ def get_poi_amenity_types(poi):
     if "amenity" not in poi.columns:
         return []
     return sorted(poi["amenity"].dropna().astype(str).unique().tolist())
-
-from shapely import wkt
-
-def geocode_from_geometry_str(geometry_str):
-    """
-    Converte una geometry WKT (stringa) in (lat, lon)
-    """
-    geom = wkt.loads(geometry_str)
-
-    if geom.geom_type != "Point":
-        raise ValueError(f"Geometry type non supportato: {geom.geom_type}")
-
-    lon, lat = geom.x, geom.y
-    return lat, lon
 

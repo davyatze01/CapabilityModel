@@ -3,6 +3,7 @@ from utils import graphml, route, decay, get_impedance
 import math
 import os
 import pickle
+from typing import Hashable, TypeGuard, cast
 import networkx as nx
 import osmnx as ox
 import time
@@ -10,6 +11,8 @@ import numpy as np
 import re
 import hashlib
 import json
+from shapely.geometry import Point
+from shapely.geometry.base import BaseGeometry
 
 # Configurazione base per la cache su disco
 CACHE_VERSION = 1
@@ -26,16 +29,75 @@ _MODE_GRAPH_CACHE = {}  # chiave: network_type -> graph
 _MODE_LENGTHS_CACHE = {}  # chiave: (origin_lat, origin_lon, network_type, radius_key) -> dict node->distance
 
 
-def _entrance_point_for_geom(geom, search_radius_m=50, poi_name=None, poi_lat=None, poi_lon=None):
+def _normalize_node_id(node):
+    # Convert numpy scalars returned by nearest_nodes to plain hashable ids.
+    try:
+        return node.item()
+    except Exception:
+        return node
+
+
+def _entrance_point_for_geom(geom, snap_graph=None, search_radius_m=50, poi_name=None, poi_lat=None, poi_lon=None) -> Point:
     if geom is None:
         raise ValueError(
             f"POI geometry is None; cannot infer point. name={poi_name} lat={poi_lat} lon={poi_lon}"
         )
     if geom.geom_type == "Point":
         return geom
-    # Fast path: use centroid only
+
+    # Polygon fallback: evaluate all boundary vertices and keep the closest
+    # vertex->nearest-node pair.
+    if snap_graph is not None and geom.geom_type in {"Polygon", "MultiPolygon"}:
+        try:
+            vertices = []
+            if geom.geom_type == "Polygon":
+                rings = [geom.exterior] + list(geom.interiors)
+                for ring in rings:
+                    vertices.extend(list(ring.coords))
+            else:
+                for poly in geom.geoms:
+                    rings = [poly.exterior] + list(poly.interiors)
+                    for ring in rings:
+                        vertices.extend(list(ring.coords))
+
+            if vertices:
+                # remove duplicates while preserving order
+                seen = set()
+                unique_vertices = []
+                for x, y in vertices:
+                    key = (round(x, 9), round(y, 9))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    unique_vertices.append((x, y))
+
+                xs = [x for x, _ in unique_vertices]
+                ys = [y for _, y in unique_vertices]
+                node_ids = ox.distance.nearest_nodes(snap_graph, xs, ys)
+                try:
+                    node_ids = list(node_ids)
+                except TypeError:
+                    node_ids = [node_ids]
+
+                best_node = None
+                best_dist = None
+                for (vx, vy), node_id in zip(unique_vertices, node_ids):
+                    node = snap_graph.nodes[node_id]
+                    node_lat = node["y"]
+                    node_lon = node["x"]
+                    d = _haversine_m(vy, vx, node_lat, node_lon)
+                    if best_dist is None or d < best_dist:
+                        best_dist = d
+                        best_node = (node_lon, node_lat)
+
+                if best_node is not None:
+                    return Point(best_node[0], best_node[1])
+        except Exception:
+            pass
+
+    # Fallback: centroid
     try:
-        return geom.centroid
+        return cast(Point, geom.centroid)
     except Exception as e:
         raise ValueError(
             f"Cannot compute centroid ({geom.geom_type}): {e}. name={poi_name} lat={poi_lat} lon={poi_lon}"
@@ -46,6 +108,10 @@ def _extract_geom_and_name(item):
     if isinstance(item, tuple) and len(item) == 2:
         return item[0], item[1]
     return item, None
+
+
+def _is_geometry(value) -> TypeGuard[BaseGeometry]:
+    return isinstance(value, BaseGeometry)
 
 
 def _poi_geom_cache_path(feature, value):
@@ -130,7 +196,14 @@ def precompute_distances(origin, radius_m=None):
     for mode in ["walk", "bike", "drive"]:
         try:
             mode_graph = _get_mode_graph(mode)
-            origin_node = ox.distance.nearest_nodes(mode_graph, origin[1], origin[0])
+            origin_nodes = ox.distance.nearest_nodes(mode_graph, [origin[1]], [origin[0]])
+            try:
+                origin_nodes = list(origin_nodes)
+            except TypeError:
+                origin_nodes = [origin_nodes]
+            if not origin_nodes:
+                raise RuntimeError("nearest_nodes returned no origin node")
+            origin_node = cast(Hashable, _normalize_node_id(origin_nodes[0]))
             
             # Calcola la distanza da 'origin_node' verso TUTTI gli altri nodi del grafo
             lengths = nx.single_source_dijkstra_path_length(
@@ -178,18 +251,29 @@ def preload_all_pois(poi_list):
     return _POI_GEOM_CACHE
 
 
-def _get_mode_lengths(grafo, origin, network_type, radius_m):
+def _get_mode_lengths(grafo, origin, network_type, radius_m, origin_node=None):
     # cache delle distanze da origine per evitare Dijkstra ripetuti
-    origin_key = (round(origin[0], 6), round(origin[1], 6))
     radius_key = "all" if radius_m is None else f"r{int(radius_m)}"
-    key = (origin_key[0], origin_key[1], network_type, radius_key)
+    if origin_node is None:
+        origin_key = (round(origin[0], 6), round(origin[1], 6))
+        key = (origin_key[0], origin_key[1], network_type, radius_key)
+    else:
+        key = (int(origin_node), network_type, radius_key)
 
     if key in _MODE_LENGTHS_CACHE:
         # ritorna distanze già calcolate per questa origine/modo
         return _MODE_LENGTHS_CACHE[key]
 
     mode_graph = _get_mode_graph(network_type)
-    origin_node = ox.distance.nearest_nodes(mode_graph, origin[1], origin[0])
+    if origin_node is None:
+        origin_nodes = ox.distance.nearest_nodes(mode_graph, [origin[1]], [origin[0]])
+        try:
+            origin_nodes = list(origin_nodes)
+        except TypeError:
+            origin_nodes = [origin_nodes]
+        if not origin_nodes:
+            raise RuntimeError("nearest_nodes returned no origin node")
+        origin_node = cast(Hashable, _normalize_node_id(origin_nodes[0]))
     lengths = nx.single_source_dijkstra_path_length(
         mode_graph,
         origin_node,
@@ -286,26 +370,33 @@ def accessibility_non_bus(poi_type, origine, feature=None, radius_m=None, tags=N
 
     points_cache_key = (feature, value)
     if radius_m is None and points_cache_key in _POI_POINTS_CACHE:
-        poi_points = _POI_POINTS_CACHE[points_cache_key]
+        poi_points = cast(list[Point], _POI_POINTS_CACHE[points_cache_key])
     else:
-        poi_points = []
+        poi_points: list[Point] = []
         for item in poi_geometry:
             geom, poi_name = _extract_geom_and_name(item)
-            if geom is None:
+            if not _is_geometry(geom):
                 continue
             poi_lat = None
             poi_lon = None
             try:
                 if geom.geom_type == "Point":
-                    poi_lat = geom.y
-                    poi_lon = geom.x
+                    geom_point = cast(Point, geom)
+                    poi_lat = geom_point.y
+                    poi_lon = geom_point.x
                 else:
                     c = geom.centroid
                     poi_lat = c.y
                     poi_lon = c.x
             except Exception:
                 pass
-            geom = _entrance_point_for_geom(geom, poi_name=poi_name, poi_lat=poi_lat, poi_lon=poi_lon)
+            geom = _entrance_point_for_geom(
+                geom,
+                snap_graph=grafo,
+                poi_name=poi_name,
+                poi_lat=poi_lat,
+                poi_lon=poi_lon,
+            )
             poi_points.append(geom)
         if radius_m is None:
             _POI_POINTS_CACHE[points_cache_key] = poi_points
@@ -319,21 +410,47 @@ def accessibility_non_bus(poi_type, origine, feature=None, radius_m=None, tags=N
 
     beta = math.log(2) / 20.0  # parametro di decay
 
+    if not poi_points:
+        return {
+            "cache_hit": False,
+            "cache_file": cache_file,
+            "poi_points": [],
+            "beta": beta,
+            "decay_walk": [],
+            "decay_bike": [],
+            "decay_drive": [],
+        }
+
     xs = [geom.x for geom in poi_points]
     ys = [geom.y for geom in poi_points]
 
     mode_distances = {}
     for mode in ["walk", "bike", "drive"]:
         # trova nodi POI e distanze shortest-path cached per ogni modo
-        mode_graph = _get_mode_graph(mode)
-        poi_nodes = ox.distance.nearest_nodes(mode_graph, xs, ys)
         try:
-            poi_nodes = list(poi_nodes)
-        except TypeError:
-            poi_nodes = [poi_nodes]
+            mode_graph = _get_mode_graph(mode)
+            # single pass: snap origin + tutti i POI insieme
+            all_x = [origine[1]]
+            all_y = [origine[0]]
+            all_x.extend(xs)
+            all_y.extend(ys)
+            all_nodes = ox.distance.nearest_nodes(mode_graph, all_x, all_y)
+            try:
+                all_nodes = list(all_nodes)
+            except TypeError:
+                all_nodes = [all_nodes]
 
-        lengths = _get_mode_lengths(grafo, origine, mode, radius_m)
-        mode_distances[mode] = [lengths.get(node) for node in poi_nodes]
+            if not all_nodes:
+                mode_distances[mode] = [None] * len(poi_points)
+                continue
+            origin_node = cast(Hashable, _normalize_node_id(all_nodes[0]))
+            poi_nodes = [cast(Hashable, _normalize_node_id(n)) for n in all_nodes[1:]]
+
+            lengths = _get_mode_lengths(grafo, origine, mode, radius_m, origin_node=origin_node)
+            mode_distances[mode] = [lengths.get(node) for node in poi_nodes]
+        except Exception:
+            # fail soft for this mode; caller will skip None distances
+            mode_distances[mode] = [None] * len(poi_points)
 
     decay_walk = []
     decay_bike = []
@@ -373,7 +490,10 @@ def accessibility_non_bus(poi_type, origine, feature=None, radius_m=None, tags=N
 def get_poi_points(poi_type, origine, feature=None, radius_m=None, tags=None, progress=None):
     feature, value, tags = _resolve_query(poi_type, feature, tags)
 
-    global _POI_GEOM_CACHE, _POI_POINTS_CACHE
+    global _G_CACHE, _POI_GEOM_CACHE, _POI_POINTS_CACHE
+    if _G_CACHE is None:
+        _G_CACHE = graphml.get_graph()
+    grafo = _G_CACHE
     cache_key = (feature, value)
     if cache_key not in _POI_GEOM_CACHE:
         cached_geom = _load_poi_geometries_from_disk(feature, value)
@@ -392,26 +512,33 @@ def get_poi_points(poi_type, origine, feature=None, radius_m=None, tags=None, pr
 
     points_cache_key = (feature, value)
     if radius_m is None and points_cache_key in _POI_POINTS_CACHE:
-        poi_points = _POI_POINTS_CACHE[points_cache_key]
+        poi_points = cast(list[Point], _POI_POINTS_CACHE[points_cache_key])
     else:
-        poi_points = []
+        poi_points: list[Point] = []
         for item in poi_geometry:
             geom, poi_name = _extract_geom_and_name(item)
-            if geom is None:
+            if not _is_geometry(geom):
                 continue
             poi_lat = None
             poi_lon = None
             try:
                 if geom.geom_type == "Point":
-                    poi_lat = geom.y
-                    poi_lon = geom.x
+                    geom_point = cast(Point, geom)
+                    poi_lat = geom_point.y
+                    poi_lon = geom_point.x
                 else:
                     c = geom.centroid
                     poi_lat = c.y
                     poi_lon = c.x
             except Exception:
                 pass
-            geom = _entrance_point_for_geom(geom, poi_name=poi_name, poi_lat=poi_lat, poi_lon=poi_lon)
+            geom = _entrance_point_for_geom(
+                geom,
+                snap_graph=grafo,
+                poi_name=poi_name,
+                poi_lat=poi_lat,
+                poi_lon=poi_lon,
+            )
             poi_points.append(geom)
             if progress is not None:
                 progress.update(1)
@@ -459,6 +586,7 @@ def merge_rra_and_accessibility(decay_walk, decay_bike, decay_drive, decay_bus):
 
 
 def accessibility(poi_type, origine, feature=None, radius_m=None, tags=None):
+    global _G_CACHE
     feature, value, tags = _resolve_query(poi_type, feature, tags)
     cache_file = _cache_file_path(poi_type, origine, feature, radius_m)
 

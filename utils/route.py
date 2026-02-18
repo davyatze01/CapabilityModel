@@ -2,6 +2,8 @@ import os
 import json
 import pickle
 import hashlib
+import time
+from typing import cast
 import requests
 import threading
 import polyline
@@ -26,6 +28,8 @@ _ROUTE_CACHE_FOLDER = "route_cache"
 _ROUTE_COORD_ROUND = 6  # arrotondamento coordinate per chiave cache
 _HTTP_LOCAL = threading.local()
 _GRAPH_BOUNDS_CACHE = {}  # cache bounds per grafo (id -> (min_lat, max_lat, min_lon, max_lon))
+_ROUTE_CACHE_LOCKS = {}
+_ROUTE_CACHE_LOCKS_GUARD = threading.Lock()
 
 # Data/ora per pianificazione (OTP)
 ROUTE_DATE = "2025-11-12"   # YYYY-MM-DD
@@ -69,30 +73,113 @@ def _route_cache_path(key, suffix):
     return os.path.join(_ROUTE_CACHE_FOLDER, f"{key_hash}.{suffix}.pkl") #ad esempio: route_cache/abc123.dist.pkl
 
 
+def _route_cache_source_key(route_key):
+    # bucket per sorgente/modalita/tempo: una entry per ogni destinazione
+    return (
+        route_key[0],  # network_type
+        route_key[1],  # origin_key
+        route_key[3],  # route_date
+        route_key[4],  # route_time
+        route_key[5],  # dist
+        route_key[6],  # center_key
+    )
+
+
+def _route_cache_dest_key(route_key):
+    return route_key[2]  # destination
+
+
+def _route_cache_bucket_path(source_key):
+    os.makedirs(_ROUTE_CACHE_FOLDER, exist_ok=True)
+    key_bytes = pickle.dumps(source_key)
+    key_hash = hashlib.sha1(key_bytes).hexdigest()
+    return os.path.join(_ROUTE_CACHE_FOLDER, f"{key_hash}.dist.pkl")
+
+
+def _route_cache_source_lock(source_key):
+    with _ROUTE_CACHE_LOCKS_GUARD:
+        lock = _ROUTE_CACHE_LOCKS.get(source_key)
+        if lock is None:
+            lock = threading.Lock()
+            _ROUTE_CACHE_LOCKS[source_key] = lock
+        return lock
+
+
+def _route_cache_bucket_load(source_key):
+    if source_key in _ROUTE_CACHE:
+        bucket = _ROUTE_CACHE[source_key]
+        if isinstance(bucket, dict):
+            return bucket
+    path = _route_cache_bucket_path(source_key)
+    if not os.path.exists(path):
+        bucket = {}
+        _ROUTE_CACHE[source_key] = bucket
+        return bucket
+    try:
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        if isinstance(data, dict):
+            _ROUTE_CACHE[source_key] = data
+            return data
+    except Exception:
+        pass
+    bucket = {}
+    _ROUTE_CACHE[source_key] = bucket
+    return bucket
+
+
+def _atomic_pickle_write(path, value, retries=5, sleep_s=0.05):
+    # Windows can raise PermissionError on os.replace if another handle is active.
+    tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    for attempt in range(retries):
+        try:
+            with open(tmp_path, "wb") as f:
+                pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, path)
+            return
+        except PermissionError:
+            if attempt >= retries - 1:
+                raise
+            time.sleep(sleep_s * (attempt + 1))
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+
 def _route_cache_get(key):
     # cerca se il dato è già stato caricato e quindi si trova nel dictionary di cache in RAM, oppure sul file corrispondente su disco
-    if key in _ROUTE_CACHE:
-        return _ROUTE_CACHE[key]
-    path = _route_cache_path(key, "dist")
-    if os.path.exists(path):
+    source_key = _route_cache_source_key(key)
+    dest_key = _route_cache_dest_key(key)
+    lock = _route_cache_source_lock(source_key)
+    with lock:
+        bucket = _route_cache_bucket_load(source_key)
+        if dest_key in bucket:
+            return bucket[dest_key]
+
+    legacy_path = _route_cache_path(key, "dist")
+    if os.path.exists(legacy_path):
         try:
-            with open(path, "rb") as f:
-                data = pickle.load(f)
-            _ROUTE_CACHE[key] = data
-            return data
+            with open(legacy_path, "rb") as f:
+                return pickle.load(f)
         except Exception:
             return None
     return None
 
 
 def _route_cache_set(key, value):
-    # si occupa di salvare il dato sia in RAM (dict di esecuzione) che su un file pickle su disco
-    _ROUTE_CACHE[key] = value
-    path = _route_cache_path(key, "dist")
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "wb") as f:
-        pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp_path, path)
+    # salva in cache esclusivamente il valore di distanza
+    source_key = _route_cache_source_key(key)
+    dest_key = _route_cache_dest_key(key)
+    lock = _route_cache_source_lock(source_key)
+    with lock:
+        bucket = dict(_route_cache_bucket_load(source_key))
+        bucket[dest_key] = value
+        _ROUTE_CACHE[source_key] = bucket
+        path = _route_cache_bucket_path(source_key)
+        _atomic_pickle_write(path, bucket)
 
 
 def _route_geom_cache_get(key):
@@ -122,7 +209,7 @@ def _route_geom_cache_set(key, value):
 
 
 def bus_cache_exists(origin, destination, route_date=None, route_time=None):
-    # verifica se cache bus (distanza + geometria) è già disponibile
+    # verifica se cache bus distanza è già disponibile
     cache_key = _route_cache_key(
         "bus",
         origin,
@@ -130,9 +217,52 @@ def bus_cache_exists(origin, destination, route_date=None, route_time=None):
         route_date=route_date or ROUTE_DATE,
         route_time=route_time or ROUTE_TIME,
     )
-    dist_cached = _route_cache_get(cache_key) is not None
-    geom_cached = _route_geom_cache_get(cache_key) is not None
-    return dist_cached and geom_cached
+    return _route_cache_get(cache_key) is not None
+
+
+def bus_distance_cache_exists(origin, destination, route_date=None, route_time=None):
+    # distance/impedance cache only (ignore geometry)
+    cache_key = _route_cache_key(
+        "bus",
+        origin,
+        destination,
+        route_date=route_date or ROUTE_DATE,
+        route_time=route_time or ROUTE_TIME,
+    )
+    return _route_cache_get(cache_key) is not None
+
+
+def _cached_distance_value(cached):
+    # compatibilità retroattiva: vecchi cache dict e nuovo cache numerico
+    if isinstance(cached, (int, float)):
+        return float(cached)
+    if isinstance(cached, dict):
+        if isinstance(cached.get("distance_m"), (int, float)):
+            return float(cached["distance_m"])
+        legacy = cached.get("result_value")
+        if isinstance(legacy, (int, float)):
+            return float(legacy)
+    return None
+
+
+def _cached_waiting_min_value(cached):
+    if isinstance(cached, dict) and isinstance(cached.get("waiting_min"), (int, float)):
+        return float(cached["waiting_min"])
+    return None
+
+
+def _bus_distance_to_impedance_minutes(distance_m):
+    # fallback semplice quando dal cache è disponibile solo la distanza
+    BUS_SPEED_KMH = 10.0
+    return (distance_m / 1000.0 / BUS_SPEED_KMH) * 60.0
+
+
+def _normalize_node_id(node):
+    # Convert numpy scalars returned by nearest_nodes to plain hashable ids.
+    try:
+        return node.item()
+    except Exception:
+        return node
 
 
 def _format_time(timestamp_ms):
@@ -216,6 +346,8 @@ def get_route(
     quiet=False,
     timeout_s=60,
     otp_url=None,
+    save_geometry=True,
+    return_status=False,
 ):
     """
     origin/destination: tuple (lat, lon)
@@ -239,6 +371,25 @@ def get_route(
         # Se ax non è creato lo creo
         fig, ax = _ensure_ax(ax)
 
+    def _build_status(ok, found_itinerary, error_type=None, error_detail=None, status_code=None):
+        return {
+            "ok": bool(ok),
+            "found_itinerary": bool(found_itinerary),
+            "error_type": error_type,
+            "error_detail": error_detail,
+            "status_code": status_code,
+        }
+
+    def _finalize(result_value, geom=None, status=None):
+        if return_status:
+            status_payload = status or _build_status(True, bool(result_value))
+            if return_geometry:
+                return fig, ax, result_value, geom, status_payload
+            return fig, ax, result_value, status_payload
+        if return_geometry:
+            return fig, ax, result_value, geom
+        return fig, ax, result_value
+
     # ==========================
     # CASO BUS (OTP2)
     # ==========================
@@ -253,10 +404,22 @@ def get_route(
         )
         cached = _route_cache_get(cache_key)
         if cached is not None and distance_only:
-            cached_value = cached.get("result_value")
-            if return_geometry:
-                return fig, ax, cached_value, None
-            return fig, ax, cached_value
+            cached_distance = _cached_distance_value(cached)
+            if cached_distance is None:
+                cached_value = None
+            elif impedance_flag:
+                cached_waiting_min = _cached_waiting_min_value(cached)
+                if cached_waiting_min is None:
+                    cached_value = _bus_distance_to_impedance_minutes(cached_distance)
+                else:
+                    cached_value = get_impedance.impedance_bus(cached_distance / 1000.0, cached_waiting_min)
+            else:
+                cached_value = cached_distance
+            return _finalize(
+                cached_value,
+                geom=None,
+                status=_build_status(True, bool(cached_value), error_type=None, error_detail=None, status_code=200),
+            )
 
         query = f"""
         query {{
@@ -285,7 +448,7 @@ def get_route(
                 to   {{ name lat lon }}
                 route {{ shortName longName }}
                 distance
-                legGeometry {{ points }}
+                {"" if distance_only and not save_geometry else "legGeometry { points }"}
               }}
             }}
           }}
@@ -302,26 +465,48 @@ def get_route(
         except Exception as e:
             print("Non hai avviato correttamente OpenTripPlanner oppure OTP non è raggiungibile.")
             print("Dettaglio:", e)
-            return fig, ax, ([] if impedance_flag else None)
+            return _finalize(
+                ([] if impedance_flag else None),
+                geom=None,
+                status=_build_status(False, False, error_type="otp_unreachable", error_detail=str(e), status_code=None),
+            )
 
         if resp.status_code != 200:
             if not quiet:
                 print("Errore nella richiesta OTP:", resp.status_code)
                 print(resp.text)
-            return fig, ax, ([] if impedance_flag else None)
+            return _finalize(
+                ([] if impedance_flag else None),
+                geom=None,
+                status=_build_status(
+                    False,
+                    False,
+                    error_type="otp_http_error",
+                    error_detail=f"HTTP {resp.status_code}",
+                    status_code=resp.status_code,
+                ),
+            )
 
         try:
             data = resp.json()
         except Exception:
             print("OTP ha risposto ma la risposta non è JSON valido.")
             print(resp.text)
-            return fig, ax, ([] if impedance_flag else None)
+            return _finalize(
+                ([] if impedance_flag else None),
+                geom=None,
+                status=_build_status(False, False, error_type="otp_bad_json", error_detail="Invalid JSON", status_code=resp.status_code),
+            )
 
         itineraries = data.get("data", {}).get("plan", {}).get("itineraries", [])
         if not itineraries:
             if not quiet:
                 print("Nessun itinerario trovato (OTP).")
-            return fig, ax, ([] if impedance_flag else None)
+            return _finalize(
+                ([] if impedance_flag else None),
+                geom=None,
+                status=_build_status(True, False, error_type="otp_no_itinerary", error_detail=None, status_code=resp.status_code),
+            )
 
         # itinerario più veloce
         itinerary = min(itineraries, key=lambda i: i["duration"])
@@ -353,12 +538,14 @@ def get_route(
         prec_leg_end_time = None
         impedance = []
         bus_geom = []
+        total_waiting_min = 0.0
 
         for leg in itinerary["legs"]:
-            geometry = leg["legGeometry"]["points"]
-            coords = polyline.decode(geometry)  # [(lat, lon), ...]
-            bus_geom.append(coords)
-            lats, lons = zip(*coords)
+            if not distance_only or save_geometry:
+                geometry = leg["legGeometry"]["points"]
+                coords = polyline.decode(geometry)  # [(lat, lon), ...]
+                bus_geom.append(coords)
+                lats, lons = zip(*coords)
 
             mode = leg["mode"]
             color = mode_colors.get(mode, "white")
@@ -382,6 +569,7 @@ def get_route(
                     waiting_time_min = 0
                 else:
                     waiting_time_min = (leg["startTime"] - prec_leg_end_time) / 60000.0
+                total_waiting_min += waiting_time_min
 
                 if impedance_flag:
                     impedance.append(get_impedance.impedance_bus(leg_distance_km, waiting_time_min))
@@ -394,7 +582,7 @@ def get_route(
                 label = f"{mode} Partenza: {departure_t} - Arrivo: {arrive_t}"
 
     
-            if not distance_only:
+            if not distance_only and bus_geom:
                 fig, ax = _ensure_ax(ax)
                 ax.plot(lons, lats, color=color, linewidth=3, label=label, zorder=5)
             prec_leg_end_time = leg["endTime"]
@@ -425,14 +613,16 @@ def get_route(
             ax.set_title("bus", color="white")
 
         result_value = impedance if impedance_flag else (total_distance_m if distance_only else None)
-        # salva sempre geometria bus per riuso futuro
-        _route_geom_cache_set(cache_key, bus_geom)
-        if distance_only:
-            # salva risultato bus per riuso futuro
-            _route_cache_set(cache_key, {"result_value": result_value})
-        if return_geometry:
-            return fig, ax, result_value, bus_geom
-        return fig, ax, result_value
+        # salva distanza + waiting-time bus per riuso futuro
+        _route_cache_set(cache_key, {
+            "distance_m": total_distance_m,
+            "waiting_min": total_waiting_min,
+        })
+        return _finalize(
+            result_value,
+            geom=bus_geom,
+            status=_build_status(True, True, error_type=None, error_detail=None, status_code=resp.status_code),
+        )
 
     # ==========================
     # CASO WALK/DRIVE/BIKE
@@ -461,44 +651,31 @@ def get_route(
     )
     # tenta cache del routing già calcolato
     cached = _route_cache_get(cache_key)
-    if cached is not None:
-        route_nodes = cached.get("route_nodes")
-        distance_m = cached.get("distance_m")
-        imp_value = cached.get("imp_value")
-        if return_geometry:
-            route_gdf = None
-            if route_nodes is not None:
-                route_gdf = route_to_gdf(network_graph, route_nodes)
-            result_value = imp_value if impedance_flag else (distance_m if distance_only else None)
-            return fig, ax, result_value, route_gdf
-        if not distance_only and route_nodes is not None:
-            fig, ax = _ensure_ax(ax)
-            # in caso di cache hit, plottiamo direttamente la route salvata
-            # plot grafo + route
-            ox.plot_graph(
-                network_graph,
-                ax=ax,
-                bgcolor="black",
-                edge_color="black",
-                node_size=0,
-                edge_linewidth=0.6,
-                show=False,
-                close=False
-            )
-            ox.plot_graph_route(
-                network_graph,
-                route_nodes,
-                ax=ax,
-                route_color=color,
-                route_linewidth=3,
-                show=False,
-                close=False
-            )
-        result_value = imp_value if impedance_flag else (distance_m if distance_only else None)
-        return fig, ax, result_value
+    if cached is not None and distance_only and not return_geometry:
+        cached_distance = _cached_distance_value(cached)
+        if cached_distance is not None:
+            if impedance_flag:
+                cached_result = get_impedance.impedance_base(cached_distance / 1000.0, network_type)
+                if return_status:
+                    return fig, ax, cached_result, _build_status(True, True)
+                return fig, ax, cached_result
+            if return_status:
+                return fig, ax, cached_distance, _build_status(True, True)
+            return fig, ax, cached_distance
 
-    origin_node = ox.distance.nearest_nodes(network_graph, origin[1], origin[0])
-    destination_node = ox.distance.nearest_nodes(network_graph, destination[1], destination[0])
+    snapped_nodes = ox.distance.nearest_nodes(
+        network_graph,
+        [origin[1], destination[1]],
+        [origin[0], destination[0]],
+    )
+    try:
+        snapped_nodes = list(snapped_nodes)
+    except TypeError:
+        snapped_nodes = [snapped_nodes]
+    if len(snapped_nodes) < 2:
+        raise RuntimeError("nearest_nodes did not return both origin and destination nodes")
+    origin_node = int(_normalize_node_id(snapped_nodes[0]))
+    destination_node = int(_normalize_node_id(snapped_nodes[1]))
 
     route_nodes = None
     route_gdf = None
@@ -520,6 +697,7 @@ def get_route(
                 weight="length",
                 method="dijkstra"
             )
+            route_nodes = cast(list[int], route_nodes)
             route_gdf = route_to_gdf(network_graph, route_nodes)
     else:
         route_nodes = nx.shortest_path(
@@ -529,8 +707,12 @@ def get_route(
             weight="length",
             method="dijkstra"
         )
+        route_nodes = cast(list[int], route_nodes)
 
     if not distance_only:
+        if route_nodes is None:
+            raise RuntimeError("route_nodes is required when distance_only is False")
+        route_nodes_nn = cast(list[int], route_nodes)
         # plot grafo + route
         fig, ax = _ensure_ax(ax)
         ox.plot_graph(
@@ -546,7 +728,7 @@ def get_route(
 
         ox.plot_graph_route(
             network_graph,
-            route_nodes,
+            route_nodes_nn,
             ax=ax,
             route_color=color,
             route_linewidth=3,
@@ -565,7 +747,9 @@ def get_route(
     imp_value = None
     if impedance_flag:
         if distance_m is None:
-            gdf = route_to_gdf(network_graph, route_nodes)
+            if route_nodes is None:
+                raise RuntimeError("route_nodes is required to compute impedance from geometry")
+            gdf = route_to_gdf(network_graph, cast(list[int], route_nodes))
             distance_km = gdf["length"].sum() / 1000.0
         else:
             distance_km = distance_m / 1000.0
@@ -581,15 +765,24 @@ def get_route(
 
     # valore finale del routing (impedenza o distanza)
     result_value = imp_value if impedance_flag else (distance_m if distance_only else None)
-    # salva distanza/nodi/impedenza per riuso futuro
+    if distance_m is None:
+        if route_nodes is None:
+            raise RuntimeError("route_nodes is required to derive distance_m")
+        distance_m = route_to_gdf(network_graph, cast(list[int], route_nodes))["length"].sum()
+    # salva distanza (+ waiting nullo per coerenza schema)
     _route_cache_set(cache_key, {
         "distance_m": distance_m,
-        "route_nodes": route_nodes,
-        "imp_value": imp_value,
+        "waiting_min": 0.0,
     })
 
     if return_geometry:
-        if route_gdf is None and route_nodes is not None:
-            route_gdf = route_to_gdf(network_graph, route_nodes)
+        if route_gdf is None:
+            if route_nodes is None:
+                raise RuntimeError("route_nodes is required when return_geometry is True")
+            route_gdf = route_to_gdf(network_graph, cast(list[int], route_nodes))
+        if return_status:
+            return fig, ax, result_value, route_gdf, _build_status(True, True)
         return fig, ax, result_value, route_gdf
+    if return_status:
+        return fig, ax, result_value, _build_status(True, True)
     return fig, ax, result_value
