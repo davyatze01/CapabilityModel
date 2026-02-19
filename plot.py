@@ -1,8 +1,6 @@
-import csv
 import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
-import numpy as np
+from sklearn.metrics.pairwise import haversine_distances
+from math import radians
 
 PATH_FILE = "./outputs/capability_to_eat.csv"
 
