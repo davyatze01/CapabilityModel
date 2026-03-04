@@ -1,0 +1,5 @@
+from_lon,from_lat,to_lon,to_lat,google_maps_transit_url,travel_time,wait_time
+9.095,39.228,9.11,39.22,"https://www.google.com/maps/dir/?api=1&origin=39.228%2C9.095&destination=39.22%2C9.11&travelmode=transit&departure_time=1760522400",24,1.0833333333333333
+9.095,39.228,9.1112,39.22,"https://www.google.com/maps/dir/?api=1&origin=39.228%2C9.095&destination=39.22%2C9.1112&travelmode=transit&departure_time=1760522400",37,8.55
+9.096200000000001,39.228,9.11,39.22,"https://www.google.com/maps/dir/?api=1&origin=39.228%2C9.096200000000001&destination=39.22%2C9.11&travelmode=transit&departure_time=1760522400",29,1.15
+9.096200000000001,39.228,9.1112,39.22,"https://www.google.com/maps/dir/?api=1&origin=39.228%2C9.096200000000001&destination=39.22%2C9.1112&travelmode=transit&departure_time=1760522400",42,8.583333333333334
