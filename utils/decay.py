@@ -10,6 +10,11 @@ def distance_decay(beta, imp):
     return math.exp(-beta * impedance)
 
 def calculate_rra(decay_walk,decay_bike,decay_drive,decay_bus):
-    all_decay = [1 - decay for decay in [decay_walk,decay_bike,decay_drive,decay_bus]]
-    rra = 1 - (math.prod(all_decay))
+    all_decay = [decay_walk,decay_bike,decay_drive,decay_bus]
+    all_decay.sort(reverse=True)
+    lambdas = [1,1,1,1]
+    weighted_decay = []
+    for i in range(len(all_decay)):
+        weighted_decay.append(all_decay[i] * lambdas[i])
+    rra = 1 - math.prod(1 - decay for decay in weighted_decay)
     return rra
