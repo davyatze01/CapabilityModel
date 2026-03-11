@@ -1,0 +1,138 @@
+H1 -> Restorativeness
+    F1 -> Sport and movement
+        leisure = sports_centre
+        leisure = swimming_pool
+        leisure = pitch
+        leisure = track
+        leisure = golf_course
+        leisure = ice_rink
+        leisure = fitness_centre
+        leisure = skatepark
+        sport   = climbing
+        leisure = climbing
+        leisure = swimming_area
+        leisure = marina
+        route   = hiking
+        route   = running
+    F2 -> Enjoy scenic views
+        tourism = attractions
+        leisure = park
+        leisure = garden
+        natural = water
+        amenity = fountain
+        waterway = canal
+        waterway = stream
+        waterway = river
+    F3 -> Enjoy quietness    
+        leisure = park
+        leisure = garden
+        amenity = library
+    F4 -> Cultural activities
+        amenity  = library
+        amenity  = cinema
+        amenity  = theatre
+        amenity  = arts_centre
+        tourism  = museum
+        historic = * + tourism = attraction
+        amenity  = community_centre
+    F5 -> Nature contact
+        leisure = park
+        leisure = garden
+        natural = water
+        amenity = fountain
+        waterway = canal
+        waterway = stream
+        waterway = river
+
+H2 -> Nutrition
+    F6 -> Eating out
+        amenity = restaurant
+        amenity = fast_food
+        shop    = bakery
+        shop    = pastry
+    F7 -> Fresh food access
+        shop = convenience
+        shop = supermarket
+        shop = greengrocer
+        shop = bakery
+        shop = butcher
+        shop = fishmonger
+    F8 -> Ready Food access
+        shop = convenience
+        shop = frozen_food
+        shop = beverages
+
+H3 -> Care
+    F9 -> Medicines and supplies
+        shop = medical_supply 
+        shop = healthcare
+        amenity = pharmacy
+        healthcare = pharmacy
+    F10 -> Impatient and Care
+        amenity = hospital 
+        healthcare = hospital
+        amenity = clinic
+        healthcare = clinic
+        healthcare = centre
+        emergency = yes
+        amenity = emergency_service
+        amenity = social_facility + social_facility = assisted_living
+        amenity=retirement_home
+    F11 -> Rehabilitation services
+        healthcare = rosthetics
+        healthcare = occupational_therapist
+        healthcare = psychomotrician
+        healthcare = dietitian
+        office     = healthcare + healthcare:speciality = dietitian
+        healthcare = psychologist
+        healthcare = physiotherapist
+        amenity    = spa 
+        leisure    = spa
+    F12 -> Diagnosis and prevention
+        healthcare = centre
+        amenity    = clinic
+        healthcare = clinic
+        healthcare:specialty = psychiatry
+        healthcare = centre + healthcare:specialty  =  preventive_medicine
+        healthcare = clinic + healthcare:speciality = preventive_medicine
+        healthcare = centre + healthcare:facility  = multi_speciality 
+        healthcare = clinic + healthcare:facility = multi_speciality
+        healthcare = physiotherapist
+        healthcare = podiatrist
+        healthcare = laboratory
+        amenity = clinic + healthcare:speciality = laboratory_medicine
+        healthcare = blood_donation
+        blood_donation = transfusion
+        amenity    = doctors 
+        healthcare = doctor
+        amenity    = dentist
+        healthcare = dentist
+        healthcare = physiotherapist
+        healthcare = psychologist
+    F13 -> Emergency services
+        amenity = hospital
+        healthcare = hospital
+        emergency = department
+        healthcare = speciality = obstetrics
+        amenity = ambulance_station
+        emergency = ambulance_station
+        healthcare = blood_donation
+    F14 -> Care services
+        healthcare = midwife
+        healthcare = nurse
+        Dialyse: healthcare=dialysis
+        healthcare = home_care
+        healthcare = clinic
+        healthcare:speciality = addiction_medicine
+        healthcare = centre + healthcare:speciality = maternal_child_health
+        amenity=social_facility + social_facility = assisted_living / nursing_home / day_care
+        amenity=retirement_home
+        amenity=childcare
+        amenity=social_facility + social_facility = outreach / social_facility = day_careù
+        amenity=community_centre
+        amenity=social_facility + social_facility = group_home / shelter / workshop
+        social_facility=assisted_living
+        amenity = social_facility + social_facility = shelter
+        amenity = shelter
+        amenity = refugee_site
+        amenity = social_facility

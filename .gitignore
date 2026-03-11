@@ -206,9 +206,20 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
 rra_cache/
 poi/
 cache/
+access_cache/
 route_cache/
 poi_geom_cache/
 graph_cache/
+.vscode
+
+# Generated routing artifacts (too large for GitHub push)
+outputs/r5_fast_routes.csv
+outputs/r5_fast_routes.csv.tmp
+outputs/r5_fast_routes.sqlite
+outputs/r5_fast_routes.sqlite.tmp
+outputs/r5_slow_routes.csv.tmp
+outputs/r5_slow_routes.sqlite.tmp
