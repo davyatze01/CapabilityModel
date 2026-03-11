@@ -5,22 +5,25 @@ from helpers import PipelineContext, SnappingStageResult, BusRoutingStageResult
 from utils import r5_routing
 from snapping_stage import build_selected_routing_destinations
 
-# Check if the csv and db are present for skipping bus routing
-def _validate_routing_artifacts_for_skip(skip_routing, routing_csv, routing_db):
+# Check if the DB is present and compatible for skipping bus routing
+def _validate_routing_artifacts_for_skip(skip_routing, routing_db):
     if not skip_routing:
         return
-    if not (os.path.isfile(routing_csv) and os.path.isfile(routing_db)):
+    if not os.path.isfile(routing_db):
         raise RuntimeError(
             "Missing routing artifacts while SKIP_ROUTING=True. "
-            f"Expected files: {routing_csv}, {routing_db}"
+            f"Expected file: {routing_db}"
         )
+    # Hard break: reject legacy schema caches when skip mode is active.
+    idx = r5_routing.open_routing_index(routing_db)
+    idx.close()
 
 # This function runs the bus routing stage.
 # If the csv and db are already in cache and the skip_routing mode is active (enabled by default)
 def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> BusRoutingStageResult:
     cfg = ctx.config
     routing_mode = r5_routing.MODE_FAST
-    routing_csv = cfg.r5_fast_csv
+    routing_csv = cfg.r5_sample_csv_path
     routing_db = cfg.r5_fast_db
     routing_chunk_size = cfg.r5_fast_chunk_size
     routing_workers_default = mp.cpu_count() if cfg.r5_fast_workers is None else int(cfg.r5_fast_workers)
@@ -29,14 +32,14 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
 
     # If the bus routing step has already been computed, skip this part and return directly the results from cache
     if cfg.skip_routing:
-        _validate_routing_artifacts_for_skip(cfg.skip_routing, routing_csv, routing_db)
+        _validate_routing_artifacts_for_skip(cfg.skip_routing, routing_db)
         print(
             "Routing configuration: "
             f"mode={routing_mode} workers={routing_workers} chunk={routing_chunk_size} "
             "origins=SKIPPED destinations=SKIPPED "
             "persist_outputs=True"
         )
-        print(f"Skipping routing build. Reusing: {routing_csv} and {routing_db}")
+        print(f"Skipping routing build. Reusing DB: {routing_db} (sample csv: {routing_csv})")
         return BusRoutingStageResult(
             routing_csv=routing_csv,
             routing_db=routing_db,
@@ -88,9 +91,17 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
         out_db=routing_db,
         chunk_size=routing_chunk_size,
         enable_progress=cfg.enable_progress,
+        sample_csv_path=routing_csv,
+        sample_rows=cfg.r5_sample_rows,
+        sample_missing_share=cfg.r5_sample_missing_share,
+        r5_fast_wait_model=cfg.r5_fast_wait_model,
+        r5_tripplanner_workers=cfg.r5_tripplanner_workers,
+        r5_tripplanner_timeout_s=cfg.r5_tripplanner_timeout_s,
         max_retries=cfg.r5_max_retries,
         retry_delay_s=cfg.r5_retry_delay_s,
         attempt_timeout_s=cfg.r5_attempt_timeout_s,
+        r5_max_time_walking_min=cfg.r5_max_time_walking_min,
+        r5_departure_window_min=cfg.r5_departure_window_min,
         persist_outputs=True,
     )
     print(
