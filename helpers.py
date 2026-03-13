@@ -33,7 +33,7 @@ class PipelineConfig:
     r5_fast_workers: int | None = None                                          # The numbers of workers that will split the table. Ideally, if a table is N rows and there are K workers, each worker will work with a portion of size N/K of the table
     r5_max_time_walking_min: int = 30                                           # Maximum walking minutes allowed for transit access/egress
     r5_departure_window_min: int = 60                                           # Minutes after departure to sample transit options
-    r5_fast_wait_model: str = "tripplanner_exact"                               # Wait model for fast mode: "tripplanner_exact" or "global_estimate"
+    r5_fast_wait_model: str = "origin_estimate"                                 # Wait model for fast mode: "tripplanner_exact", "origin_estimate" or "global_estimate"
     r5_tripplanner_workers: int | None = None                                   # Workers for TripPlanner pass on feasible ODs
     r5_tripplanner_timeout_s: float = 15.0                                      # Soft timeout per OD for TripPlanner pass
     r5_sample_rows: int = 10000                                                 # Max rows to write in sampled routing csv

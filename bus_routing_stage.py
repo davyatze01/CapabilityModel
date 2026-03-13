@@ -1,9 +1,20 @@
 import os
 import multiprocessing as mp
+from pathlib import Path
 
 from helpers import PipelineContext, SnappingStageResult, BusRoutingStageResult
 from utils import r5_routing
 from snapping_stage import build_selected_routing_destinations
+
+
+def _resolve_routing_sample_csv_path(base_path: str, routing_mode: str, wait_model: str | None) -> str:
+    path = Path(base_path)
+    suffix = path.suffix or ".csv"
+    stem = path.stem
+    token = routing_mode
+    if routing_mode == r5_routing.MODE_FAST:
+        token = f"{routing_mode}_{r5_routing._normalize_fast_wait_model(wait_model)}"
+    return str(path.with_name(f"{stem}_{token}{suffix}"))
 
 # Check if the DB is present and compatible for skipping bus routing
 def _validate_routing_artifacts_for_skip(skip_routing, routing_db):
@@ -23,7 +34,11 @@ def _validate_routing_artifacts_for_skip(skip_routing, routing_db):
 def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> BusRoutingStageResult:
     cfg = ctx.config
     routing_mode = r5_routing.MODE_FAST
-    routing_csv = cfg.r5_sample_csv_path
+    routing_csv = _resolve_routing_sample_csv_path(
+        cfg.r5_sample_csv_path,
+        routing_mode=routing_mode,
+        wait_model=cfg.r5_fast_wait_model,
+    )
     routing_db = cfg.r5_fast_db
     routing_chunk_size = cfg.r5_fast_chunk_size
     routing_workers_default = mp.cpu_count() if cfg.r5_fast_workers is None else int(cfg.r5_fast_workers)
