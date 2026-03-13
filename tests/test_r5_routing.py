@@ -6,12 +6,14 @@ import sqlite3
 import types
 import unittest
 import uuid
+import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
 import pandas as pd
 
+from bus_routing_stage import _resolve_routing_sample_csv_path
 from helpers import PipelineConfig
 from utils import r5_routing
 
@@ -33,12 +35,67 @@ class TestR5RoutingStorageRefactor(unittest.TestCase):
         conn.commit()
         return conn
 
+    def _write_test_gtfs_zip(self, zip_path: Path) -> None:
+        files = {
+            "calendar.txt": "\n".join(
+                [
+                    "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date",
+                    "wk,1,1,1,1,1,1,1,20250101,20251231",
+                ]
+            ),
+            "trips.txt": "\n".join(
+                [
+                    "route_id,service_id,trip_id",
+                    "r1,wk,t1",
+                    "r1,wk,t2",
+                    "r1,wk,t3",
+                    "r1,wk,t4",
+                    "r2,wk,t5",
+                    "r2,wk,t6",
+                    "r2,wk,t7",
+                ]
+            ),
+            "stops.txt": "\n".join(
+                [
+                    "stop_id,stop_name,stop_lat,stop_lon",
+                    "A,Stop A,39.2001,9.1001",
+                    "B,Stop B,39.2101,9.1101",
+                ]
+            ),
+            "stop_times.txt": "\n".join(
+                [
+                    "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+                    "t1,12:00:00,12:00:00,A,1",
+                    "t2,12:10:00,12:10:00,A,1",
+                    "t3,12:20:00,12:20:00,A,1",
+                    "t4,12:30:00,12:30:00,A,1",
+                    "t5,12:00:00,12:00:00,B,1",
+                    "t6,12:30:00,12:30:00,B,1",
+                    "t7,13:00:00,13:00:00,B,1",
+                ]
+            ),
+        }
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            for name, content in files.items():
+                zf.writestr(name, content)
+
     def test_pipeline_config_defaults_for_sample(self):
         cfg = PipelineConfig()
         self.assertEqual(cfg.r5_sample_rows, 10000)
         self.assertAlmostEqual(cfg.r5_sample_missing_share, 0.3)
         self.assertEqual(cfg.r5_sample_csv_path, os.path.join("outputs", "r5_routes_sample.csv"))
-        self.assertEqual(cfg.r5_fast_wait_model, "tripplanner_exact")
+        self.assertEqual(cfg.r5_fast_wait_model, "origin_estimate")
+
+    def test_sample_csv_path_includes_fast_wait_model(self):
+        path = _resolve_routing_sample_csv_path(
+            os.path.join("outputs", "r5_routes_sample.csv"),
+            routing_mode=r5_routing.MODE_FAST,
+            wait_model="origin_estimate",
+        )
+        self.assertEqual(
+            path,
+            os.path.join("outputs", "r5_routes_sample_fast_routing_origin_estimate.csv"),
+        )
 
     def test_create_db_schema_normalized(self):
         with self._temp_dir() as tmp:
@@ -205,8 +262,8 @@ class TestR5RoutingStorageRefactor(unittest.TestCase):
             self.assertTrue(rows)
             self.assertIn("google_maps_transit_url", rows[0])
             self.assertTrue(rows[0]["google_maps_transit_url"].startswith("https://www.google.com/maps/dir/?"))
-            self.assertIn("wait_time_min", rows[0])
-            self.assertIn("impedance_min", rows[0])
+            self.assertIn("wait_time", rows[0])
+            self.assertIn("impedance", rows[0])
             self.assertIn("is_missing", rows[0])
             self.assertNotIn("wait_time_estimated_min", rows[0])
             self.assertGreater(sum(int(r["is_missing"]) for r in rows), 0)
@@ -339,6 +396,95 @@ class TestR5RoutingStorageRefactor(unittest.TestCase):
                 self.assertIsNone(rows[1][0])
                 self.assertIsNone(rows[1][1])
                 self.assertIsNone(rows[1][2])
+            finally:
+                conn.close()
+
+    def test_build_routing_store_origin_estimate_assigns_wait_by_origin(self):
+        captured: list[dict] = []
+
+        class _FakeTTM(list):
+            def __init__(self, *args, **kwargs):
+                captured.append(kwargs)
+                super().__init__(
+                    [
+                        {"from_id": "o0", "to_id": "d0", "travel_time": 12.0},
+                        {"from_id": "o1", "to_id": "d0", "travel_time": 18.0},
+                    ]
+                )
+
+        fake_r5py = types.ModuleType("r5py")
+        fake_r5py.TransportMode = types.SimpleNamespace(BUS="BUS", WALK="WALK")
+        fake_r5py.TransportNetwork = lambda *args, **kwargs: object()
+        fake_r5py.TravelTimeMatrix = _FakeTTM
+        fake_r5py.DetailedItineraries = object
+
+        fake_base = types.ModuleType("r5py.r5.base_travel_time_matrix")
+        fake_base.BaseTravelTimeMatrix = type("BaseTravelTimeMatrix", (), {"NUM_THREADS": 1})
+
+        with self._temp_dir() as tmp:
+            gtfs_path = Path(tmp) / "mini_gtfs.zip"
+            self._write_test_gtfs_zip(gtfs_path)
+            out_db = str(Path(tmp) / "routes.sqlite")
+            out_csv = str(Path(tmp) / "sample.csv")
+            with mock.patch.object(r5_routing, "_force_java_major", return_value=None), \
+                 mock.patch.object(r5_routing, "_preflight", return_value=None), \
+                 mock.patch.object(r5_routing, "_configure_java_home_from_path", return_value=None), \
+                 mock.patch.object(r5_routing, "_configure_java_runtime_flags", return_value=None), \
+                 mock.patch.object(r5_routing, "_ensure_r5_classpath_arg", return_value=None), \
+                 mock.patch.object(r5_routing, "_ensure_r5_max_memory_arg", return_value=None), \
+                 mock.patch.dict(
+                     "sys.modules",
+                     {
+                         "r5py": fake_r5py,
+                         "r5py.r5": types.ModuleType("r5py.r5"),
+                         "r5py.r5.base_travel_time_matrix": fake_base,
+                     },
+                     clear=False,
+                 ):
+                summary = r5_routing.build_routing_store(
+                    origins=[(39.2, 9.1), (39.21, 9.11)],
+                    destinations=[(39.3, 9.2)],
+                    mode=r5_routing.MODE_FAST,
+                    pbf_path="dummy.pbf",
+                    gtfs_path=str(gtfs_path),
+                    jar_path="dummy.jar",
+                    departure_dt=dt.datetime(2025, 10, 15, 12, 0, 0),
+                    workers=1,
+                    out_csv=out_csv,
+                    out_db=out_db,
+                    chunk_size=2,
+                    enable_progress=False,
+                    sample_rows=10,
+                    sample_missing_share=0.5,
+                    r5_fast_wait_model="origin_estimate",
+                    r5_max_time_walking_min=2,
+                    persist_outputs=True,
+                )
+
+            self.assertTrue(captured)
+            self.assertEqual(summary["rows"], 2)
+
+            conn = sqlite3.connect(out_db)
+            try:
+                run_id = r5_routing._resolve_run_id(conn, r5_routing.MODE_FAST, "2025-10-15T12:00:00")
+                self.assertIsNotNone(run_id)
+                rows = conn.execute(
+                    """
+                    SELECT fp.lat_r, fp.lon_r, r.travel_time_min, r.wait_time_min, r.impedance_min
+                    FROM routes AS r
+                    JOIN points AS fp ON fp.point_id = r.from_point_id
+                    WHERE r.run_id = ?
+                    ORDER BY fp.lat_r, fp.lon_r
+                    """,
+                    (int(run_id),),
+                ).fetchall()
+                self.assertEqual(len(rows), 2)
+                self.assertEqual(rows[0][2], 12.0)
+                self.assertAlmostEqual(rows[0][3], 10.0, places=3)
+                self.assertAlmostEqual(rows[0][4], 22.0, places=3)
+                self.assertEqual(rows[1][2], 18.0)
+                self.assertAlmostEqual(rows[1][3], 30.0, places=3)
+                self.assertAlmostEqual(rows[1][4], 48.0, places=3)
             finally:
                 conn.close()
 
