@@ -20,24 +20,7 @@ class PipelineConfig:
     poi_snap_cache_dir: str = os.path.join("cache", "poi_snap_cache")   # Each poi is snapped to one or more network nodes to compute routings. They are cached so that geometries are not re-downloaded when re-executing the step on the sme points
 
     r5_fixed_departure: dt.datetime = dt.datetime(2025, 10, 15, 12, 0, 0)       # The date in which we are querying the system. It is fixed: 15-10-2025 midday
-    r5_pbf_path: str = os.path.join("gtfs-pbf", "cagliari-latest.osmv2.pbf")    # Where to find the pbf file used for graph extraction
-    r5_gtfs_path: str = os.path.join("gtfs-pbf", "GTFS.zip")                    # Where to find the GTFS transport data
-    r5_jar_path: str = "r5-v7.5-r5py-all.jar"                                   # Where to find r5py's jar, necessary for installation
-    r5_fast_csv: str = os.path.join("outputs", "r5_fast_routes.csv")            # Legacy field kept for compatibility; not used for full routing output anymore
-    r5_sample_csv_path: str = os.path.join("outputs", "r5_routes_sample.csv")   # Human-readable sampled routing rows for inspection
-    r5_fast_db: str = os.path.join("outputs", "r5_fast_routes.sqlite")          # Where to find the sqlite table for faster accessing of the cached bus routes
-    r5_max_retries: int = 20                                                    # When r5 accidentally crashes, it retries from the last crash for a maximum of 20 times                                                   
-    r5_retry_delay_s: float = 3.0                                               # Wait three seconds before retrying
-    r5_attempt_timeout_s: float = 1800.0                                        # Consider the attempt failed if nothing progresses after 30 minutes
-    r5_fast_chunk_size: int = 128                                               # Divide the data into chunks between workers. By default a chunk contains 128 rows of the table
-    r5_fast_workers: int | None = None                                          # The numbers of workers that will split the table. Ideally, if a table is N rows and there are K workers, each worker will work with a portion of size N/K of the table
-    r5_max_time_walking_min: int = 30                                           # Maximum walking minutes allowed for transit access/egress
-    r5_departure_window_min: int = 60                                           # Minutes after departure to sample transit options
-    r5_fast_wait_model: str = "origin_estimate"                                 # Wait model for fast mode: "tripplanner_exact", "origin_estimate" or "global_estimate"
-    r5_tripplanner_workers: int | None = None                                   # Workers for TripPlanner pass on feasible ODs
-    r5_tripplanner_timeout_s: float = 15.0                                      # Soft timeout per OD for TripPlanner pass
-    r5_sample_rows: int = 10000                                                 # Max rows to write in sampled routing csv
-    r5_sample_missing_share: float = 0.3                                        # Target share of missing routes in sampled csv
+    bus_cache_pkl: str = os.path.join("outputs", "r5_fast_routes.sqlite")       # Where to find the pickle table with the cached results
 
     pool_max_retries: int = 4                                                   # Retries during multiprocess stage when a worker pool crashes, to avoid crashing completely because of a single worker crash
     pool_retry_delay_s: float = 2.0                                             # Wait some seconds before trying again
@@ -65,9 +48,9 @@ class SnappingStageResult:
 
 @dataclass
 class BusRoutingStageResult:
-    routing_csv: str            # Path of sampled routing rows for inspection (not a full OD export)
-    routing_db: str             # Where the sqlite database with the routing results is saved
-    routing_departure_iso: str  # The date and time of departure, in ISO format
+    routing_csv: str             # Path of sampled routing rows for inspection (not a full OD export)
+    routing_pkl: str             # Where the cached pickle with the routing results is saved
+    routing_departure_iso: str   # The date and time of departure, in ISO format
 
 
 @dataclass

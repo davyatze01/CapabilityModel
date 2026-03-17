@@ -1,7 +1,8 @@
 import csv
 from tqdm import tqdm
 
-from helpers import PipelineContext, ServiceStageResult, CapabilityStageResult
+from context import PipelineContext
+from pipeline_types import ServiceStageResult, CapabilityStageResult
 from utils import capabilities as cap
 
 
