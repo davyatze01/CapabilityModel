@@ -9,7 +9,8 @@ import osmnx as ox
 from shapely.geometry import Point
 from tqdm import tqdm
 
-from helpers import PipelineContext, SnappingStageResult
+from context import PipelineContext
+from pipeline_types import SnappingStageResult
 from utils import graphml, services as serv, delta_g
 
 
@@ -389,7 +390,7 @@ def run_snapping_stage(ctx: PipelineContext) -> SnappingStageResult:
             cfg.enable_progress,
             cfg.poi_snap_cache_dir,
             cache_ns=f"mode_{mode}",
-            max_pois=cfg.max_pois,
+            max_pois=cfg.debug_max_pois,
             seed=cfg.seed,
         )
         mode_snap_info = _snap_map_to_info(mode_snap_map)

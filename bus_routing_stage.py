@@ -1,66 +1,254 @@
+import csv
+import hashlib
 import os
-import multiprocessing as mp
+import pickle
+import signal
+import shutil
+import subprocess
 from pathlib import Path
 
-from helpers import PipelineContext, SnappingStageResult, BusRoutingStageResult
-from utils import r5_routing
+import pandas as pd
+import numpy as np
+from pipeline_types import BusRoutingStageResult, PipelineContext, SnappingStageResult
 from snapping_stage import build_selected_routing_destinations
+import json
+
+COORD_ROUND = 6
+
+def _load_routing_cache(path: str):
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
-def _resolve_routing_sample_csv_path(base_path: str, routing_mode: str, wait_model: str | None) -> str:
-    path = Path(base_path)
-    suffix = path.suffix or ".csv"
-    stem = path.stem
-    token = routing_mode
-    if routing_mode == r5_routing.MODE_FAST:
-        token = f"{routing_mode}_{r5_routing._normalize_fast_wait_model(wait_model)}"
-    return str(path.with_name(f"{stem}_{token}{suffix}"))
+def _is_valid_routing_cache(payload, departure_iso: str, origins_sig: str | None = None,
+                            destinations_sig: str | None = None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("departure_iso") != departure_iso:
+        return False
+    
+    routes = payload.get("routes")
+    if not isinstance(routes, dict):
+        return False
+    
+    if origins_sig is not None and payload.get("origins_sig") != origins_sig:
+        return False
+    
+    if destinations_sig is not None and payload.get("destinations_sig") != destinations_sig:
+        return False
+    
+    return True
 
-# Check if the DB is present and compatible for skipping bus routing
-def _validate_routing_artifacts_for_skip(skip_routing, routing_db):
+def _validate_routing_artifacts_for_skip(skip_routing: bool, cache_path: str, departure_iso: str,
+    origins_sig: str | None = None, destinations_sig: str | None = None,):
     if not skip_routing:
         return
-    if not os.path.isfile(routing_db):
+    if not os.path.isfile(cache_path):
         raise RuntimeError(
-            "Missing routing artifacts while SKIP_ROUTING=True. "
-            f"Expected file: {routing_db}"
+            "Missing routing cache while skip_routing=True. "
+            f"Expected file: {cache_path}"
         )
-    # Hard break: reject legacy schema caches when skip mode is active.
-    idx = r5_routing.open_routing_index(routing_db)
-    idx.close()
+    try:
+        payload = _load_routing_cache(cache_path)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load routing cache: {cache_path}") from exc
+    if not _is_valid_routing_cache(payload, departure_iso=departure_iso, origins_sig=origins_sig, destinations_sig=destinations_sig):
+        raise RuntimeError(
+            "Routing cache is invalid or incompatible while skip_routing=True. "
+            f"Cache file: {cache_path}"
+        )
 
-# This function runs the bus routing stage.
-# If the csv and db are already in cache and the skip_routing mode is active (enabled by default)
+def _coords_signature(coords: list[tuple[float, float]]) -> str:
+    """Hash an ordered coordinate list so runs can be matched to exact routing inputs."""
+    h = hashlib.sha1()
+    for lat, lon in coords:
+        h.update(f"{round(float(lat), COORD_ROUND)},{round(float(lon), COORD_ROUND)};".encode("ascii"))
+    return h.hexdigest()
+
+
+def _write_r5r_point_inputs(
+        nodes_with_coords,
+        destinations,
+        origins_csv,
+        destinations_csv,
+):
+    Path(origins_csv).parent.mkdir(parents=True, exist_ok=True)
+
+    with open(origins_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "lon", "lat"])
+        for node_id, data in nodes_with_coords:
+            writer.writerow([str(node_id), float(data["x"]), float(data["y"])])
+
+    with open(destinations_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "lon", "lat"])
+        for idx, (lat, lon) in enumerate(destinations):
+            writer.writerow([f"d{idx}", float(lon), float(lat)])
+
+
+def _run_r5r_script(script_path: str) -> None:
+    rscript_exe = shutil.which("Rscript")
+    if not rscript_exe:
+        raise RuntimeError(
+            "Rscript executable not found. Add Rscript to your PATH so the pipeline can run the R routing script."
+        )
+    popen_kwargs = dict(
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+    proc = subprocess.Popen([rscript_exe, script_path], **popen_kwargs)
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+        return_code = proc.wait()
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, [rscript_exe, script_path])
+    except KeyboardInterrupt:
+        # Forward interruption to child so Ctrl+C actually stops Rscript.
+        if proc.poll() is None:
+            try:
+                if os.name == "nt":
+                    proc.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+        raise
+
+def build_bus_impedance_cache(context: PipelineContext) -> None:
+    cfg = context.config
+    source_id_to_row = {}
+    dest_id_to_col = {}
+
+    matrix_path = Path(cfg.bus_impedance_matrix_path)
+    Path(matrix_path).parent.mkdir(parents=True, exist_ok=True)
+    source_index_path = Path(cfg.bus_source_id_to_row_path)
+    dest_index_path = Path(cfg.bus_dest_id_to_col_path)
+
+    if matrix_path.is_file()  and matrix_path.stat().st_size > 0 and source_index_path.is_file() and dest_index_path.is_file():
+        return
+
+    # Read the source csv and create correspondance between id and row in the csv
+    with open(cfg.bus_routing_origins_input_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row_idx, row in enumerate(reader):
+            source_id = row["id"]
+            source_id_to_row[source_id] = row_idx
+
+    # Read the destination csv and create correspondance between id and row in the csv
+    with open(cfg.bus_routing_destinations_input_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for col_idx, row in enumerate(reader):
+            dest_id = row["id"]
+            dest_id_to_col[dest_id] = col_idx
+
+        
+    n_rows = len(source_id_to_row)
+    n_cols = len(dest_id_to_col)
+    impedance_matrix = np.memmap(
+        cfg.bus_impedance_matrix_path,
+        dtype=np.float32,
+        mode="w+",
+        shape=(n_rows, n_cols),
+    )
+    impedance_matrix[:] = 0
+
+    with open(cfg.bus_routing_matrix_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row_idx, row in enumerate(reader):
+            source_row = source_id_to_row[row["from_id"]]
+            dest_col = dest_id_to_col[row["to_id"]]
+            total_time = row["total_time"]
+            if total_time == "" or (row["routes"] in ["", "[WALK]"]):
+                total_time = 0
+            impedance_matrix[source_row][dest_col] = total_time
+
+    with open(cfg.bus_source_id_to_row_path, 'w') as f:
+        json.dump(source_id_to_row, f)
+    
+    with open(cfg.bus_dest_id_to_col_path, 'w') as f:
+        json.dump(dest_id_to_col, f)
+
+
+def _save_routing_cache(path: str, payload) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp_path, path)
+
+
+def _build_routing_cache_from_r5r_csv(
+    csv_path: str,
+    origin_id_to_coord: dict[str, tuple[float, float]],
+    destination_id_to_coord: dict[str, tuple[float, float]],
+    departure_iso: str,
+    origins_sig: str,
+    destinations_sig: str,
+):
+    routes = {}
+    usecols = ["from_id", "to_id", "total_time", "wait_time", "routes"]
+
+    reader = pd.read_csv(
+        csv_path,
+        usecols=lambda c: c in usecols,
+        chunksize=200_000,
+        engine="python",   # avoids C parser native crash path
+    )
+
+    for chunk in reader:
+        for row in chunk.itertuples(index=False):
+            from_id = str(row.from_id)
+            to_id = str(row.to_id)
+
+            origin_coord = origin_id_to_coord.get(from_id)
+            destination_coord = destination_id_to_coord.get(to_id)
+            if origin_coord is None or destination_coord is None:
+                continue
+
+            total_time = row.total_time
+            wait_time = row.wait_time
+            if pd.isna(total_time) or pd.isna(wait_time):
+                continue
+
+            total_time = float(total_time)
+            wait_time = float(wait_time)
+            travel_time = total_time - wait_time
+            if travel_time < 0:
+                continue
+
+            routes[(origin_coord, destination_coord)] = {
+                "travel_time": travel_time,
+                "wait_time": wait_time,
+                "impedance": total_time,
+                "routes": getattr(row, "routes", None),
+            }
+
+    return {
+        "departure_iso": departure_iso,
+        "origins_sig": origins_sig,
+        "destinations_sig": destinations_sig,
+        "routes": routes,
+    }
+
+
+# This function runs the bus routing stage
 def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> BusRoutingStageResult:
     cfg = ctx.config
-    routing_mode = r5_routing.MODE_FAST
-    routing_csv = _resolve_routing_sample_csv_path(
-        cfg.r5_sample_csv_path,
-        routing_mode=routing_mode,
-        wait_model=cfg.r5_fast_wait_model,
-    )
-    routing_db = cfg.r5_fast_db
-    routing_chunk_size = cfg.r5_fast_chunk_size
-    routing_workers_default = mp.cpu_count() if cfg.r5_fast_workers is None else int(cfg.r5_fast_workers)
-    routing_workers = routing_workers_default
-    routing_workers = max(1, routing_workers)
-
-    # If the bus routing step has already been computed, skip this part and return directly the results from cache
-    if cfg.skip_routing:
-        _validate_routing_artifacts_for_skip(cfg.skip_routing, routing_db)
-        print(
-            "Routing configuration: "
-            f"mode={routing_mode} workers={routing_workers} chunk={routing_chunk_size} "
-            "origins=SKIPPED destinations=SKIPPED "
-            "persist_outputs=True"
-        )
-        print(f"Skipping routing build. Reusing DB: {routing_db} (sample csv: {routing_csv})")
-        return BusRoutingStageResult(
-            routing_csv=routing_csv,
-            routing_db=routing_db,
-            routing_departure_iso=cfg.r5_fixed_departure.isoformat(),
-        )
-
+    departure_iso = cfg.bus_departure_dt.isoformat()
+    routing_csv = cfg.bus_routing_matrix_path
+    routing_cache = cfg.bus_routing_cache_path
     
     all_candidate_snapped_coords = set()
     has_multi_snap_candidates = False
@@ -87,53 +275,66 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
 
     origins = [(data["y"], data["x"]) for _, data in ctx.nodes_with_coords]
     destinations = list(unique_snapped_coords)
-    print(
-        "Routing configuration: "
-        f"mode={routing_mode} workers={routing_workers} chunk={routing_chunk_size} "
-        f"origins={len(origins)} destinations={len(destinations)} "
-        "persist_outputs=True"
+    origins_sig = _coords_signature(origins)
+    destinations_sig = _coords_signature(destinations)
+
+    if cfg.skip_routing:
+        _validate_routing_artifacts_for_skip(
+            cfg.skip_routing,
+            routing_cache,
+            departure_iso,
+            origins_sig=origins_sig,
+            destinations_sig=destinations_sig,
+        )
+
+        print(f"Skipping routing build. Reusing cache: {routing_cache}")
+
+        return BusRoutingStageResult(
+            routing_csv=routing_csv,
+            routing_pkl=routing_cache,
+            routing_departure_iso=departure_iso,
+        )
+    
+    origin_id_to_coord = {
+        str(node_id): (round(float(data["y"]), COORD_ROUND), round(float(data["x"]), COORD_ROUND))
+        for node_id, data in ctx.nodes_with_coords
+    }
+    destination_id_to_coord = {
+        f"d{idx}": (round(float(lat), COORD_ROUND), round(float(lon), COORD_ROUND))
+        for idx, (lat, lon) in enumerate(destinations)
+    }
+
+    r_origins_csv = cfg.bus_routing_origins_input_path
+    r_dest_csv = cfg.bus_routing_destinations_input_path
+
+    _write_r5r_point_inputs(
+        ctx.nodes_with_coords,
+        destinations,
+        r_origins_csv,
+        r_dest_csv,
     )
-    routing_summary = r5_routing.build_routing_store_resilient(
-        origins=origins,
-        destinations=destinations,
-        mode=routing_mode,
-        pbf_path=cfg.r5_pbf_path,
-        gtfs_path=cfg.r5_gtfs_path,
-        jar_path=cfg.r5_jar_path,
-        departure_dt=cfg.r5_fixed_departure,
-        workers=routing_workers,
-        out_csv=routing_csv,
-        out_db=routing_db,
-        chunk_size=routing_chunk_size,
-        enable_progress=cfg.enable_progress,
-        sample_csv_path=routing_csv,
-        sample_rows=cfg.r5_sample_rows,
-        sample_missing_share=cfg.r5_sample_missing_share,
-        r5_fast_wait_model=cfg.r5_fast_wait_model,
-        r5_tripplanner_workers=cfg.r5_tripplanner_workers,
-        r5_tripplanner_timeout_s=cfg.r5_tripplanner_timeout_s,
-        max_retries=cfg.r5_max_retries,
-        retry_delay_s=cfg.r5_retry_delay_s,
-        attempt_timeout_s=cfg.r5_attempt_timeout_s,
-        r5_max_time_walking_min=cfg.r5_max_time_walking_min,
-        r5_departure_window_min=cfg.r5_departure_window_min,
-        persist_outputs=True,
+
+    r_script_path = os.path.join("utils", "r5_routing.r")
+    print("[Bus] Launching Rscript...", flush=True)
+    _run_r5r_script(r_script_path)
+    print("[Bus] Rscript completed. Building routing cache from CSV...", flush=True)
+
+    build_bus_impedance_cache(ctx)
+
+    routing_payload = _build_routing_cache_from_r5r_csv(
+        routing_csv,
+        origin_id_to_coord=origin_id_to_coord,
+        destination_id_to_coord=destination_id_to_coord,
+        departure_iso=departure_iso,
+        origins_sig=origins_sig,
+        destinations_sig=destinations_sig,
     )
-    print(
-        "Built routing store: "
-        f"mode={routing_summary['mode']} rows={routing_summary['rows']} "
-        f"missing={routing_summary['missing_rows']} resumed={routing_summary.get('resumed', False)} "
-        f"processed_origins={routing_summary.get('processed_origins', 0)} "
-        f"attempt={routing_summary.get('supervisor_attempt', 1)}/"
-        f"{routing_summary.get('supervisor_attempts_total', 1)} "
-        f"workers={routing_summary.get('supervisor_workers_used')} "
-        f"chunk={routing_summary.get('supervisor_chunk_size_used')} "
-        f"csv={routing_summary['out_csv']} db={routing_summary['out_db']}"
-    )
+    _save_routing_cache(routing_cache, routing_payload)
+
     return BusRoutingStageResult(
         routing_csv=routing_csv,
-        routing_db=routing_db,
-        routing_departure_iso=cfg.r5_fixed_departure.isoformat(),
+        routing_pkl=routing_cache,
+        routing_departure_iso=departure_iso,
     )
 
 

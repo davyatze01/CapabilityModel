@@ -8,7 +8,8 @@ from typing import Any, cast
 
 from tqdm import tqdm
 
-from helpers import PipelineContext, SnappingStageResult, NonBusRoutingStageResult
+from context import PipelineContext
+from pipeline_types import SnappingStageResult, NonBusRoutingStageResult
 from utils import delta_g, services as serv
 from snapping_stage import select_best_snap_candidate_for_origin, coord_key
 
