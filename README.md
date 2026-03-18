@@ -16,7 +16,7 @@ The current implementation is configured around **Cagliari, Sardinia, Italy** an
 
 ## Main Workflow
 
-The pipeline entry point is [`main.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/main.py). Its execution flow is:
+The pipeline entry point is [`main.py`](main.py). Its execution flow is:
 
 1. Build configuration and shared context.
 2. Snap every POI to the relevant transport graphs.
@@ -32,11 +32,11 @@ At a high level, the data flow is:
 
 ## Core Entry Files
 
-### [`main.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/main.py)
+### [`main.py`](main.py)
 
 `main()` orchestrates the whole pipeline. It creates a `PipelineConfig`, builds a `PipelineContext`, runs six stages in sequence, and prints the output paths returned by the final stage.
 
-### [`config.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/config.py)
+### [`config.py`](config.py)
 
 Defines `PipelineConfig`, which controls:
 
@@ -52,7 +52,7 @@ Important current defaults:
 - non-bus cache lives in `cache/non_bus`
 - POI snapping cache lives in `cache/poi_snap_cache`
 
-### [`context.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/context.py)
+### [`context.py`](context.py)
 
 Builds the shared runtime context used by every stage:
 
@@ -63,7 +63,7 @@ Builds the shared runtime context used by every stage:
 - computes worker count
 - injects the service lists associated with each capability
 
-### [`pipeline_types.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/pipeline_types.py)
+### [`pipeline_types.py`](pipeline_types.py)
 
 Defines the dataclasses passed between stages, such as:
 
@@ -83,7 +83,7 @@ These types make the stage interfaces explicit.
 
 Before any routing is done, the repo builds the semantic model of the pipeline.
 
-#### [`config/poi_types.csv`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/config/poi_types.csv)
+#### [`config/poi_types.csv`](config/poi_types.csv)
 
 This CSV is the main domain configuration. Each row defines:
 
@@ -96,7 +96,7 @@ This CSV is the main domain configuration. Each row defines:
 
 A single POI type can contribute to more than one service.
 
-#### [`utils/services.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/utils/services.py)
+#### [`utils/services.py`](utils/services.py)
 
 This module parses `config/poi_types.csv` and turns it into runtime structures:
 
@@ -112,7 +112,7 @@ It also provides:
 - `get_service_queries(service)` to enumerate the POIs behind a service
 - `choquet_integral()` to aggregate POI-level accessibilities into one service score
 
-#### [`utils/capabilities.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/utils/capabilities.py)
+#### [`utils/capabilities.py`](utils/capabilities.py)
 
 Defines the next aggregation level:
 
@@ -122,7 +122,7 @@ Defines the next aggregation level:
 
 This is where the three top-level capabilities are formalized.
 
-#### [`services_capabilities.txt`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/services_capabilities.txt)
+#### [`services_capabilities.txt`](services_capabilities.txt)
 
 This file is a human-readable reference listing the conceptual mapping from:
 
@@ -133,16 +133,16 @@ The code uses `config/poi_types.csv` and `utils/capabilities.py` directly; this 
 
 ### 2. Snapping Stage
 
-Implemented in [`snapping_stage.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/snapping_stage.py).
+Implemented in [`snapping_stage.py`](snapping_stage.py).
 
 Goal: convert each POI geometry into one or more graph-aligned candidate nodes for later routing.
 
 #### Inputs
 
 - `PipelineContext`
-- POI definitions from [`utils/services.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/utils/services.py)
-- graph and POI loaders from [`utils/graphml.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/utils/graphml.py)
-- geometry helpers and caches from [`utils/delta_g.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/utils/delta_g.py)
+- POI definitions from [`utils/services.py`](utils/services.py)
+- graph and POI loaders from [`utils/graphml.py`](utils/graphml.py)
+- geometry helpers and caches from [`utils/delta_g.py`](utils/delta_g.py)
 
 #### What happens
 
@@ -175,15 +175,15 @@ The returned `SnappingStageResult` contains:
 
 ### 3. Bus Routing Stage
 
-Implemented in [`bus_routing_stage.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/bus_routing_stage.py).
+Implemented in [`bus_routing_stage.py`](bus_routing_stage.py).
 
 Goal: compute transit travel times from every origin node to every relevant snapped POI destination.
 
 #### Supporting files
 
-- [`utils/r5_routing.r`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/utils/r5_routing.r)
-- GTFS / network files under [`gtfs`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/gtfs)
-- transit inputs/outputs under [`outputs`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/outputs)
+- [`utils/r5_routing.r`](utils/r5_routing.r)
+- GTFS / network files under [`gtfs`](gtfs)
+- transit inputs/outputs under [`outputs`](outputs)
 
 #### What happens in Python
 
@@ -193,13 +193,16 @@ Goal: compute transit travel times from every origin node to every relevant snap
 4. It writes:
    - `outputs/r5r_origins.csv`
    - `outputs/r5r_dest.csv`
-5. If `skip_routing=True`, it validates the existing pickle cache and reuses it.
+5. If `skip_routing=True`, it validates the existing routing cache and bus-matrix metadata before reusing artifacts.
 6. Otherwise, it launches `Rscript utils/r5_routing.r`.
-7. After the R script writes the expanded travel-time matrix CSV, Python converts it into a compact pickle cache keyed by `(origin_coord, destination_coord)`.
+7. After the R script writes the expanded travel-time matrix CSV, Python builds:
+   - a compact routing pickle cache keyed by `(origin_coord, destination_coord)`
+   - a dense bus impedance matrix (`.dat`) with row/column index JSON files
+   - a bus matrix metadata JSON (`departure_iso`, `origins_sig`, `destinations_sig`)
 
 #### What happens in R
 
-[`utils/r5_routing.r`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/utils/r5_routing.r) does the transit work with `r5r`:
+[`utils/r5_routing.r`](utils/r5_routing.r) does the transit work with `r5r`:
 
 - loads the GTFS/network bundle from `gtfs`
 - reads origin and destination CSVs
@@ -208,7 +211,12 @@ Goal: compute transit travel times from every origin node to every relevant snap
 - keeps the best route per origin/destination pair
 - writes `outputs/r5r_expanded_travel_time_matrix.csv`
 
-The Python stage then turns that CSV into `outputs/r5r_best_routes.pkl`.
+The Python stage then turns that CSV into `outputs/r5r_best_routes.pkl` and builds matrix artifacts used by the accessibility stage:
+
+- `outputs/bus_impedance_matrix.dat`
+- `outputs/source_id_to_row.json`
+- `outputs/dest_id_to_col.json`
+- `outputs/bus_impedance_meta.json`
 
 The stored route record includes:
 
@@ -219,16 +227,16 @@ The stored route record includes:
 
 ### 4. Non-Bus Routing Stage
 
-Implemented in [`non_bus_routing_stage.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/non_bus_routing_stage.py).
+Implemented in [`non_bus_routing_stage.py`](non_bus_routing_stage.py).
 
 Goal: for every origin node, compute the walk/bike/drive accessibility ingredients needed later for each POI type.
 
 #### Main dependencies
 
-- [`utils/delta_g.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/utils/delta_g.py)
-- [`utils/get_impedance.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/utils/get_impedance.py)
-- [`utils/decay.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/utils/decay.py)
-- [`utils/services.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/utils/services.py)
+- [`utils/delta_g.py`](utils/delta_g.py)
+- [`utils/get_impedance.py`](utils/get_impedance.py)
+- [`utils/decay.py`](utils/decay.py)
+- [`utils/services.py`](utils/services.py)
 
 #### What happens
 
@@ -239,7 +247,7 @@ Goal: for every origin node, compute the walk/bike/drive accessibility ingredien
 
 #### What `delta_g.accessibility_non_bus_from_snap_map()` does
 
-Inside [`utils/delta_g.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/utils/delta_g.py), this function:
+Inside [`utils/delta_g.py`](utils/delta_g.py), this function:
 
 - builds or reuses an RRA cache path in `rra_cache`
 - if a full non-bus RRA cache already exists, returns the final accessibility value immediately
@@ -268,37 +276,42 @@ This design avoids recomputing shortest-path work for unchanged nodes.
 
 ### 5. Accessibility Stage
 
-Implemented in [`accessibility_stage.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/accessibility_stage.py).
+Implemented in [`accessibility_stage.py`](accessibility_stage.py).
 
 Goal: combine non-bus modal decays with bus impedances, compute POI-level accessibility, and organize the result by service.
 
 #### Inputs
 
 - non-bus per-node cache files from `cache/non_bus`
-- bus routing pickle from `outputs/r5r_best_routes.pkl`
-- decay and aggregation logic from [`utils/decay.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/utils/decay.py) and [`utils/delta_g.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/utils/delta_g.py)
+- bus impedance artifacts:
+  - `outputs/bus_impedance_matrix.dat`
+  - `outputs/source_id_to_row.json`
+  - `outputs/dest_id_to_col.json`
+  - `outputs/bus_impedance_meta.json`
+- decay and aggregation logic from [`utils/decay.py`](utils/decay.py) and [`utils/delta_g.py`](utils/delta_g.py)
 
 #### What happens
 
 1. Workers load each node's non-bus cache file.
-2. They gather all bus destinations needed by that node.
-3. They load the shared transit routing pickle and extract bus impedances for the current origin/destination pairs.
-4. For each POI type entry:
+2. They validate bus matrix metadata (`departure_iso`, `origins_sig`, `destinations_sig`) against the current bus stage result.
+3. They load the bus matrix and index files once per worker.
+4. For each origin/destination lookup, they retrieve bus impedance from the dense matrix using source/destination indexes.
+5. For each POI type entry:
    - compute the decay parameter `beta = log(2) / decay_constant`
    - convert each bus impedance into a bus decay value
    - merge walk, bike, drive, and bus decays into an RRA value with `delta_g.build_rra()`
    - convert the RRA list into one accessibility score with `delta_g.accessibility_from_rra()`
-5. The computed RRA is saved to disk so later runs can reuse it.
-6. Results are grouped back into `accessibility_by_service`.
+6. The computed RRA is saved to disk so later runs can reuse it.
+7. Results are grouped back into `accessibility_by_service`.
 
 #### What the helper functions mean
 
-In [`utils/decay.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/utils/decay.py):
+In [`utils/decay.py`](utils/decay.py):
 
 - `distance_decay(beta, imp)` applies exponential distance decay
 - `calculate_rra(...)` merges the four modal decay values into one route/resource availability score
 
-In [`utils/delta_g.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/utils/delta_g.py):
+In [`utils/delta_g.py`](utils/delta_g.py):
 
 - `build_rra()` constructs one RRA value per POI candidate
 - `accessibility_from_rra()` aggregates the list of RRA values for a POI type into a single accessibility value using a contribution curve
@@ -308,7 +321,7 @@ The output of this stage is one `AccessibilityNodeResult` per origin node, conta
 
 ### 6. Service Aggregation Stage
 
-Implemented in [`service_stage.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/service_stage.py).
+Implemented in [`service_stage.py`](service_stage.py).
 
 Goal: aggregate the accessibility values of all POI types that contribute to the same service.
 
@@ -323,7 +336,7 @@ This is the stage where multiple POI types such as `restaurant`, `fast_food`, an
 
 ### 7. Capability Aggregation Stage
 
-Implemented in [`capability_stage.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/capability_stage.py).
+Implemented in [`capability_stage.py`](capability_stage.py).
 
 Goal: aggregate service scores into final capability scores and write the final CSVs.
 
@@ -339,9 +352,9 @@ For each node:
 
 Generated files:
 
-- [`outputs/capability_restorativeness.csv`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/outputs/capability_restorativeness.csv)
-- [`outputs/capability_nutrition.csv`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/outputs/capability_nutrition.csv)
-- [`outputs/capability_care.csv`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/outputs/capability_care.csv)
+- [`outputs/capability_restorativeness.csv`](outputs/capability_restorativeness.csv)
+- [`outputs/capability_nutrition.csv`](outputs/capability_nutrition.csv)
+- [`outputs/capability_care.csv`](outputs/capability_care.csv)
 
 Each file contains:
 
@@ -353,34 +366,34 @@ Each file contains:
 
 ## Data, Cache, and Output Folders
 
-### [`graph`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/graph)
+### [`graph`](graph)
 
 Mode-specific GraphML files used by OSMnx and NetworkX.
 
-### [`poi`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/poi)
+### [`poi`](poi)
 
 Cached POI extracts saved as GeoJSON, usually one file per OSM tag query.
 
-### [`cache`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/cache)
+### [`cache`](cache)
 
 Runtime caches, especially:
 
 - non-bus per-node caches
 - POI snap caches
 
-### [`poi_geom_cache`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/poi_geom_cache)
+### [`poi_geom_cache`](poi_geom_cache)
 
 Cached geometry-level POI extraction artifacts reused during snapping and accessibility work.
 
-### [`rra_cache`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/rra_cache)
+### [`rra_cache`](rra_cache)
 
 Cached RRA/accessibility artifacts for origin/POI combinations.
 
-### [`gtfs`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/gtfs)
+### [`gtfs`](gtfs)
 
 Transit and street network files consumed by `r5r`.
 
-### [`outputs`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/outputs)
+### [`outputs`](outputs)
 
 Final capability CSVs plus intermediate routing artifacts such as:
 
@@ -388,6 +401,11 @@ Final capability CSVs plus intermediate routing artifacts such as:
 - `r5r_dest.csv`
 - `r5r_expanded_travel_time_matrix.csv`
 - `r5r_best_routes.pkl`
+- `bus_impedance_matrix.dat`
+- `source_id_to_row.json`
+- `dest_id_to_col.json`
+- `bus_impedance_meta.json`
+- `r5r_chunks/`
 
 ## Running the Pipeline
 
@@ -417,8 +435,10 @@ The pipeline is organized as a layered aggregation process:
 
 If you want to understand the repo quickly, start with:
 
-1. [`main.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/main.py)
-2. [`config/poi_types.csv`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/config/poi_types.csv)
-3. [`snapping_stage.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/snapping_stage.py)
-4. [`non_bus_routing_stage.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/non_bus_routing_stage.py)
-5. [`accessibility_stage.py`](/c:/Users/mocci/Desktop/PhD/II/CapabilityModel/accessibility_stage.py)
+1. [`main.py`](main.py)
+2. [`config/poi_types.csv`](config/poi_types.csv)
+3. [`snapping_stage.py`](snapping_stage.py)
+4. [`non_bus_routing_stage.py`](non_bus_routing_stage.py)
+5. [`accessibility_stage.py`](accessibility_stage.py)
+
+

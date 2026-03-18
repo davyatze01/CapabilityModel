@@ -1,6 +1,15 @@
 from osmnx.routing import route_to_gdf
 
 def impedance_bus(route_distance,route_waiting):
+    """Compute bus impedance in minutes from route distance and waiting time.
+
+    Inputs:
+    - route_distance: route distance value expected in kilometers.
+    - route_waiting: waiting time expected in minutes.
+
+    Outputs:
+    - float: estimated bus impedance in minutes.
+    """
     impedance = None
 
     BUS_SPEED = 10
@@ -13,6 +22,15 @@ def impedance_bus(route_distance,route_waiting):
         exit()
 
 def impedance_base(distance,network_type):
+    """Convert distance to travel-time impedance for a given transport mode.
+
+    Inputs:
+    - distance: route distance in kilometers.
+    - network_type: one of walk, bike, or drive.
+
+    Outputs:
+    - float: impedance in minutes using fixed mode speed.
+    """
 
     speed = None
 

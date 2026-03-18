@@ -8,6 +8,14 @@ from utils import graphml
 
 
 def build_context(config: PipelineConfig) -> PipelineContext:
+    """Build shared runtime context from configuration.
+
+    Inputs:
+    - config: pipeline configuration with paths, debug options, and worker settings.
+
+    Outputs:
+    - PipelineContext: graph, node list, output paths, worker count, and service groupings.
+    """
     graph = graphml.get_mode_graph("walk")
     nodes = list(graph.nodes(data=True))
     nodes_with_coords = [item for item in nodes if "y" in item[1] and "x" in item[1]]

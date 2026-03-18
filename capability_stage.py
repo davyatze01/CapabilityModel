@@ -7,6 +7,15 @@ from utils import capabilities as cap
 
 
 def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> CapabilityStageResult:
+    """Aggregate service scores into capability scores and write capability CSV outputs.
+
+    Inputs:
+    - ctx: pipeline context with capability-service mapping and output paths.
+    - svc: service scores computed for each node.
+
+    Outputs:
+    - CapabilityStageResult: written output paths and number of processed rows.
+    """
     output_paths = ctx.output_paths
     rows_written = 0
 

@@ -5,6 +5,15 @@ from tqdm import tqdm
 
 
 def run_service_stage(ctx: PipelineContext, acc: AccessibilityStageResult) -> ServiceStageResult:
+    """Aggregate POI-type accessibility values into one score per service for each node.
+
+    Inputs:
+    - ctx: pipeline context with service configuration and progress settings.
+    - acc: node-level accessibility results grouped by service and POI type.
+
+    Outputs:
+    - ServiceStageResult: one service-score dictionary per node.
+    """
     out = ServiceStageResult()
     pbar = tqdm(total=len(acc.node_results), desc="Service stage", mininterval=1) if ctx.config.enable_progress else None
     try:

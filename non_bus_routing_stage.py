@@ -22,22 +22,55 @@ _NON_BUS_CACHE_SCHEMA_VERSION: int = 0
 
 
 def _non_bus_cache_path(node_id):
+    """Build cache file path for one node id.
+
+    Inputs:
+    - node_id: origin node identifier.
+
+    Outputs:
+    - str: non-bus cache file path.
+    """
     if not _NON_BUS_CACHE_DIR:
         raise RuntimeError("non-bus cache directory is not initialized")
     return os.path.join(_NON_BUS_CACHE_DIR, f"{node_id}.pkl")
 
 
 def _write_non_bus_cache(path, payload):
+    """Write non-bus cache payload for a node.
+
+    Inputs:
+    - path: destination pickle path.
+    - payload: node-level non-bus cache payload.
+
+    Outputs:
+    - None. Writes pickle file.
+    """
     with open(path, "wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def _load_non_bus_cache(path):
+    """Load node-level non-bus cache payload from disk.
+
+    Inputs:
+    - path: cache pickle path.
+
+    Outputs:
+    - dict-like payload for one node.
+    """
     with open(path, "rb") as f:
         return pickle.load(f)
 
 
 def _is_valid_non_bus_cache(payload):
+    """Validate non-bus cache schema shape and version.
+
+    Inputs:
+    - payload: cache object loaded from pickle.
+
+    Outputs:
+    - bool: True when cache can be safely reused.
+    """
     if not isinstance(payload, dict):
         return False
     if payload.get("schema_version") != _NON_BUS_CACHE_SCHEMA_VERSION:
@@ -50,6 +83,14 @@ def _is_valid_non_bus_cache(payload):
 
 
 def _has_valid_non_bus_cache(path):
+    """Check whether a node cache file exists and is reusable.
+
+    Inputs:
+    - path: non-bus cache path.
+
+    Outputs:
+    - bool: True when file exists and passes schema validation.
+    """
     if not os.path.exists(path):
         return False
     try:
@@ -68,6 +109,20 @@ def _init_worker(
     non_bus_cache_dir: str = "",
     non_bus_cache_schema_version: int = 0,
 ):
+    """Initialize worker state for non-bus multiprocessing stage.
+
+    Inputs:
+    - poi_bus_snap_info_by_type: bus snap candidates keyed by POI key.
+    - poi_mode_snap_info_by_type: snap candidates split by mode and POI key.
+    - graph: base graph object shared with utilities.
+    - mode_graphs: mapping of mode -> graph.
+    - non_bus_progress_value: shared progress counter.
+    - non_bus_cache_dir: cache directory for node payloads.
+    - non_bus_cache_schema_version: expected cache schema version.
+
+    Outputs:
+    - None. Populates worker globals and warm caches.
+    """
     global _POI_BUS_SNAP_INFO, _POI_MODE_SNAP_INFO, _NON_BUS_PROGRESS_VALUE, _POI_WORK_UNITS_BY_KEY
     global _NON_BUS_CACHE_DIR, _NON_BUS_CACHE_SCHEMA_VERSION
     _NON_BUS_CACHE_DIR = non_bus_cache_dir or ""
@@ -87,6 +142,14 @@ def _init_worker(
 
 
 def _process_node(node_item):
+    """Compute non-bus modal ingredients for one origin node.
+
+    Inputs:
+    - node_item: `(node_id, node_data)` pair with origin coordinates.
+
+    Outputs:
+    - dict node payload ready for non-bus cache persistence, or None for invalid nodes.
+    """
     node_id, data = node_item
     if "y" not in data or "x" not in data:
         return None
@@ -155,6 +218,15 @@ def run_non_bus_routing_stage(
     ctx: PipelineContext,
     snap: SnappingStageResult,
 ) -> NonBusRoutingStageResult:
+    """Run non-bus routing ingredient computation with cache reuse and retries.
+
+    Inputs:
+    - ctx: pipeline context with workers, config, and node list.
+    - snap: snapping outputs used to resolve POI candidates by mode.
+
+    Outputs:
+    - NonBusRoutingStageResult: cache paths and computed/cached node counters.
+    """
     cfg = ctx.config
     global _NON_BUS_CACHE_DIR, _NON_BUS_CACHE_SCHEMA_VERSION
     _NON_BUS_CACHE_DIR = cfg.non_bus_cache_dir
