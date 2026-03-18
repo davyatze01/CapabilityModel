@@ -25,5 +25,6 @@ class PipelineConfig:
     bus_source_id_to_row_path : str = os.path.join("outputs","source_id_to_row.json")
     bus_dest_id_to_col_path : str = os.path.join("outputs","dest_id_to_col.json")
     bus_impedance_matrix_path : str = os.path.join("outputs","bus_impedance_matrix.dat")
+    bus_impedance_meta_path: str = os.path.join("outputs", "bus_impedance_meta.json")
     pool_max_retries: int = 4
     pool_retry_delay_s: float = 2.0

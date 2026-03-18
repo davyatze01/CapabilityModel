@@ -225,3 +225,10 @@ outputs/r5_slow_routes.csv.tmp
 outputs/r5_slow_routes.sqlite.tmp
 outputs/r5r_best_routes.pkl
 outputs/r5r_expanded_travel_time_matrix.csv
+outputs/bus_impedance_matrix.dat
+outputs/source_id_to_row.json
+outputs/dest_id_to_col.json
+outputs/bus_impedance_meta.json
+outputs/r5r_chunks/
+outputs/r5r_origins.csv
+outputs/r5r_dest.csv

@@ -1,4 +1,5 @@
 {
+  "python.defaultInterpreterPath": "C:\\Program Files\\WindowsApps\\PythonSoftwareFoundation.Python.3.11_3.11.2544.0_x64__qbz5n2kfra8p0\\python3.11.exe",
   "python.analysis.exclude": [
     "**/.git",
     "**/.hg",
@@ -16,5 +17,6 @@
     "**/rra_cache"
   ],
   "python.analysis.indexing": false,
-  "python.analysis.diagnosticMode": "openFilesOnly"
+  "python.analysis.diagnosticMode": "openFilesOnly",
+  "python-envs.defaultEnvManager": "ms-python.python:system"
 }

@@ -27,6 +27,8 @@ class BusRoutingStageResult:
     routing_csv: str
     routing_pkl: str
     routing_departure_iso: str
+    origins_sig: str
+    destinations_sig: str
 
 
 @dataclass

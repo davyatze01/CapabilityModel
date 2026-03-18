@@ -104,12 +104,10 @@ def _process_node(node_item):
                     (_POI_MODE_SNAP_INFO or {}).get(poi_key, {}),
                     tags=query.tags,
                 )
-            except Exception:
-                data = {
-                    "cache_hit": True,
-                    "cache_file": None,
-                    "accessibility_value": 0.0,
-                }
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Non-bus routing failed for node_id={node_id}, poi_type={query.poi_type}"
+                ) from exc
             if data["cache_hit"]:
                 entries.append({
                     "poi_type": query.poi_type,
@@ -232,14 +230,22 @@ def run_non_bus_routing_stage(
                     ),
                 ) as pool:
                     pending_batch = list(pending_non_bus.items())
+                    made_progress = False
                     for partial in pool.imap_unordered(_process_node, pending_batch, chunksize=20):
                         if partial is None:
                             continue
                         node_id = partial["node_id"]
                         cache_path = _non_bus_cache_path(node_id)
                         _write_non_bus_cache(cache_path, partial)
-                        pending_non_bus.pop(node_id, None)
-                break
+                        if node_id in pending_non_bus:
+                            pending_non_bus.pop(node_id, None)
+                            made_progress = True
+                if not pending_non_bus:
+                    break
+                if not made_progress:
+                    raise RuntimeError(
+                         f"Non-bus pool made no progress; remaining_nodes={len(pending_non_bus)}"
+                    )
             except Exception as e:
                 non_bus_attempt += 1
                 if non_bus_attempt > cfg.pool_max_retries:
