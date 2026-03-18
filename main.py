@@ -22,6 +22,7 @@ if isinstance(sys.stdout, io.TextIOWrapper):
 
 
 def main():
+    """Run the full capability pipeline end-to-end and print generated output paths."""
     # Create a context with the configuration values specified in PipelineConfig. All global values accessed by multiple stages are found here.
     cfg = PipelineConfig()
     ctx = build_context(cfg)

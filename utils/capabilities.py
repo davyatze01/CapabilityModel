@@ -53,6 +53,15 @@ CAP_SINGLETON_M = {
 }
 
 def cap(S, capability):
+    """Return the capability measure for a subset of services.
+
+    Inputs:
+    - S: ordered/list-like subset of services.
+    - capability: target capability key.
+
+    Outputs:
+    - float: fuzzy measure value used by Choquet aggregation.
+    """
     if len(S) == 0:
         return 0
     elif len(S) == 1:
@@ -64,6 +73,15 @@ def cap(S, capability):
     
 
 def choquet_integral(x, capability):
+    """Aggregate service scores into one capability score via Choquet integral.
+
+    Inputs:
+    - x: service score list aligned to capability service order.
+    - capability: target capability key.
+
+    Outputs:
+    - float: aggregated capability score.
+    """
     n = len(x)
     order = sorted(range(n), key=lambda i: x[i])
     x_sorted = [x[i] for i in order]

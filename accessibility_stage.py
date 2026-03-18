@@ -27,11 +27,27 @@ _BUS_SOURCE_ID_TO_ROW: dict[str, int] | None = None
 _BUS_DEST_COORD_TO_COL: dict[tuple[float, float], int] | None = None
 # Load cached files from non-bus routing
 def _load_non_bus_cache(path):
+    """Load per-node non-bus cache payload from pickle.
+
+    Inputs:
+    - path: file path to non-bus cache for one origin node.
+
+    Outputs:
+    - dict-like cache payload for that node.
+    """
     with open(path, "rb") as f:
         return pickle.load(f)
 
 # If the schema version is outdated, that non-bus cache is invalid
 def _is_valid_non_bus_cache(payload):
+    """Validate minimal non-bus cache schema compatibility.
+
+    Inputs:
+    - payload: object loaded from non-bus cache file.
+
+    Outputs:
+    - bool: True when payload matches expected schema version and shape.
+    """
     if not isinstance(payload, dict):
         return False
     if payload.get("schema_version") != _NON_BUS_CACHE_SCHEMA_VERSION:
@@ -51,6 +67,19 @@ def _init_accessibility_worker(
     dest_csv_path,
     access_progress_value=None,
 ):
+    """Initialize worker-local state for accessibility multiprocessing.
+
+    Inputs:
+    - non_bus_cache_schema_version: expected cache schema version.
+    - matrix_path: path to dense bus impedance matrix.
+    - source_id_to_row_path: path to origin-id -> row index JSON.
+    - dest_id_to_col_path: path to destination-id -> column index JSON.
+    - dest_csv_path: path to destination CSV used to map coords to destination ids.
+    - access_progress_value: optional shared progress counter.
+
+    Outputs:
+    - None. Populates worker globals used during node computation.
+    """
     global _NON_BUS_CACHE_SCHEMA_VERSION, _ACCESS_PROGRESS_VALUE
     global _BUS_SOURCE_ID_TO_ROW, _BUS_DEST_COORD_TO_COL, _BUS_IMPEDANCE_MATRIX
     _NON_BUS_CACHE_SCHEMA_VERSION = non_bus_cache_schema_version
@@ -77,6 +106,17 @@ def _init_accessibility_worker(
     )
 
 def _validate_bus_matrix_meta(meta_path, expected_departure_iso, expected_origins_sig, expected_destinations_sig):
+    """Validate bus matrix metadata before accessibility computation starts.
+
+    Inputs:
+    - meta_path: metadata JSON path.
+    - expected_departure_iso: departure datetime expected by current run.
+    - expected_origins_sig: expected origin signature.
+    - expected_destinations_sig: expected destination signature.
+
+    Outputs:
+    - None. Raises RuntimeError when metadata is stale or incompatible.
+    """
     with open(meta_path, encoding="utf-8") as f:
         meta = json.load(f)
 
@@ -94,6 +134,14 @@ def _validate_bus_matrix_meta(meta_path, expected_departure_iso, expected_origin
 # It is the result of the aggregation of singular accessibility calculations for each set of poi_type in the graph.
 # The accessibility values of the poi_types are grouped based on the service distribution
 def _compute_node_accessibility(item):
+    """Compute service-grouped accessibility for a single origin node.
+
+    Inputs:
+    - item: `(node_id, cache_path)` pair for one origin node.
+
+    Outputs:
+    - AccessibilityNodeResult for valid caches, or None when node cache is unusable.
+    """
     try:
         node_id, cache_path = item
         if not os.path.exists(cache_path):
@@ -120,6 +168,14 @@ def _compute_node_accessibility(item):
         imp_cache: dict[tuple[float, float], float | None] = {}
 
         def _get_imp(coord_key: tuple[float, float]) -> float | None:
+            """Return bus impedance for one destination coordinate using lazy memoization.
+
+            Inputs:
+            - coord_key: destination coordinate key `(lat, lon)` rounded to 6 decimals.
+
+            Outputs:
+            - float impedance in minutes, or None if lookup is unavailable.
+            """
             if coord_key in imp_cache:
                 return imp_cache[coord_key]
 
@@ -145,6 +201,14 @@ def _compute_node_accessibility(item):
         # # The bus impedance is loaded from the cached numpy dense matrix and the decay is calculated
         # The decays for each mode are merged and then we merge with the RRA the decays of the POI types
         def _compute_entry_accessibility(entry):
+            """Compute accessibility for one POI-type entry of a service.
+
+            Inputs:
+            - entry: non-bus cache entry with mode decays and destination coordinates.
+
+            Outputs:
+            - float accessibility value for the POI type.
+            """
             nonlocal missing_bus_ods
             if entry["cache_hit"]:
                 return entry["accessibility_value"]
@@ -204,6 +268,16 @@ def run_accessibility_stage(
     non_bus: NonBusRoutingStageResult,
     bus: BusRoutingStageResult,
 ) -> AccessibilityStageResult:
+    """Run accessibility stage over all nodes with multiprocessing and retries.
+
+    Inputs:
+    - ctx: pipeline context with worker count, config paths, and progress settings.
+    - non_bus: non-bus stage result with per-node cache paths.
+    - bus: bus stage result with routing signatures used for metadata validation.
+
+    Outputs:
+    - AccessibilityStageResult: node-level accessibility outputs and missing OD count.
+    """
     pending = {node_id: non_bus.cache_paths[node_id] for node_id, _ in ctx.nodes_with_coords}
     pool_workers = ctx.workers
     attempt = 0

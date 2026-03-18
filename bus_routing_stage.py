@@ -16,12 +16,31 @@ import json
 COORD_ROUND = 6
 
 def _load_routing_cache(path: str):
+    """Load persisted routing cache payload from pickle.
+
+    Inputs:
+    - path: file path to routing pickle cache.
+
+    Outputs:
+    - dict-like payload containing routing metadata and routes.
+    """
     with open(path, "rb") as f:
         return pickle.load(f)
 
 
 def _is_valid_routing_cache(payload, departure_iso: str, origins_sig: str | None = None,
                             destinations_sig: str | None = None) -> bool:
+    """Validate routing cache schema and optional run signatures.
+
+    Inputs:
+    - payload: object loaded from routing cache file.
+    - departure_iso: expected departure datetime string.
+    - origins_sig: optional expected origin signature.
+    - destinations_sig: optional expected destination signature.
+
+    Outputs:
+    - bool: True when cache is compatible with the expected run context.
+    """
     if not isinstance(payload, dict):
         return False
     if payload.get("departure_iso") != departure_iso:
@@ -41,6 +60,18 @@ def _is_valid_routing_cache(payload, departure_iso: str, origins_sig: str | None
 
 def _validate_routing_artifacts_for_skip(skip_routing: bool, cache_path: str, departure_iso: str,
     origins_sig: str | None = None, destinations_sig: str | None = None,):
+    """Fail fast when skip mode is enabled but routing cache is missing/incompatible.
+
+    Inputs:
+    - skip_routing: whether the stage is configured to reuse existing artifacts.
+    - cache_path: routing pickle path to validate.
+    - departure_iso: expected departure datetime string.
+    - origins_sig: optional expected origin signature.
+    - destinations_sig: optional expected destination signature.
+
+    Outputs:
+    - None. Raises RuntimeError on invalid artifacts.
+    """
     if not skip_routing:
         return
     if not os.path.isfile(cache_path):
@@ -59,6 +90,17 @@ def _validate_routing_artifacts_for_skip(skip_routing: bool, cache_path: str, de
         )
     
 def _validate_bus_matrix_meta(path: str, departure_iso: str, origins_sig: str, destinations_sig: str) -> None:
+    """Validate bus matrix metadata file against expected run signatures.
+
+    Inputs:
+    - path: metadata JSON path.
+    - departure_iso: expected departure datetime string.
+    - origins_sig: expected origin signature.
+    - destinations_sig: expected destination signature.
+
+    Outputs:
+    - None. Raises RuntimeError when metadata is missing or incompatible.
+    """
     if not os.path.isfile(path):
         raise RuntimeError(f"Missing bus matrix metadata while skip_routing=True. Expected file: {path}")
     try:
@@ -78,7 +120,14 @@ def _validate_bus_matrix_meta(path: str, departure_iso: str, origins_sig: str, d
         )
 
 def _coords_signature(coords: list[tuple[float, float]]) -> str:
-    """Hash an ordered coordinate list so runs can be matched to exact routing inputs."""
+    """Hash ordered coordinates to identify exact routing inputs across runs.
+
+    Inputs:
+    - coords: ordered (lat, lon) list.
+
+    Outputs:
+    - str: stable SHA1 signature of the rounded coordinate sequence.
+    """
     h = hashlib.sha1()
     for lat, lon in coords:
         h.update(f"{round(float(lat), COORD_ROUND)},{round(float(lon), COORD_ROUND)};".encode("ascii"))
@@ -91,6 +140,17 @@ def _write_r5r_point_inputs(
         origins_csv,
         destinations_csv,
 ):
+    """Write origin/destination CSV files consumed by the R routing script.
+
+    Inputs:
+    - nodes_with_coords: iterable of graph node ids with x/y coordinates.
+    - destinations: selected destination coordinates as (lat, lon).
+    - origins_csv: output path for origins CSV.
+    - destinations_csv: output path for destinations CSV.
+
+    Outputs:
+    - None. Writes CSV files to disk.
+    """
     Path(origins_csv).parent.mkdir(parents=True, exist_ok=True)
 
     with open(origins_csv, "w", newline="", encoding="utf-8") as f:
@@ -107,6 +167,14 @@ def _write_r5r_point_inputs(
 
 
 def _run_r5r_script(script_path: str) -> None:
+    """Run the external R routing script and stream its logs.
+
+    Inputs:
+    - script_path: path to the R script entrypoint.
+
+    Outputs:
+    - None. Raises if Rscript fails or is not available.
+    """
     rscript_exe = shutil.which("Rscript")
     if not rscript_exe:
         raise RuntimeError(
@@ -154,6 +222,15 @@ def _run_r5r_script(script_path: str) -> None:
         raise
 
 def build_bus_impedance_cache(context: PipelineContext, force_rebuild: bool = False) -> None:
+    """Build dense bus impedance matrix and index files from routing CSV.
+
+    Inputs:
+    - context: pipeline context with bus artifact paths.
+    - force_rebuild: when True, rebuild matrix/indexes even if files exist.
+
+    Outputs:
+    - None. Writes matrix `.dat` and row/column index JSON files.
+    """
     cfg = context.config
     source_id_to_row = {}
     dest_id_to_col = {}
@@ -216,6 +293,17 @@ def build_bus_impedance_cache(context: PipelineContext, force_rebuild: bool = Fa
 
 
 def _write_bus_matrix_meta(path, departure_iso, origins_sig, destinations_sig):
+    """Persist metadata used to validate matrix freshness across runs.
+
+    Inputs:
+    - path: metadata JSON destination.
+    - departure_iso: run departure datetime string.
+    - origins_sig: origin signature.
+    - destinations_sig: destination signature.
+
+    Outputs:
+    - None. Writes metadata JSON to disk.
+    """
     with open(path, "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -228,6 +316,15 @@ def _write_bus_matrix_meta(path, departure_iso, origins_sig, destinations_sig):
 
 
 def _save_routing_cache(path: str, payload) -> None:
+    """Atomically persist routing cache payload to pickle.
+
+    Inputs:
+    - path: destination pickle path.
+    - payload: routing cache payload dictionary.
+
+    Outputs:
+    - None. Writes pickle file with atomic replace.
+    """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path + ".tmp"
     with open(tmp_path, "wb") as f:
@@ -243,6 +340,19 @@ def _build_routing_cache_from_r5r_csv(
     origins_sig: str,
     destinations_sig: str,
 ):
+    """Build in-memory routing cache dictionary from expanded routing CSV.
+
+    Inputs:
+    - csv_path: expanded routing CSV path produced by R.
+    - origin_id_to_coord: mapping from origin ids to rounded coordinates.
+    - destination_id_to_coord: mapping from destination ids to rounded coordinates.
+    - departure_iso: departure datetime string.
+    - origins_sig: origin signature.
+    - destinations_sig: destination signature.
+
+    Outputs:
+    - dict: routing cache payload with metadata and `(origin,destination)` route map.
+    """
     routes = {}
     usecols = ["from_id", "to_id", "total_time", "wait_time", "routes"]
 
@@ -291,6 +401,15 @@ def _build_routing_cache_from_r5r_csv(
 
 # This function runs the bus routing stage
 def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> BusRoutingStageResult:
+    """Execute transit routing stage and produce reusable bus routing artifacts.
+
+    Inputs:
+    - ctx: pipeline context with configuration and graph nodes.
+    - snap: snapping results with bus destination candidates.
+
+    Outputs:
+    - BusRoutingStageResult: paths and signatures for downstream stages.
+    """
     cfg = ctx.config
     departure_iso = cfg.bus_departure_dt.isoformat()
     routing_csv = cfg.bus_routing_matrix_path

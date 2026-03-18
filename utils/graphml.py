@@ -15,6 +15,14 @@ _MODE_GRAPH_CACHE = {}
 
 
 def get_graph():
+    """Load or download the base graph and cache it in memory.
+
+    Inputs:
+    - none.
+
+    Outputs:
+    - graph object representing the default study-area network.
+    """
 
     # Nomi file
     PLACE_NAME = "Cagliari, Sardinia, Italy"
@@ -40,6 +48,14 @@ def get_graph():
 
 
 def get_mode_graph(network_type):
+    """Load or download graph for a specific travel mode.
+
+    Inputs:
+    - network_type: mode string (for example walk, bike, drive).
+
+    Outputs:
+    - graph object for that mode, cached in memory.
+    """
     # Cache per-mode graphs on disk to avoid repeated Overpass downloads.
     PLACE_NAME = "Cagliari, Sardinia, Italy"
     NAME_FILE = f"graph/cagliari_{network_type}.graphml"
@@ -60,6 +76,14 @@ def get_mode_graph(network_type):
     return graph
 
 def _tags_file_name(tags):
+    """Build stable geojson filename for a tags-based POI query.
+
+    Inputs:
+    - tags: dictionary used in OSM features query.
+
+    Outputs:
+    - str: deterministic filename for cache reuse.
+    """
     tags_json = json.dumps(tags, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     key_hash = hashlib.sha1(tags_json.encode("utf-8")).hexdigest()
     return f"tags_{key_hash}.geojson"
@@ -70,6 +94,15 @@ def get_poi(
     value: TagValue | None = None,
     tags: TagsDict | None = None,
 ):
+    """Load POIs from local cache or download them from OSM.
+
+    Inputs:
+    - feature/value: optional key-value OSM filter.
+    - tags: optional tags dictionary filter (preferred when provided).
+
+    Outputs:
+    - GeoDataFrame: POI features matching requested filters.
+    """
 
     # Nomi file
     PLACE_NAME = "Cagliari, Sardinia, Italy"
@@ -137,6 +170,16 @@ def get_poi(
     return poi
 
 def print_poi(poi, print_start, print_end):
+    """Print POI names in a selected index window.
+
+    Inputs:
+    - poi: POI GeoDataFrame.
+    - print_start: start index (inclusive).
+    - print_end: end index (exclusive).
+
+    Outputs:
+    - None. Prints names to stdout.
+    """
     if print_start == None or print_start < 0:
         print_start = 0
     
@@ -150,16 +193,40 @@ def print_poi(poi, print_start, print_end):
 
 
 def get_poi_names(poi):
+    """Extract POI names from a GeoDataFrame.
+
+    Inputs:
+    - poi: POI GeoDataFrame.
+
+    Outputs:
+    - list[str]: non-null POI names.
+    """
     return [
         name for name in poi["name"].dropna().astype(str).values
     ]
 
 def get_poi_geom(poi):
+    """Extract geometry column values as strings.
+
+    Inputs:
+    - poi: POI GeoDataFrame.
+
+    Outputs:
+    - list[str]: non-null geometry values converted to strings.
+    """
     return [
         geometry for geometry in poi["geometry"].dropna().astype(str).values
     ]
 
 def get_poi_geometries(poi):
+    """Extract geometry objects with optional names from POI table.
+
+    Inputs:
+    - poi: POI GeoDataFrame.
+
+    Outputs:
+    - list[tuple[geometry, name]]: geometry/name pairs for downstream snapping.
+    """
     out = []
     if "geometry" not in poi.columns:
         return out
@@ -175,6 +242,14 @@ def get_poi_geometries(poi):
     return out
 
 def get_poi_amenity_types(poi):
+    """List unique amenity values present in POI data.
+
+    Inputs:
+    - poi: POI GeoDataFrame.
+
+    Outputs:
+    - list[str]: sorted unique amenity labels.
+    """
     if "amenity" not in poi.columns:
         return []
     return sorted(poi["amenity"].dropna().astype(str).unique().tolist())

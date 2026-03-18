@@ -12,10 +12,20 @@ from tqdm import tqdm
 from context import PipelineContext
 from pipeline_types import SnappingStageResult
 from utils import graphml, services as serv, delta_g
-
+from osmnx.distance import nearest_nodes
+import numpy as np
 
 # Computes the haversine distance in meters between two points (lat1, lon1) and (lat2, lon2)
 def _haversine_m(lat1, lon1, lat2, lon2):
+    """Compute great-circle distance between two coordinates in meters.
+
+    Inputs:
+    - lat1, lon1: first coordinate.
+    - lat2, lon2: second coordinate.
+
+    Outputs:
+    - float: distance in meters.
+    """
     r = 6371000.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
@@ -26,12 +36,28 @@ def _haversine_m(lat1, lon1, lat2, lon2):
 
 # When caching routing/impedance results, the keys used to retrieve the values are the coordinates of the node in question, rounded to 6 decimals.
 def _coord_key(coord):
+    """Normalize coordinate keys for cache/index lookups.
+
+    Inputs:
+    - coord: `(lat, lon)` coordinate tuple.
+
+    Outputs:
+    - tuple: rounded `(lat, lon)` key at 6-decimal precision.
+    """
     return (round(coord[0], 6), round(coord[1], 6))
 
 
 # Since POI can be geometries and each POI must be snapped to a node of the graph to compute routing, in this function we create a collection of candidate
 # snap points for a geometry, i.e. a list of vertices for that geometry. Then, the snapped point of the graph will be selected based on the closest to the origin of the routing.
 def _extract_geom_vertices(geom):
+    """Extract representative vertex coordinates from a geometry object.
+
+    Inputs:
+    - geom: shapely geometry (point, line, polygon, multiparts, collection).
+
+    Outputs:
+    - list of `(lat, lon)` coordinates used as snap candidates.
+    """
     gtype = geom.geom_type
     if gtype == "Point":
         return [(geom.y, geom.x)]
@@ -64,6 +90,15 @@ def _extract_geom_vertices(geom):
 
 # In a single pass, all coordinates are snapped to the closest node of the graph 
 def _snap_coords_batch(graph, coords):
+    """Snap many coordinates to nearest graph nodes in one vectorized call.
+
+    Inputs:
+    - graph: network graph used for nearest-node queries.
+    - coords: list of source coordinates `(lat, lon)`.
+
+    Outputs:
+    - dict: `coord_key -> (snapped_coord, snap_distance_m)`.
+    """
     if not coords:
         return {}
     unique = {}
@@ -75,10 +110,13 @@ def _snap_coords_batch(graph, coords):
             ordered.append(key)
     lons = [unique[k][1] for k in ordered]
     lats = [unique[k][0] for k in ordered]
-    nodes = ox.distance.nearest_nodes(graph, lons, lats)
-    if hasattr(nodes, "tolist"):
+    nodes = nearest_nodes(graph, lons, lats)
+
+    if isinstance(nodes, np.ndarray):
         nodes = nodes.tolist()
-    elif not isinstance(nodes, (list, tuple)):
+    elif isinstance(nodes, tuple):
+        nodes = list(nodes)
+    elif not isinstance(nodes, list):
         nodes = [nodes]
     out = {}
     for idx, key in enumerate(ordered):
@@ -94,6 +132,14 @@ def _snap_coords_batch(graph, coords):
 # A list of pairs contiaining the source node and then the second element is a list of snapped points.
 # Each snapped point is a pair as well containing the coordinates of the snapped node and the distance in meters from the source coordinate.
 def _normalize_cached_snap_entries(cached):
+    """Normalize old/new cache formats into a unified snap-entry structure.
+
+    Inputs:
+    - cached: object loaded from a snap cache file.
+
+    Outputs:
+    - normalized list or None when payload is not a compatible list format.
+    """
     if not isinstance(cached, list):
         return None
     normalized = []
@@ -148,6 +194,14 @@ def _normalize_cached_snap_entries(cached):
 # For each specified PoiQuery it returns the corresponding geometries. This is done only if the snapped list for the poi does not exist.
 # Otherwise, we will always refer to the snapped point and avoid dealing with the geometry, reducing the complexity of the code
 def _get_query_geometries(query):
+    """Load and cache POI geometries for one query key.
+
+    Inputs:
+    - query: POI query configuration object.
+
+    Outputs:
+    - list of geometries with optional names.
+    """
     feature, value, tags = delta_g._resolve_query(query.poi_type, None, query.tags)
     cache_key = (feature, value)
     if cache_key in delta_g._POI_GEOM_CACHE:
@@ -162,6 +216,16 @@ def _get_query_geometries(query):
 
 # To avoid long file names, an hash is computed for each poi_key and this function returns the path where a particular poi_key is saved
 def _poi_snap_cache_path(cache_dir, poi_key, cache_ns):
+    """Build deterministic cache filename for one POI key and namespace.
+
+    Inputs:
+    - cache_dir: directory where snap caches are stored.
+    - poi_key: normalized key of POI query.
+    - cache_ns: namespace token (for mode separation).
+
+    Outputs:
+    - str: cache file path.
+    """
     os.makedirs(cache_dir, exist_ok=True)
     key_repr = f"{cache_ns}|{repr(poi_key)}"
     key_hash = hashlib.sha1(key_repr.encode("utf-8")).hexdigest()
@@ -169,6 +233,16 @@ def _poi_snap_cache_path(cache_dir, poi_key, cache_ns):
 
 # Loads the poi_snap_cache, i.e. for each poi -> the closest node of the graph. If the POI is a geometry then there's one closest node for each vertex
 def _load_poi_snap_cache(cache_dir, poi_key, cache_ns):
+    """Load snap cache payload for one POI key when available.
+
+    Inputs:
+    - cache_dir: snap cache directory.
+    - poi_key: POI query key.
+    - cache_ns: mode/cache namespace.
+
+    Outputs:
+    - cached payload object or None when file is missing/invalid.
+    """
     path = _poi_snap_cache_path(cache_dir, poi_key, cache_ns)
     if not os.path.exists(path):
         return None
@@ -180,6 +254,17 @@ def _load_poi_snap_cache(cache_dir, poi_key, cache_ns):
 
 # Save the poi_snap_cache, i.e. for each poi -> the closest node of the graph. If the POI is a geometry then there's one closest node for each vertex
 def _save_poi_snap_cache(cache_dir, poi_key, payload, cache_ns):
+    """Persist normalized snap payload atomically for one POI key.
+
+    Inputs:
+    - cache_dir: snap cache directory.
+    - poi_key: POI query key.
+    - payload: normalized snap payload.
+    - cache_ns: mode/cache namespace.
+
+    Outputs:
+    - None. Writes cache file to disk.
+    """
     path = _poi_snap_cache_path(cache_dir, poi_key, cache_ns)
     tmp_path = path + ".tmp"
     with open(tmp_path, "wb") as f:
@@ -189,6 +274,20 @@ def _save_poi_snap_cache(cache_dir, poi_key, payload, cache_ns):
 # This function builds the poi_snap_map. For each poi type, we have a list of snapped POIs. If the POI is a geometry or so, then that POI is represented with a list
 # containing the snapped node for each vertex. The selection of the node will be dependent to the origin of the routing.
 def _build_poi_snap_map(graph, query_by_key, enable_progress, cache_dir, cache_ns, max_pois=None, seed=42):
+    """Build POI-to-snap-candidates map, reusing cache when possible.
+
+    Inputs:
+    - graph: target transport graph for snapping.
+    - query_by_key: mapping of query key to POI query definition.
+    - enable_progress: whether to show progress bars.
+    - cache_dir: snap cache directory.
+    - cache_ns: namespace to isolate cache by mode.
+    - max_pois: optional debug cap per query.
+    - seed: random seed used for debug sampling.
+
+    Outputs:
+    - dict: POI key -> list of source coords and candidate snapped coords.
+    """
     poi_snap_map = {}
     rng = random.Random(seed)
 
@@ -284,6 +383,14 @@ def _build_poi_snap_map(graph, query_by_key, enable_progress, cache_dir, cache_n
 
 # The snap map is then converted to a dictionary for faster lookup.
 def _snap_map_to_info(poi_snap_map):
+    """Convert snap-map payload into fast lookup structure by POI/source coord.
+
+    Inputs:
+    - poi_snap_map: normalized snap map payload.
+
+    Outputs:
+    - dict: POI key -> `{source_coord_key: [(snapped_coord, dist_m), ...]}`.
+    """
     poi_snap_info_by_type = {}
     for poi_key, snapped_list in poi_snap_map.items():
         info = {}
@@ -310,6 +417,16 @@ def _snap_map_to_info(poi_snap_map):
 # When the poi is a geometry, the closest graph node depends to the source. Ideally, the closest vertex to the source will be where you'll access to the poi.
 # So distance is computed between all candidate snap pois and origin and only one is chosen.
 def _select_best_snap_candidate_for_origin(origin, coord, snap_info):
+    """Choose best snapped candidate for an origin/source pair.
+
+    Inputs:
+    - origin: origin coordinate `(lat, lon)`.
+    - coord: original source coordinate `(lat, lon)`.
+    - snap_info: candidate snapped points with snap distances.
+
+    Outputs:
+    - tuple: `(selected_snapped_coord, selected_snap_distance_m)`.
+    """
     if snap_info and isinstance(snap_info, list):
         best_cand = None
         for cand in snap_info:
@@ -331,6 +448,16 @@ def _select_best_snap_candidate_for_origin(origin, coord, snap_info):
 # Instead, if there are multiple candidates the _select_best_snap_candidate above is called.
 # At the end the result is a set of snapped_pois based on the OD pairs.
 def _build_selected_routing_destinations(nodes_with_coords, poi_bus_snap_info_by_type, enable_progress):
+    """Build reduced bus destination set by selecting best candidates per origin.
+
+    Inputs:
+    - nodes_with_coords: origin nodes with x/y coordinates.
+    - poi_bus_snap_info_by_type: bus snap candidates for each POI key.
+    - enable_progress: whether to display progress while evaluating OD pairs.
+
+    Outputs:
+    - list: sorted set of selected destination coordinates for routing.
+    """
     single_candidate_selected = set()
     multi_candidate_items = []
 
@@ -368,6 +495,14 @@ def _build_selected_routing_destinations(nodes_with_coords, poi_bus_snap_info_by
 
 
 def run_snapping_stage(ctx: PipelineContext) -> SnappingStageResult:
+    """Run snapping stage for walk/bike/drive and derive bus snap candidates.
+
+    Inputs:
+    - ctx: pipeline context with config, graphs, and debug/progress settings.
+
+    Outputs:
+    - SnappingStageResult: query map, bus/mode snap info, and shared mode graphs.
+    """
     # Creates the query keys to get the POIs information
     cfg = ctx.config
     unique_queries = serv.unique_query_keys()

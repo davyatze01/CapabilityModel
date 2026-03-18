@@ -17,6 +17,16 @@ class PoiQuery:
 
 
 def _config_error(row_num: int | None, column: str | None, message: str) -> ValueError:
+    """Build standardized configuration error with CSV location context.
+
+    Inputs:
+    - row_num: optional CSV row number.
+    - column: optional CSV column name.
+    - message: validation message.
+
+    Outputs:
+    - ValueError ready to be raised by callers.
+    """
     where = f"path={CONFIG_CSV_PATH}"
     if row_num is not None:
         where += f" row={row_num}"
@@ -26,6 +36,16 @@ def _config_error(row_num: int | None, column: str | None, message: str) -> Valu
 
 
 def _parse_json_cell(raw: str, row_num: int, column: str) -> Any:
+    """Parse JSON from a CSV cell and raise contextual errors.
+
+    Inputs:
+    - raw: raw JSON text from CSV cell.
+    - row_num: source row number.
+    - column: source column name.
+
+    Outputs:
+    - parsed JSON value.
+    """
     try:
         return json.loads(raw)
     except Exception as exc:
@@ -33,6 +53,14 @@ def _parse_json_cell(raw: str, row_num: int, column: str) -> Any:
 
 
 def _validate_required_columns(fieldnames: list[str] | None) -> None:
+    """Ensure required POI configuration columns are present.
+
+    Inputs:
+    - fieldnames: header field list from CSV reader.
+
+    Outputs:
+    - None. Raises ValueError if required columns are missing.
+    """
     required = ["poi_type", "decay_constant", "choquet_capacity", "contribution_constant", "tags", "services"]
     if fieldnames is None:
         raise _config_error(None, None, f"missing header row, expected columns {required}")
@@ -42,6 +70,14 @@ def _validate_required_columns(fieldnames: list[str] | None) -> None:
 
 
 def _load_rows() -> list[dict[str, Any]]:
+    """Load and validate POI configuration rows from CSV.
+
+    Inputs:
+    - none.
+
+    Outputs:
+    - list of normalized row dictionaries with parsed numeric/JSON fields.
+    """
     if not CONFIG_CSV_PATH.is_file():
         raise _config_error(None, None, f"file not found: {CONFIG_CSV_PATH}")
 
@@ -136,6 +172,14 @@ def _load_rows() -> list[dict[str, Any]]:
 
 
 def _build_runtime_structures(rows: list[dict[str, Any]]):
+    """Build runtime lookup structures used by service/capability stages.
+
+    Inputs:
+    - rows: validated row dictionaries from `_load_rows`.
+
+    Outputs:
+    - tuple containing service queries, singleton measures, decay constants, and contribution constants.
+    """
     service_poi_queries: "OrderedDict[str, list[PoiQuery]]" = OrderedDict()
     service_singleton_m: "OrderedDict[str, dict[str, float]]" = OrderedDict()
     decay_constants: dict[str, float] = {}
@@ -163,6 +207,14 @@ def _build_runtime_structures(rows: list[dict[str, Any]]):
 
 
 def _bootstrap_compatibility_checks() -> None:
+    """Validate consistency between configured services and capability mappings.
+
+    Inputs:
+    - none.
+
+    Outputs:
+    - None. Raises ValueError if compatibility checks fail.
+    """
     try:
         from utils import capabilities as _cap
     except Exception as exc:
@@ -185,10 +237,27 @@ def _bootstrap_compatibility_checks() -> None:
 
 
 def get_decay_constant(poi_type: str) -> float:
+    """Return decay constant configured for a POI type.
+
+    Inputs:
+    - poi_type: POI type key.
+
+    Outputs:
+    - float decay constant.
+    """
     return POI_DECAY_CONSTANTS[poi_type]
 
 
 def get_contribution_constant(poi_type: str, service: str | None = None) -> float:
+    """Return contribution constant for a POI type, optionally scoped by service.
+
+    Inputs:
+    - poi_type: POI type key.
+    - service: optional service key to disambiguate per-service constants.
+
+    Outputs:
+    - float contribution constant.
+    """
     if service is not None:
         return SERVICE_CONTRIBUTION_CONSTANTS[service][poi_type]
     matches = []
@@ -213,10 +282,26 @@ _bootstrap_compatibility_checks()
 
 
 def get_service_queries(service: str) -> list[PoiQuery]:
+    """Get ordered POI queries that contribute to one service.
+
+    Inputs:
+    - service: service key.
+
+    Outputs:
+    - list of `PoiQuery` definitions.
+    """
     return SERVICE_POI_QUERIES[service]
 
 
 def get_service_poi_types() -> dict[str, list[str]]:
+    """Return POI-type lists grouped by service.
+
+    Inputs:
+    - none.
+
+    Outputs:
+    - mapping service -> ordered list of POI types.
+    """
     return {
         service: [q.poi_type for q in queries]
         for service, queries in SERVICE_POI_QUERIES.items()
@@ -224,10 +309,26 @@ def get_service_poi_types() -> dict[str, list[str]]:
 
 
 def all_queries() -> list[PoiQuery]:
+    """Return flat list of all service-specific POI queries.
+
+    Inputs:
+    - none.
+
+    Outputs:
+    - list of `PoiQuery`.
+    """
     return [q for group in SERVICE_POI_QUERIES.values() for q in group]
 
 
 def unique_query_keys() -> list[PoiQuery]:
+    """Return deduplicated POI queries across services.
+
+    Inputs:
+    - none.
+
+    Outputs:
+    - list of unique `PoiQuery`, preserving first-seen order.
+    """
     seen = set()
     out = []
     for q in all_queries():
@@ -240,6 +341,14 @@ def unique_query_keys() -> list[PoiQuery]:
 
 
 def query_key(q: PoiQuery) -> tuple[str, tuple | None]:
+    """Build hashable key for a POI query.
+
+    Inputs:
+    - q: POI query object.
+
+    Outputs:
+    - tuple key using poi_type and normalized tags.
+    """
     tags_key = None
     if q.tags:
         tags_key = tuple(sorted(q.tags.items()))
@@ -247,6 +356,14 @@ def query_key(q: PoiQuery) -> tuple[str, tuple | None]:
 
 
 def _service_idx_map(service: str) -> dict[str, int]:
+    """Create POI-type to index mapping for one service.
+
+    Inputs:
+    - service: service key.
+
+    Outputs:
+    - dict mapping POI type -> positional index.
+    """
     return {q.poi_type: i for i, q in enumerate(SERVICE_POI_QUERIES[service])}
 
 
@@ -267,6 +384,15 @@ CARE_SERVICES_IDX = _service_idx_map("care_services")
 
 
 def cap(S, service):
+    """Compute fuzzy measure for a subset of POI types in one service.
+
+    Inputs:
+    - S: subset/list of POI types.
+    - service: service key.
+
+    Outputs:
+    - float fuzzy measure used by Choquet aggregation.
+    """
     if len(S) == 0:
         return 0
     if len(S) == 1:
@@ -277,6 +403,15 @@ def cap(S, service):
 
 
 def choquet_integral(x, service):
+    """Aggregate POI-type accessibility values into one service score.
+
+    Inputs:
+    - x: POI accessibility values aligned to service POI order.
+    - service: service key.
+
+    Outputs:
+    - float aggregated service score.
+    """
     n = len(x)
     order = sorted(range(n), key=lambda i: x[i])
     x_sorted = [x[i] for i in order]
