@@ -223,3 +223,5 @@ outputs/r5_fast_routes.sqlite
 outputs/r5_fast_routes.sqlite.tmp
 outputs/r5_slow_routes.csv.tmp
 outputs/r5_slow_routes.sqlite.tmp
+outputs/r5r_best_routes.pkl
+outputs/r5r_expanded_travel_time_matrix.csv
