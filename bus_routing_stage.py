@@ -57,6 +57,25 @@ def _validate_routing_artifacts_for_skip(skip_routing: bool, cache_path: str, de
             "Routing cache is invalid or incompatible while skip_routing=True. "
             f"Cache file: {cache_path}"
         )
+    
+def _validate_bus_matrix_meta(path: str, departure_iso: str, origins_sig: str, destinations_sig: str) -> None:
+    if not os.path.isfile(path):
+        raise RuntimeError(f"Missing bus matrix metadata while skip_routing=True. Expected file: {path}")
+    try:
+        with open(path, encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load bus matrix metadata: {path}") from exc
+
+    if (
+        meta.get("departure_iso") != departure_iso
+        or meta.get("origins_sig") != origins_sig
+        or meta.get("destinations_sig") != destinations_sig
+    ):
+        raise RuntimeError(
+            "Bus matrix metadata is invalid or incompatible while skip_routing=True. "
+            f"Meta file: {path}"
+        )
 
 def _coords_signature(coords: list[tuple[float, float]]) -> str:
     """Hash an ordered coordinate list so runs can be matched to exact routing inputs."""
@@ -93,16 +112,24 @@ def _run_r5r_script(script_path: str) -> None:
         raise RuntimeError(
             "Rscript executable not found. Add Rscript to your PATH so the pipeline can run the R routing script."
         )
-    popen_kwargs = dict(
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
     if os.name == "nt":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        proc = subprocess.Popen(
+            [rscript_exe, script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+    else:
+        proc = subprocess.Popen(
+            [rscript_exe, script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
 
-    proc = subprocess.Popen([rscript_exe, script_path], **popen_kwargs)
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -126,7 +153,7 @@ def _run_r5r_script(script_path: str) -> None:
                 proc.kill()
         raise
 
-def build_bus_impedance_cache(context: PipelineContext) -> None:
+def build_bus_impedance_cache(context: PipelineContext, force_rebuild: bool = False) -> None:
     cfg = context.config
     source_id_to_row = {}
     dest_id_to_col = {}
@@ -136,7 +163,13 @@ def build_bus_impedance_cache(context: PipelineContext) -> None:
     source_index_path = Path(cfg.bus_source_id_to_row_path)
     dest_index_path = Path(cfg.bus_dest_id_to_col_path)
 
-    if matrix_path.is_file()  and matrix_path.stat().st_size > 0 and source_index_path.is_file() and dest_index_path.is_file():
+    if (
+        not force_rebuild
+        and matrix_path.is_file()
+        and matrix_path.stat().st_size > 0
+        and source_index_path.is_file()
+        and dest_index_path.is_file()
+    ):
         return
 
     # Read the source csv and create correspondance between id and row in the csv
@@ -173,12 +206,25 @@ def build_bus_impedance_cache(context: PipelineContext) -> None:
             if total_time == "" or (row["routes"] in ["", "[WALK]"]):
                 total_time = 0
             impedance_matrix[source_row][dest_col] = total_time
+    impedance_matrix.flush()
 
     with open(cfg.bus_source_id_to_row_path, 'w') as f:
         json.dump(source_id_to_row, f)
     
     with open(cfg.bus_dest_id_to_col_path, 'w') as f:
         json.dump(dest_id_to_col, f)
+
+
+def _write_bus_matrix_meta(path, departure_iso, origins_sig, destinations_sig):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "departure_iso": departure_iso,
+                "origins_sig": origins_sig,
+                "destinations_sig": destinations_sig,
+            },
+            f,
+        )
 
 
 def _save_routing_cache(path: str, payload) -> None:
@@ -278,6 +324,7 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
     origins_sig = _coords_signature(origins)
     destinations_sig = _coords_signature(destinations)
 
+
     if cfg.skip_routing:
         _validate_routing_artifacts_for_skip(
             cfg.skip_routing,
@@ -286,6 +333,13 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
             origins_sig=origins_sig,
             destinations_sig=destinations_sig,
         )
+        _validate_bus_matrix_meta(
+            cfg.bus_impedance_meta_path,
+            departure_iso,
+            origins_sig,
+            destinations_sig,
+        )
+        build_bus_impedance_cache(ctx, force_rebuild=False)
 
         print(f"Skipping routing build. Reusing cache: {routing_cache}")
 
@@ -293,7 +347,10 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
             routing_csv=routing_csv,
             routing_pkl=routing_cache,
             routing_departure_iso=departure_iso,
+            origins_sig=origins_sig,
+            destinations_sig=destinations_sig,
         )
+
     
     origin_id_to_coord = {
         str(node_id): (round(float(data["y"]), COORD_ROUND), round(float(data["x"]), COORD_ROUND))
@@ -319,7 +376,7 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
     _run_r5r_script(r_script_path)
     print("[Bus] Rscript completed. Building routing cache from CSV...", flush=True)
 
-    build_bus_impedance_cache(ctx)
+    build_bus_impedance_cache(ctx, force_rebuild=True)
 
     routing_payload = _build_routing_cache_from_r5r_csv(
         routing_csv,
@@ -331,11 +388,20 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
     )
     _save_routing_cache(routing_cache, routing_payload)
 
+    _write_bus_matrix_meta(
+        cfg.bus_impedance_meta_path,
+        departure_iso,
+        origins_sig,
+        destinations_sig
+    )
     return BusRoutingStageResult(
         routing_csv=routing_csv,
         routing_pkl=routing_cache,
         routing_departure_iso=departure_iso,
+        origins_sig=origins_sig,
+        destinations_sig=destinations_sig,
     )
+
 
 
 # compatibility shim

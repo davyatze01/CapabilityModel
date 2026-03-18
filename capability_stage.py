@@ -55,10 +55,7 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
                 row_care = [node.node_id, node.lat, node.lon, capability_care]
                 row_care.extend(scores[s] for s in ctx.care_services)
                 writer_care.writerow(row_care)
-
-                f_rest.flush()
-                f_nut.flush()
-                f_care.flush()
+                
                 rows_written += 1
                 if pbar:
                     pbar.update(1)
