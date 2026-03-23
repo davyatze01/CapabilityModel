@@ -171,34 +171,24 @@ def _process_node(node_item):
                 raise RuntimeError(
                     f"Non-bus routing failed for node_id={node_id}, poi_type={query.poi_type}"
                 ) from exc
-            if data["cache_hit"]:
-                entries.append({
-                    "poi_type": query.poi_type,
-                    "cache_hit": True,
-                    "cache_file": data["cache_file"],
-                    "accessibility_value": data["accessibility_value"],
-                })
-            else:
-                decay_walk = data["decay_walk"]
-                decay_bike = data["decay_bike"]
-                decay_drive = data["decay_drive"]
-                source_coords = data.get("source_coords", [])
-                poi_coords = []
-                snap_info_for_key = _POI_BUS_SNAP_INFO.get(poi_key, {}) if _POI_BUS_SNAP_INFO else {}
-                for coord in source_coords:
-                    snap_info = snap_info_for_key.get(coord_key(coord))
-                    snapped_coord, _ = select_best_snap_candidate_for_origin(origin, coord, snap_info)
-                    poi_coords.append(snapped_coord)
+            decay_walk = data["decay_walk"]
+            decay_bike = data["decay_bike"]
+            decay_drive = data["decay_drive"]
+            source_coords = data.get("source_coords", [])
+            poi_coords = []
+            snap_info_for_key = _POI_BUS_SNAP_INFO.get(poi_key, {}) if _POI_BUS_SNAP_INFO else {}
+            for coord in source_coords:
+                snap_info = snap_info_for_key.get(coord_key(coord))
+                snapped_coord, _ = select_best_snap_candidate_for_origin(origin, coord, snap_info)
+                poi_coords.append(snapped_coord)
 
-                entries.append({
-                    "poi_type": query.poi_type,
-                    "cache_hit": False,
-                    "cache_file": data["cache_file"],
-                    "decay_walk": decay_walk,
-                    "decay_bike": decay_bike,
-                    "decay_drive": decay_drive,
-                    "poi_coords": poi_coords,
-                })
+            entries.append({
+                "poi_type": query.poi_type,
+                "decay_walk": decay_walk,
+                "decay_bike": decay_bike,
+                "decay_drive": decay_drive,
+                "poi_coords": poi_coords,
+            })
             if _NON_BUS_PROGRESS_VALUE is not None and _POI_WORK_UNITS_BY_KEY is not None:
                 units = float(_POI_WORK_UNITS_BY_KEY.get(poi_key, 0))
                 if units > 0:

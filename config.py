@@ -7,6 +7,24 @@ import os
 class PipelineConfig:
     worker_count: int | None = None
     skip_routing: bool = False
+    accessibility_chunksize: int = 100
+    accessibility_deduplicate_entries: bool = True
+
+    # Accessibility matrix cache
+    accessibility_matrix_cache_enabled: bool = True
+    accessibility_matrix_path: str = os.path.join("outputs", "accessibility_matrix.dat")
+    accessibility_meta_path: str = os.path.join("outputs", "accessibility_meta.json")
+    accessibility_node_to_row_path: str = os.path.join("outputs", "access_node_to_row.json")
+    accessibility_poi_to_col_path: str = os.path.join("outputs", "access_poi_to_col.json")
+    accessibility_matrix_schema_version: int = 1
+
+    # Service matrix cache
+    service_matrix_cache_enabled: bool = True
+    service_matrix_path: str = os.path.join("outputs", "service_matrix.dat")
+    service_meta_path: str = os.path.join("outputs", "service_meta.json")
+    service_node_to_row_path: str = os.path.join("outputs", "service_node_to_row.json")
+    service_to_col_path: str = os.path.join("outputs", "service_to_col.json")
+    service_matrix_schema_version: int = 1
 
     debug_max_nodes: int | None = None
     debug_max_pois: int | None = None
@@ -14,7 +32,7 @@ class PipelineConfig:
     enable_progress: bool = True
 
     non_bus_cache_dir: str = os.path.join("cache", "non_bus")
-    non_bus_cache_schema_version: int = 3
+    non_bus_cache_schema_version: int = 4
     poi_snap_cache_dir: str = os.path.join("cache", "poi_snap_cache")
 
     bus_departure_dt: dt.datetime = dt.datetime(2025, 10, 15, 12, 0, 0)

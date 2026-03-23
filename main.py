@@ -43,8 +43,6 @@ def main():
     # We compute impedances, decay and accessibilities for each Origin-Destination pair based on the routing results. The Accessibility values are then aggregated for POI type
     print("[Stage] Accessibility", flush=True)
     acc = run_accessibility_stage(ctx, non_bus, bus)
-    if acc.missing_bus_ods_total:
-        print(f"Missing routing OD lookups: {acc.missing_bus_ods_total}", flush=True)
 
     # Each poi type contributes to one or multiple services. Based on the accessibility to the poi types, we compute the opportunity for services
     print("[Stage] Service Aggregation", flush=True)
