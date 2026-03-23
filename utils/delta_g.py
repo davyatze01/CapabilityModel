@@ -1,7 +1,6 @@
 from utils import graphml, decay, get_impedance, services as serv
 import math
 import os
-import pickle
 import json
 import hashlib
 from typing import Hashable, TypeGuard, cast
@@ -9,11 +8,6 @@ import networkx as nx
 import osmnx as ox
 from shapely.geometry.base import BaseGeometry
 
-
-# Active pipeline cache/versioning
-CACHE_VERSION = 3
-CACHE_FOLDER = "rra_cache"
-os.makedirs(CACHE_FOLDER, exist_ok=True)
 
 # Kept because main.py uses this in-memory geometry cache while building snap maps.
 POI_GEOM_CACHE_FOLDER = "poi_geom_cache"
@@ -211,27 +205,6 @@ def _get_mode_lengths(grafo, origin, network_type, radius_m, origin_node=None):
     return lengths
 
 
-def _cache_file_path(poi_type, origine, feature, radius_m):
-    """Build cache file path for RRA payload of one origin/POI query.
-
-    Inputs:
-    - poi_type: POI type key.
-    - origine: origin coordinate `(lat, lon)`.
-    - feature: query feature token.
-    - radius_m: optional routing radius.
-
-    Outputs:
-    - str path to RRA cache file.
-    """
-    lat_key = f"{origine[0]:.6f}"
-    lon_key = f"{origine[1]:.6f}"
-    radius_key = "all" if radius_m is None else f"r{int(radius_m)}"
-    return os.path.join(
-        CACHE_FOLDER,
-        f"RRA_v{CACHE_VERSION}_{feature}_{poi_type}_{radius_key}_{lat_key}_{lon_key}.pkl",
-    )
-
-
 def build_rra(decay_walk, decay_bike, decay_drive, decay_bus):
     """Build per-POI RRA list by combining modal decay lists element-wise.
 
@@ -307,16 +280,7 @@ def accessibility_non_bus_from_snap_map(poi_type, origine, poi_snap_info_by_mode
     Outputs:
     - dict with cache metadata and non-bus modal decay arrays.
     """
-    feature, value, tags = _resolve_query(poi_type, feature, tags)
-    cache_file = _cache_file_path(poi_type, origine, feature, radius_m)
-
-    if os.path.exists(cache_file):
-        rra = load_rra(cache_file)
-        return {
-            "cache_hit": True,
-            "cache_file": cache_file,
-            "accessibility_value": accessibility_from_rra(rra, poi_type=poi_type),
-        }
+    _feature, _value, _tags = _resolve_query(poi_type, feature, tags)
 
     mode_infos = poi_snap_info_by_mode or {}
     source_keys_seen = set()
@@ -333,8 +297,6 @@ def accessibility_non_bus_from_snap_map(poi_type, origine, poi_snap_info_by_mode
     beta = math.log(2) / decay_constant
     if not source_coords:
         return {
-            "cache_hit": False,
-            "cache_file": cache_file,
             "source_coords": [],
             "beta": beta,
             "decay_walk": [],
@@ -395,8 +357,6 @@ def accessibility_non_bus_from_snap_map(poi_type, origine, poi_snap_info_by_mode
         decay_drive.append(dd)
 
     return {
-        "cache_hit": False,
-        "cache_file": cache_file,
         "source_coords": source_coords,
         "beta": beta,
         "decay_walk": decay_walk,
@@ -420,30 +380,3 @@ def merge_rra_and_accessibility(decay_walk, decay_bike, decay_drive, decay_bus, 
     return rra, accessibility_from_rra(rra, poi_type=poi_type, contribution_constant=contribution_constant)
 
 
-def save_rra(path, RRA):
-    """Persist RRA list atomically to cache.
-
-    Inputs:
-    - path: destination cache path.
-    - RRA: list of RRA values to save.
-
-    Outputs:
-    - None. Writes pickle file.
-    """
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "wb") as f:
-        pickle.dump(RRA, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp_path, path)
-
-
-def load_rra(path):
-    """Load cached RRA list from disk.
-
-    Inputs:
-    - path: cache path.
-
-    Outputs:
-    - object loaded from pickle, expected to be RRA list.
-    """
-    with open(path, "rb") as f:
-        return pickle.load(f)

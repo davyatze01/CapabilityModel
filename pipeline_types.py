@@ -44,13 +44,11 @@ class AccessibilityNodeResult:
     lat: float
     lon: float
     accessibility_by_service: dict[str, list[dict[str, Any]]]
-    missing_bus_ods: int
 
 
 @dataclass
 class AccessibilityStageResult:
     node_results: list[AccessibilityNodeResult] = field(default_factory=list)
-    missing_bus_ods_total: int = 0
 
 
 @dataclass
