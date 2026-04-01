@@ -298,7 +298,9 @@ def _build_poi_snap_map(graph, query_by_key, enable_progress, cache_dir, cache_n
     for poi_key, query in query_by_key.items():
         cached = _load_poi_snap_cache(cache_dir, poi_key, cache_ns)
         normalized = _normalize_cached_snap_entries(cached)
-        if normalized is not None:
+        # Empty cached payloads can come from transient POI download failures;
+        # treat them as stale so we retry POI extraction/snapping.
+        if normalized is not None and len(normalized) > 0:
             poi_snap_map[poi_key] = normalized
             continue
 
@@ -524,7 +526,7 @@ def run_snapping_stage(ctx: PipelineContext) -> SnappingStageResult:
             query_by_key,
             cfg.enable_progress,
             cfg.poi_snap_cache_dir,
-            cache_ns=f"mode_{mode}",
+            cache_ns=f"{cfg.city_slug}|mode_{mode}",
             max_pois=cfg.debug_max_pois,
             seed=cfg.seed,
         )

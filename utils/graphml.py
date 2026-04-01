@@ -6,12 +6,19 @@ import hashlib
 import json
 from typing import TypeAlias
 
+from config import PipelineConfig
+
 TagValue: TypeAlias = bool | str | list[str]
 TagsDict: TypeAlias = dict[str, TagValue]
 
 # In-memory caches to avoid repeated disk loads
 _GRAPH_CACHE = None
 _MODE_GRAPH_CACHE = {}
+_CITY_POI_UNIVERSE_CACHE: dict[str, gpd.GeoDataFrame] = {}
+
+def _get_city_settings() -> tuple[str, str]:
+    cfg = PipelineConfig()
+    return cfg.city_name, cfg.city_slug
 
 
 def get_graph():
@@ -25,8 +32,8 @@ def get_graph():
     """
 
     # Nomi file
-    PLACE_NAME = "Cagliari, Sardinia, Italy"
-    NAME_FILE = "graph/cagliari.graphml"
+    place_name, city_slug = _get_city_settings()
+    name_file = f"graph/{city_slug}.graphml"
 
     # Se esiste lo carico altrimenti creo e salvo
 
@@ -36,11 +43,11 @@ def get_graph():
 
     graph = None
     try:
-        graph = ox.io.load_graphml(NAME_FILE)
+        graph = ox.io.load_graphml(name_file)
     except Exception:
-        print("Grafo non presente, scarico il grafo di Cagliari..")
-        graph = ox.graph_from_place(PLACE_NAME)
-        ox.io.save_graphml(graph,filepath = NAME_FILE)
+        print(f"Grafo non presente, scarico il grafo di {place_name}..")
+        graph = ox.graph_from_place(place_name)
+        ox.io.save_graphml(graph, filepath=name_file)
         print("Grafo scaricato e salvato correttamente!")
 
     _GRAPH_CACHE = graph
@@ -57,19 +64,19 @@ def get_mode_graph(network_type):
     - graph object for that mode, cached in memory.
     """
     # Cache per-mode graphs on disk to avoid repeated Overpass downloads.
-    PLACE_NAME = "Cagliari, Sardinia, Italy"
-    NAME_FILE = f"graph/cagliari_{network_type}.graphml"
+    place_name, city_slug = _get_city_settings()
+    name_file = f"graph/{city_slug}_{network_type}.graphml"
 
     if network_type in _MODE_GRAPH_CACHE:
         return _MODE_GRAPH_CACHE[network_type]
 
     graph = None
     try:
-        graph = ox.io.load_graphml(NAME_FILE)
+        graph = ox.io.load_graphml(name_file)
     except Exception:
         print(f"Grafo {network_type} non presente, scarico da OSM..")
-        graph = ox.graph_from_place(PLACE_NAME, network_type=network_type)
-        ox.io.save_graphml(graph, filepath=NAME_FILE)
+        graph = ox.graph_from_place(place_name, network_type=network_type)
+        ox.io.save_graphml(graph, filepath=name_file)
         print("Grafo scaricato e salvato correttamente!")
 
     _MODE_GRAPH_CACHE[network_type] = graph
@@ -88,6 +95,134 @@ def _tags_file_name(tags):
     key_hash = hashlib.sha1(tags_json.encode("utf-8")).hexdigest()
     return f"tags_{key_hash}.geojson"
 
+def _feature_value_file_name(feature: str, value: TagValue) -> str:
+    """Build stable geojson filename for a feature/value POI query."""
+    payload = json.dumps(
+        {"feature": feature, "value": value},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    key_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()
+    return f"fv_{key_hash}.geojson"
+
+def _city_poi_cache_dir(city_slug: str) -> str:
+    """Return city-scoped directory path for POI cache files."""
+    return os.path.join("poi", city_slug)
+
+def _all_tags_file_name(query_tags: TagsDict) -> str:
+    payload = json.dumps(query_tags, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    key_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()
+    return f"all_tags_{key_hash}.geojson"
+
+def _normalize_value_list(values: set[TagValue]) -> list[TagValue]:
+    return sorted(list(values), key=lambda x: json.dumps(x, sort_keys=True, ensure_ascii=True))
+
+def _build_city_query_batches() -> dict[str, list[TagValue]]:
+    """Group configured POI queries by tag key to enable batched extraction."""
+    from utils import services as serv
+
+    by_key: dict[str, set[TagValue]] = {}
+    for q in serv.unique_query_keys():
+        tags = q.tags or {}
+        for key, value in tags.items():
+            if isinstance(value, list):
+                for item in value:
+                    by_key.setdefault(str(key), set()).add(str(item))
+            else:
+                by_key.setdefault(str(key), set()).add(value)
+    return {k: _normalize_value_list(v) for k, v in by_key.items()}
+
+def _build_city_universe_tags() -> TagsDict:
+    """Build one combined tags payload covering all configured POI queries."""
+    key_batches = _build_city_query_batches()
+    out: TagsDict = {}
+    for key, values in key_batches.items():
+        if any(v is True for v in values):
+            out[key] = True
+        else:
+            out[key] = [str(v) for v in values]
+    return out
+
+def _download_city_poi_universe(place_name: str, query_tags: TagsDict) -> gpd.GeoDataFrame:
+    """Download one city-wide POI dataset that covers all configured tags."""
+    print(f"[POI] OSMnx city-universe download: keys={len(query_tags)}")
+    return _download_poi_for_place(place_name, query_tags)
+
+def _values_match(series: pd.Series, value: TagValue) -> pd.Series:
+    if value is True:
+        return series.notna()
+    if isinstance(value, list):
+        wanted = {str(v) for v in value}
+        return series.astype(str).isin(wanted)
+    return series.astype(str) == str(value)
+
+def _filter_by_tags(gdf: gpd.GeoDataFrame, tags: TagsDict) -> gpd.GeoDataFrame:
+    if gdf.empty:
+        return gdf
+    mask = pd.Series(True, index=gdf.index)
+    for key, value in tags.items():
+        if key not in gdf.columns:
+            return gpd.GeoDataFrame(geometry=[], crs=gdf.crs)
+        mask = mask & _values_match(gdf[key], value)
+    out = gdf.loc[mask].copy()
+    if "geometry" in out.columns:
+        out = out[out["geometry"].notna()].copy()
+    return out
+
+def _get_city_poi_universe(place_name: str, city_slug: str, city_poi_dir: str) -> gpd.GeoDataFrame:
+    cached = _CITY_POI_UNIVERSE_CACHE.get(city_slug)
+    if cached is not None:
+        return cached
+
+    universe_tags = _build_city_universe_tags()
+    path = os.path.join(city_poi_dir, _all_tags_file_name(universe_tags))
+    gdf = _load_cached_poi_if_nonempty(path)
+    if gdf is None:
+        try:
+            gdf = _download_city_poi_universe(place_name, universe_tags)
+        except Exception as exc:
+            print(f"[POI] City-universe download failed: {exc}")
+            gdf = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        if gdf is not None and not gdf.empty and "geometry" in gdf.columns and not gdf["geometry"].dropna().empty:
+            try:
+                gdf.to_file(path, driver="GeoJSON")
+            except Exception as exc:
+                print(f"[POI] Failed to persist city-universe cache {path}: {exc}")
+    if gdf is None:
+        gdf = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+    _CITY_POI_UNIVERSE_CACHE[city_slug] = gdf
+    return gdf
+
+def _download_poi_for_place(place_name: str, query_tags: TagsDict):
+    """Download POIs for one place with polygon fallback when place lookup fails."""
+    try:
+        return ox.features_from_place(place_name, query_tags)
+    except Exception as place_exc:
+        print(
+            f"features_from_place failed for '{place_name}' ({place_exc}); "
+            "retrying with geocoded polygon..."
+        )
+        place_gdf = ox.geocode_to_gdf(place_name)
+        if place_gdf.empty:
+            raise RuntimeError(f"geocode_to_gdf returned no geometry for place '{place_name}'")
+        polygon = place_gdf.geometry.iloc[0]
+        return ox.features_from_polygon(polygon, query_tags)
+
+def _load_cached_poi_if_nonempty(path: str):
+    """Load cached POI file and return None when missing/invalid/empty."""
+    try:
+        poi = gpd.read_file(path)
+    except Exception:
+        return None
+    if poi is None or poi.empty:
+        return None
+    if "geometry" not in poi.columns:
+        return None
+    if poi["geometry"].dropna().empty:
+        return None
+    return poi
+
 
 def get_poi(
     feature: str | None = None,
@@ -105,24 +240,25 @@ def get_poi(
     """
 
     # Nomi file
-    PLACE_NAME = "Cagliari, Sardinia, Italy"
+    place_name, city_slug = _get_city_settings()
 
     os.makedirs("poi", exist_ok=True)
+    city_poi_dir = _city_poi_cache_dir(city_slug)
+    os.makedirs(city_poi_dir, exist_ok=True)
 
     if (feature is None or value is None) and not tags:
         poi_files = [
-            os.path.join("poi", name)
-            for name in os.listdir("poi")
+            os.path.join(city_poi_dir, name)
+            for name in os.listdir(city_poi_dir)
             if name.lower().endswith(".geojson")
         ]
 
         if poi_files:
             frames = []
             for path in poi_files:
-                try:
-                    frames.append(gpd.read_file(path))
-                except Exception:
-                    continue
+                cached = _load_cached_poi_if_nonempty(path)
+                if cached is not None:
+                    frames.append(cached)
 
             if frames:
                 poi = gpd.GeoDataFrame(
@@ -136,36 +272,65 @@ def get_poi(
         value = True
 
     if tags:
-        NAME_FILE = os.path.join("poi", _tags_file_name(tags))
+        NAME_FILE = os.path.join(city_poi_dir, _tags_file_name(tags))
     else:
-        NAME_FILE = f"poi/{feature}_{value}.geojson"
+        feature_key = feature if feature is not None else "amenity"
+        value_key: TagValue = value if value is not None else True
+        NAME_FILE = os.path.join(city_poi_dir, _feature_value_file_name(feature_key, value_key))
 
-    try:
-        # Provo a caricare i POI gia salvati
-        poi = gpd.read_file(NAME_FILE)
-    except Exception:
+    # Provo a caricare i POI gia salvati.
+    poi = _load_cached_poi_if_nonempty(NAME_FILE)
+    if poi is None:
+        if tags:
+            try:
+                universe = _get_city_poi_universe(place_name, city_slug, city_poi_dir)
+                if universe is not None and not universe.empty:
+                    poi = _filter_by_tags(universe, tags)
+                    if poi is not None and not poi.empty:
+                        poi.to_file(NAME_FILE, driver="GeoJSON")
+                        print(f"POI built from city-universe cache. count={len(poi)} file={NAME_FILE}")
+                        return poi
+            except Exception as batch_exc:
+                print(f"[POI] Batch resolution failed for tags={tags}: {batch_exc}")
+            # Avoid duplicate OSMnx work: tags queries rely only on the city-universe dataset.
+            print(f"[POI] No matches after city-universe filtering for tags={tags}. Skipping per-query OSMnx fallback.")
+            return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
         # Scarico POI da OSM
-        print("Scarico POI da OSM...")
+        print(f"Scarico POI da OSM per '{place_name}'...")
 
         try:
             if tags:
                 query_tags: TagsDict = tags
             else:
-                feature_key = feature if feature is not None else "amenity"
-                value_key: TagValue = value if value is not None else True
                 query_tags = {feature_key: value_key}
-            poi = ox.features_from_place(
-                PLACE_NAME,
-                query_tags
-            )
+            poi = _download_poi_for_place(place_name, query_tags)
         except Exception as e:
             # Nessun POI disponibile per questa query: ritorna GDF vuoto
-            print(f"Nessun POI trovato per {feature}={value} tags={tags}: {e}")
+            print(f"Nessun POI trovato per city={place_name} feature={feature} value={value} tags={tags}: {e}")
+            return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+        if poi.empty:
+            # Do not persist empty payloads: they can mask transient Overpass/geocoding issues.
+            try:
+                if os.path.exists(NAME_FILE):
+                    os.remove(NAME_FILE)
+            except Exception:
+                pass
+            print(f"POI download returned 0 features. Cache not persisted for {NAME_FILE}")
+            return poi
+        if "geometry" not in poi.columns or poi["geometry"].dropna().empty:
+            try:
+                if os.path.exists(NAME_FILE):
+                    os.remove(NAME_FILE)
+            except Exception:
+                pass
+            print(f"POI download has no usable geometry. Cache not persisted for {NAME_FILE}")
             return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
         # Salvo tutti i POI
         poi.to_file(NAME_FILE, driver="GeoJSON")
-        print("POI scaricati e salvati correttamente!")
+        print(f"POI scaricati e salvati correttamente! count={len(poi)} file={NAME_FILE}")
 
     return poi
 

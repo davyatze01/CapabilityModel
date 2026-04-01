@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import osmnx as ox
 import pandas as pd
 import numpy as np
 from pipeline_types import BusRoutingStageResult, PipelineContext, SnappingStageResult
@@ -14,6 +15,114 @@ from snapping_stage import build_selected_routing_destinations
 import json
 
 COORD_ROUND = 6
+
+
+def _prepare_r5r_data_bundle(cfg) -> str:
+    """Ensure routing data folder contains one OSM PBF and one or more GTFS zip files."""
+    data_dir = cfg.routing_data_dir
+    Path(data_dir).mkdir(parents=True, exist_ok=True)
+
+    pbf_path = os.path.join(data_dir, f"{cfg.city_slug}.osm.pbf")
+    if not os.path.isfile(pbf_path):
+        if cfg.osm_pbf_autobuild:
+            print(
+                "[Bus] OSM PBF missing. Building local extract from city_name via OSMnx...",
+                flush=True,
+            )
+            _autobuild_pbf_from_place(cfg, pbf_path)
+            print(f"[Bus] OSM PBF auto-built: {pbf_path}", flush=True)
+        else:
+            raise RuntimeError(
+                "Missing OSM PBF for routing. "
+                f"Expected: {pbf_path}. Enable config.osm_pbf_autobuild."
+            )
+
+    if not cfg.gtfs_feeds:
+        raise RuntimeError("config.gtfs_feeds is empty. Provide at least one GTFS zip path.")
+
+    staged_gtfs = []
+    for feed_path in cfg.gtfs_feeds:
+        if not os.path.isfile(feed_path):
+            raise RuntimeError(f"GTFS feed not found: {feed_path}")
+        if Path(feed_path).suffix.lower() != ".zip":
+            raise RuntimeError(f"GTFS feed must be a .zip file: {feed_path}")
+
+        dst_path = os.path.join(data_dir, os.path.basename(feed_path))
+        if os.path.abspath(feed_path) != os.path.abspath(dst_path):
+            shutil.copy2(feed_path, dst_path)
+        staged_gtfs.append(dst_path)
+
+    if not staged_gtfs:
+        raise RuntimeError(f"No GTFS feeds staged into {data_dir}.")
+
+    return data_dir
+
+
+def _autobuild_pbf_from_place(cfg, pbf_path: str) -> None:
+    """Build a place-scoped OSM extract and convert it to PBF for r5r."""
+    xml_path = os.path.join(cfg.routing_data_dir, f"{cfg.city_slug}.osm.xml")
+
+    # Build unsimplified graph so OSM export keeps a closer representation of ways.
+    graph = ox.graph_from_place(
+        cfg.city_name,
+        network_type=cfg.osm_autobuild_network_type,
+        simplify=cfg.osm_autobuild_simplify,
+        retain_all=cfg.osm_autobuild_retain_all,
+    )
+    ox.io.save_graph_xml(graph, filepath=xml_path)
+
+    osmium_exe = shutil.which("osmium")
+    if osmium_exe:
+        subprocess.run(
+            [osmium_exe, "cat", xml_path, "-o", pbf_path, "--overwrite"],
+            check=True,
+        )
+        return
+
+    osmconvert_exe = shutil.which("osmconvert")
+    if osmconvert_exe:
+        subprocess.run(
+            [osmconvert_exe, xml_path, f"-o={pbf_path}"],
+            check=True,
+        )
+        return
+
+    # Fallback: use Python osmium bindings (pyosmium) when CLI tools are unavailable.
+    try:
+        import osmium
+    except Exception:
+        osmium = None
+
+    if osmium is not None:
+        class _CopyToPbf(osmium.SimpleHandler):
+            def __init__(self, writer):
+                super().__init__()
+                self._writer = writer
+
+            def node(self, n):
+                self._writer.add_node(n)
+
+            def way(self, w):
+                self._writer.add_way(w)
+
+            def relation(self, r):
+                self._writer.add_relation(r)
+
+        writer = osmium.SimpleWriter(pbf_path)
+        try:
+            handler = _CopyToPbf(writer)
+            handler.apply_file(xml_path, locations=False)
+        finally:
+            writer.close()
+        return
+
+    raise RuntimeError(
+        "Could not convert auto-generated OSM XML to PBF. "
+        "None of these conversion backends is available: "
+        "'osmium' CLI, 'osmconvert' CLI, Python package 'osmium'. "
+        "Install one of them, for example: `python -m pip install osmium`. "
+        f"Generated XML at: {xml_path}"
+    )
 
 def _load_routing_cache(path: str):
     """Load persisted routing cache payload from pickle.
@@ -166,7 +275,39 @@ def _write_r5r_point_inputs(
             writer.writerow([f"d{idx}", float(lon), float(lat)])
 
 
-def _run_r5r_script(script_path: str) -> None:
+def _write_empty_routing_csv(path: str) -> None:
+    """Write an empty expanded-routing CSV with the expected schema."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "from_id",
+                "to_id",
+                "departure_time",
+                "draw_number",
+                "access_time",
+                "wait_time",
+                "ride_time",
+                "transfer_time",
+                "egress_time",
+                "routes",
+                "n_rides",
+                "total_time",
+            ]
+        )
+
+
+def _write_dummy_destination_csv(path: str) -> None:
+    """Write one placeholder destination so matrix artifacts remain non-empty."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "lon", "lat"])
+        writer.writerow(["d0", 0.0, 0.0])
+
+
+def _run_r5r_script(script_path: str, ctx: PipelineContext) -> None:
     """Run the external R routing script and stream its logs.
 
     Inputs:
@@ -180,9 +321,20 @@ def _run_r5r_script(script_path: str) -> None:
         raise RuntimeError(
             "Rscript executable not found. Add Rscript to your PATH so the pipeline can run the R routing script."
         )
+    cfg = ctx.config
+    r5_data_path = _prepare_r5r_data_bundle(cfg)
+    env = os.environ.copy()
+    env["R5_DATA_PATH"] = r5_data_path
+    env["R5_ORIGINS_PATH"] = cfg.bus_routing_origins_input_path
+    env["R5_DEST_PATH"] = cfg.bus_routing_destinations_input_path
+    env["R5_OUTPUT_PATH"] = cfg.bus_routing_matrix_path
+    env["R5_CHUNK_DIR"] = os.path.join("outputs", "r5r_chunks", cfg.city_slug)
+    env["R5_DEPARTURE_DATETIME"] = cfg.bus_departure_dt.strftime("%Y-%m-%d %H:%M:%S")
+
     if os.name == "nt":
         proc = subprocess.Popen(
             [rscript_exe, script_path],
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -192,6 +344,7 @@ def _run_r5r_script(script_path: str) -> None:
     else:
         proc = subprocess.Popen(
             [rscript_exe, script_path],
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -276,14 +429,34 @@ def build_bus_impedance_cache(context: PipelineContext, force_rebuild: bool = Fa
 
     with open(cfg.bus_routing_matrix_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        missing_from_ids = set()
+        missing_to_ids = set()
         for row_idx, row in enumerate(reader):
-            source_row = source_id_to_row[row["from_id"]]
-            dest_col = dest_id_to_col[row["to_id"]]
+            from_id = row["from_id"]
+            to_id = row["to_id"]
+            source_row = source_id_to_row.get(from_id)
+            dest_col = dest_id_to_col.get(to_id)
+            if source_row is None:
+                missing_from_ids.add(from_id)
+                continue
+            if dest_col is None:
+                missing_to_ids.add(to_id)
+                continue
             total_time = row["total_time"]
             if total_time == "" or (row["routes"] in ["", "[WALK]"]):
                 total_time = 0
             impedance_matrix[source_row][dest_col] = total_time
     impedance_matrix.flush()
+
+    if missing_from_ids or missing_to_ids:
+        sample_from = sorted(missing_from_ids)[:5]
+        sample_to = sorted(missing_to_ids)[:5]
+        raise RuntimeError(
+            "Routing CSV contains origin/destination IDs not present in the current run inputs. "
+            "This usually means stale or mixed chunk files were reused. "
+            f"Unknown from_id count={len(missing_from_ids)} sample={sample_from}; "
+            f"unknown to_id count={len(missing_to_ids)} sample={sample_to}."
+        )
 
     with open(cfg.bus_source_id_to_row_path, 'w') as f:
         json.dump(source_id_to_row, f)
@@ -443,6 +616,43 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
     origins_sig = _coords_signature(origins)
     destinations_sig = _coords_signature(destinations)
 
+    # No snapped destinations for this city: skip R routing and emit empty-safe artifacts.
+    if not destinations:
+        print("[Bus] No snapped destinations found. Writing empty bus artifacts and skipping R routing.", flush=True)
+
+        _write_r5r_point_inputs(
+            ctx.nodes_with_coords,
+            [],
+            cfg.bus_routing_origins_input_path,
+            cfg.bus_routing_destinations_input_path,
+        )
+        _write_dummy_destination_csv(cfg.bus_routing_destinations_input_path)
+        _write_empty_routing_csv(routing_csv)
+        build_bus_impedance_cache(ctx, force_rebuild=True)
+
+        _save_routing_cache(
+            routing_cache,
+            {
+                "departure_iso": departure_iso,
+                "origins_sig": origins_sig,
+                "destinations_sig": destinations_sig,
+                "routes": {},
+            },
+        )
+        _write_bus_matrix_meta(
+            cfg.bus_impedance_meta_path,
+            departure_iso,
+            origins_sig,
+            destinations_sig,
+        )
+        return BusRoutingStageResult(
+            routing_csv=routing_csv,
+            routing_pkl=routing_cache,
+            routing_departure_iso=departure_iso,
+            origins_sig=origins_sig,
+            destinations_sig=destinations_sig,
+        )
+
 
     if cfg.skip_routing:
         _validate_routing_artifacts_for_skip(
@@ -491,8 +701,11 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
     )
 
     r_script_path = os.path.join("utils", "r5_routing.r")
+    chunk_dir = os.path.join("outputs", "r5r_chunks", cfg.city_slug)
+    if os.path.isdir(chunk_dir):
+        shutil.rmtree(chunk_dir)
     print("[Bus] Launching Rscript...", flush=True)
-    _run_r5r_script(r_script_path)
+    _run_r5r_script(r_script_path, ctx)
     print("[Bus] Rscript completed. Building routing cache from CSV...", flush=True)
 
     build_bus_impedance_cache(ctx, force_rebuild=True)

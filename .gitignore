@@ -232,3 +232,18 @@ outputs/bus_impedance_meta.json
 outputs/r5r_chunks/
 outputs/r5r_origins.csv
 outputs/r5r_dest.csv
+outputs/accessibility_matrix.dat
+outputs/accessibility_meta.json
+outputs/access_node_to_row.json
+outputs/service_matrix.dat
+outputs/service_meta.json
+outputs/service_node_to_row.json
+outputs/capability_*.csv
+experiments/
+walkability_model/
+
+# Generated local graph/OSM caches
+graph/*.graphml
+gtfs/*.osm.pbf
+gtfs/*.osm.xml
+gtfs/*.zip

@@ -20,6 +20,8 @@ shutup.please()
 if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(line_buffering=True)
 
+import logging
+logger = logging.getLogger(__name__)
 
 def main():
     """Run the full capability pipeline end-to-end and print generated output paths."""

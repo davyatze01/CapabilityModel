@@ -7,7 +7,10 @@ from typing import Hashable, TypeGuard, cast
 import networkx as nx
 import osmnx as ox
 from shapely.geometry.base import BaseGeometry
-
+import logging
+import walkability
+from config import PipelineConfig
+logger = logging.getLogger(__name__)
 
 # Kept because main.py uses this in-memory geometry cache while building snap maps.
 POI_GEOM_CACHE_FOLDER = "poi_geom_cache"
@@ -17,6 +20,10 @@ _G_CACHE = None
 _POI_GEOM_CACHE = {}  # key: (feature, value) -> list geometries
 _MODE_GRAPH_CACHE = {}  # key: network_type -> graph
 _MODE_LENGTHS_CACHE = {}  # key: (origin, network_type, radius_key) -> dict node->distance
+_MODE_PATHS_CACHE = {}
+_WALK_EDGE_SCORES_CACHE: dict[str, dict[tuple[int, int, int], float]] = {}
+_WALK_GRAPH_SIG_BY_OBJID: dict[int, str] = {}
+
 
 
 def _normalize_node_id(node):
@@ -167,8 +174,8 @@ def _get_mode_graph(network_type):
     return _MODE_GRAPH_CACHE[network_type]
 
 
-def _get_mode_lengths(grafo, origin, network_type, radius_m, origin_node=None):
-    """Get/calculate shortest-path lengths from one origin on a mode graph.
+def _get_mode_lengths_and_paths(grafo, origin, network_type, radius_m, origin_node=None):
+    """Get/calculate shortest-path lengths and node paths from one origin.
 
     Inputs:
     - grafo: base graph reference (kept for compatibility).
@@ -178,7 +185,9 @@ def _get_mode_lengths(grafo, origin, network_type, radius_m, origin_node=None):
     - origin_node: optional pre-snapped origin node id.
 
     Outputs:
-    - dict mapping reachable node id -> path length in meters.
+    - tuple `(lengths, paths)` where:
+      `lengths` maps reachable node id -> path length in meters and
+      `paths` maps reachable node id -> ordered node path from origin.
     """
     radius_key = "all" if radius_m is None else f"r{int(radius_m)}"
     if origin_node is None:
@@ -187,8 +196,9 @@ def _get_mode_lengths(grafo, origin, network_type, radius_m, origin_node=None):
     else:
         key = (int(origin_node), network_type, radius_key)
 
-    if key in _MODE_LENGTHS_CACHE:
-        return _MODE_LENGTHS_CACHE[key]
+    if key in _MODE_LENGTHS_CACHE and key in _MODE_PATHS_CACHE:
+        return (_MODE_LENGTHS_CACHE[key], _MODE_PATHS_CACHE[key])
+    
 
     mode_graph = _get_mode_graph(network_type)
     if origin_node is None:
@@ -200,9 +210,10 @@ def _get_mode_lengths(grafo, origin, network_type, radius_m, origin_node=None):
         if not origin_nodes:
             raise RuntimeError("nearest_nodes returned no origin node")
         origin_node = cast(Hashable, _normalize_node_id(origin_nodes[0]))
-    lengths = nx.single_source_dijkstra_path_length(mode_graph, origin_node, weight="length")
+    lengths, paths = nx.single_source_dijkstra(mode_graph, origin_node, weight="length")
     _MODE_LENGTHS_CACHE[key] = lengths
-    return lengths
+    _MODE_PATHS_CACHE[key] = paths
+    return (lengths, paths)
 
 
 def build_rra(decay_walk, decay_bike, decay_drive, decay_bus):
@@ -266,7 +277,7 @@ def accessibility_from_rra(RRA, poi_type=None, contribution_constant=None):
     return out
 
 
-def accessibility_non_bus_from_snap_map(poi_type, origine, poi_snap_info_by_mode, feature=None, radius_m=None, tags=None):
+def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origine, poi_snap_info_by_mode, feature=None, radius_m=None, tags=None):
     """Compute non-bus decay ingredients for one origin/POI type from snap maps.
 
     Inputs:
@@ -310,6 +321,10 @@ def accessibility_non_bus_from_snap_map(poi_type, origine, poi_snap_info_by_mode
     grafo = _G_CACHE
 
     mode_distances = {}
+    walk_paths: dict[Hashable, list[Hashable]] = {}
+    walk_paths_scores = []
+    walk_poi_nodes: list[Hashable] = []
+    walk_graph = None
     for mode in ("walk", "bike", "drive"):
         info = mode_infos.get(mode) or {}
         chosen_coords = []
@@ -330,21 +345,83 @@ def accessibility_non_bus_from_snap_map(poi_type, origine, poi_snap_info_by_mode
                 continue
             origin_node = cast(Hashable, _normalize_node_id(all_nodes[0]))
             poi_nodes = [cast(Hashable, _normalize_node_id(n)) for n in all_nodes[1:]]
-            lengths = _get_mode_lengths(grafo, origine, mode, radius_m, origin_node=origin_node)
+            lengths_raw, paths_raw = _get_mode_lengths_and_paths(
+                grafo, origine, mode, radius_m, origin_node=origin_node
+            )
+            lengths: dict[Hashable, float] = cast(dict[Hashable, float], lengths_raw)
+            paths: dict[Hashable, list[Hashable]] = cast(dict[Hashable, list[Hashable]], paths_raw)
+
+            if mode == "walk":
+                walk_paths = paths
+                walk_graph = mode_graph
+                walk_poi_nodes = poi_nodes
+
             mode_distances[mode] = [lengths.get(node) for node in poi_nodes]
-        except Exception:
+
+        except (KeyError, ValueError, TypeError, nx.NodeNotFound, nx.NetworkXNoPath) as exc:
+            logger.warning("Walk routing fallback: mode=%s origin=%s reason=%s", mode, origine, exc)
             mode_distances[mode] = [None] * len(source_coords)
 
     decay_walk = []
     decay_bike = []
     decay_drive = []
+    walk_edge_scores = None
+    if walk_graph is not None:
+        graph_obj_id = id(walk_graph)
+        graph_sig = _WALK_GRAPH_SIG_BY_OBJID.get(graph_obj_id)
+        if graph_sig is None:
+            graph_sig = walkability.compute_graph_signature(walk_graph)
+            _WALK_GRAPH_SIG_BY_OBJID[graph_obj_id] = graph_sig
+
+        cached_scores = _WALK_EDGE_SCORES_CACHE.get(graph_sig)
+        if cached_scores is None:
+            cache_obj = walkability.get_or_build_edge_walkability_index(
+                    cfg=config,
+                    G=walk_graph,
+                    force_rebuild=False,
+                    schema_version=1,
+            )
+            cached_scores = cache_obj.edge_scores
+            _WALK_EDGE_SCORES_CACHE[graph_sig] = cached_scores
+        walk_edge_scores = cached_scores
+    
     for i in range(len(source_coords)):
         dw = db = dd = None
+
+        w_i = None
+        if (
+            walk_graph is not None
+            and walk_edge_scores is not None
+            and i < len(walk_poi_nodes)
+        ):
+            target_node = walk_poi_nodes[i]
+            walk_path = walk_paths.get(target_node)
+            if walk_path:
+                try:
+                    path_edges = walkability.path_nodes_to_path_edges(walk_graph, walk_path)
+                    w_i = walkability.compute_path_walkability_from_edges(
+                        G=walk_graph,
+                        path_edges=path_edges,
+                        edge_scores=walk_edge_scores,
+                        length_attr="length",
+                    )
+                except (KeyError, ValueError, TypeError):
+                    w_i = None
+        walk_paths_scores.append(w_i)
+
         for mode in ("walk", "bike", "drive"):
             dist_m = mode_distances[mode][i]
             if dist_m is None:
                 continue
-            imp = get_impedance.impedance_base(dist_m / 1000.0, mode)
+
+            dist_km = dist_m / 1000.0
+            if mode == "walk":
+                imp = get_impedance.impedance_base(dist_km, mode, w_i)
+            else:
+                imp = get_impedance.impedance_base(dist_km, mode)
+            
+            if imp is None:
+                continue
             d = decay.distance_decay(beta, imp)
             if mode == "walk":
                 dw = d
@@ -362,6 +439,7 @@ def accessibility_non_bus_from_snap_map(poi_type, origine, poi_snap_info_by_mode
         "decay_walk": decay_walk,
         "decay_bike": decay_bike,
         "decay_drive": decay_drive,
+        "walk_path_scores": walk_paths_scores
     }
 
 

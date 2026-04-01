@@ -12,6 +12,7 @@ from context import PipelineContext
 from pipeline_types import SnappingStageResult, NonBusRoutingStageResult
 from utils import delta_g, services as serv
 from snapping_stage import select_best_snap_candidate_for_origin, coord_key
+from config import PipelineConfig
 
 _POI_BUS_SNAP_INFO: dict[Any, Any] | None = None
 _POI_MODE_SNAP_INFO: dict[Any, Any] | None = None
@@ -19,7 +20,7 @@ _NON_BUS_PROGRESS_VALUE: Any | None = None
 _POI_WORK_UNITS_BY_KEY: dict[Any, int] | None = None
 _NON_BUS_CACHE_DIR: str = ""
 _NON_BUS_CACHE_SCHEMA_VERSION: int = 0
-
+_PIPELINE_CONFIG: PipelineConfig | None = None
 
 def _non_bus_cache_path(node_id):
     """Build cache file path for one node id.
@@ -101,6 +102,7 @@ def _has_valid_non_bus_cache(path):
 
 
 def _init_worker(
+    pipeline_config = None,
     poi_bus_snap_info_by_type=None,
     poi_mode_snap_info_by_type=None,
     graph=None,
@@ -124,7 +126,8 @@ def _init_worker(
     - None. Populates worker globals and warm caches.
     """
     global _POI_BUS_SNAP_INFO, _POI_MODE_SNAP_INFO, _NON_BUS_PROGRESS_VALUE, _POI_WORK_UNITS_BY_KEY
-    global _NON_BUS_CACHE_DIR, _NON_BUS_CACHE_SCHEMA_VERSION
+    global _NON_BUS_CACHE_DIR, _NON_BUS_CACHE_SCHEMA_VERSION, _PIPELINE_CONFIG
+    _PIPELINE_CONFIG = pipeline_config
     _NON_BUS_CACHE_DIR = non_bus_cache_dir or ""
     _NON_BUS_CACHE_SCHEMA_VERSION = int(non_bus_cache_schema_version)
     _POI_BUS_SNAP_INFO = poi_bus_snap_info_by_type or {}
@@ -160,8 +163,12 @@ def _process_node(node_item):
         entries = []
         for query in serv.get_service_queries(service):
             poi_key = serv.query_key(query)
+            cfg = _PIPELINE_CONFIG
+            if cfg is None:
+                raise RuntimeError("Worker config not initialized")
             try:
                 data = delta_g.accessibility_non_bus_from_snap_map(
+                    cfg,
                     query.poi_type,
                     origin,
                     (_POI_MODE_SNAP_INFO or {}).get(poi_key, {}),
@@ -169,8 +176,9 @@ def _process_node(node_item):
                 )
             except Exception as exc:
                 raise RuntimeError(
-                    f"Non-bus routing failed for node_id={node_id}, poi_type={query.poi_type}"
+                    f"Non-bus routing failed for node_id={node_id}, poi_type={query.poi_type}, cause={exc!r}"
                 ) from exc
+
             decay_walk = data["decay_walk"]
             decay_bike = data["decay_bike"]
             decay_drive = data["decay_drive"]
@@ -188,7 +196,9 @@ def _process_node(node_item):
                 "decay_bike": decay_bike,
                 "decay_drive": decay_drive,
                 "poi_coords": poi_coords,
+                "walk_path_scores" : data.get("walk_path_scores", [])
             })
+
             if _NON_BUS_PROGRESS_VALUE is not None and _POI_WORK_UNITS_BY_KEY is not None:
                 units = float(_POI_WORK_UNITS_BY_KEY.get(poi_key, 0))
                 if units > 0:
@@ -217,10 +227,10 @@ def run_non_bus_routing_stage(
     Outputs:
     - NonBusRoutingStageResult: cache paths and computed/cached node counters.
     """
-    cfg = ctx.config
-    global _NON_BUS_CACHE_DIR, _NON_BUS_CACHE_SCHEMA_VERSION
-    _NON_BUS_CACHE_DIR = cfg.non_bus_cache_dir
-    _NON_BUS_CACHE_SCHEMA_VERSION = cfg.non_bus_cache_schema_version
+    global _NON_BUS_CACHE_DIR, _NON_BUS_CACHE_SCHEMA_VERSION, _PIPELINE_CONFIG
+    _PIPELINE_CONFIG = ctx.config
+    _NON_BUS_CACHE_DIR = _PIPELINE_CONFIG.non_bus_cache_dir
+    _NON_BUS_CACHE_SCHEMA_VERSION = _PIPELINE_CONFIG.non_bus_cache_schema_version
 
     cache_paths = {}
     nodes_to_compute = []
@@ -240,7 +250,7 @@ def run_non_bus_routing_stage(
             total_non_bus_pois += len(snap.poi_bus_snap_info_by_type.get(poi_key, {}))
     total_non_bus_tasks = len(ctx.nodes_with_coords) * total_non_bus_pois
 
-    pbar_non_bus = tqdm(total=total_non_bus_tasks, desc="Non-bus routing stage", mininterval=1) if cfg.enable_progress else None
+    pbar_non_bus = tqdm(total=total_non_bus_tasks, desc="Non-bus routing stage", mininterval=1) if _PIPELINE_CONFIG.enable_progress else None
     non_bus_base_progress = [float(cached_nodes * total_non_bus_pois)]
     non_bus_displayed_progress = [0.0]
     non_bus_shared_progress: list[Any | None] = [None]
@@ -282,13 +292,14 @@ def run_non_bus_routing_stage(
                     processes=non_bus_pool_workers,
                     initializer=_init_worker,
                     initargs=(
+                        ctx.config,
                         snap.poi_bus_snap_info_by_type,
                         snap.poi_mode_snap_info_by_type,
                         ctx.graph,
                         snap.shared_mode_graphs,
                         shared_progress,
-                        cfg.non_bus_cache_dir,
-                        cfg.non_bus_cache_schema_version,
+                        _PIPELINE_CONFIG.non_bus_cache_dir,
+                        _PIPELINE_CONFIG.non_bus_cache_schema_version,
                     ),
                 ) as pool:
                     pending_batch = list(pending_non_bus.items())
@@ -310,18 +321,18 @@ def run_non_bus_routing_stage(
                     )
             except Exception as e:
                 non_bus_attempt += 1
-                if non_bus_attempt > cfg.pool_max_retries:
+                if non_bus_attempt > _PIPELINE_CONFIG.pool_max_retries:
                     raise RuntimeError(
-                        f"Non-bus pool failed after {cfg.pool_max_retries + 1} attempts. Last error: {e}"
+                        f"Non-bus pool failed after {_PIPELINE_CONFIG.pool_max_retries + 1} attempts. Last error: {e}"
                     ) from e
                 new_workers = max(1, non_bus_pool_workers // 2)
                 print(
                     f"Non-bus pool failed ({type(e).__name__}: {e}). "
-                    f"Retry {non_bus_attempt}/{cfg.pool_max_retries} with workers={new_workers} "
+                    f"Retry {non_bus_attempt}/{_PIPELINE_CONFIG.pool_max_retries} with workers={new_workers} "
                     f"remaining_nodes={len(pending_non_bus)}."
                 )
                 non_bus_pool_workers = new_workers
-                time.sleep(cfg.pool_retry_delay_s)
+                time.sleep(_PIPELINE_CONFIG.pool_retry_delay_s)
     finally:
         stop_event.set()
         monitor_thread.join(timeout=2)

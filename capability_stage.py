@@ -1,9 +1,24 @@
 import csv
+import os
+import shutil
 from tqdm import tqdm
 
 from context import PipelineContext
 from pipeline_types import ServiceStageResult, CapabilityStageResult
 from utils import capabilities as cap
+
+
+def _ensure_unique_path(path: str) -> str:
+    """Return a non-existing path by adding an incrementing suffix when needed."""
+    if not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    idx = 2
+    while True:
+        candidate = f"{root}_{idx}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        idx += 1
 
 
 def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> CapabilityStageResult:
@@ -18,6 +33,9 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
     """
     output_paths = ctx.output_paths
     rows_written = 0
+    rest_sum = 0.0
+    nut_sum = 0.0
+    care_sum = 0.0
 
     with (
         open(output_paths["restorativeness"], "w", newline="", encoding="utf-8") as f_rest,
@@ -64,6 +82,10 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
                 row_care = [node.node_id, node.lat, node.lon, capability_care]
                 row_care.extend(scores[s] for s in ctx.care_services)
                 writer_care.writerow(row_care)
+
+                rest_sum += capability_rest
+                nut_sum += capability_nut
+                care_sum += capability_care
                 
                 rows_written += 1
                 if pbar:
@@ -72,4 +94,33 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
             if pbar:
                 pbar.close()
 
-    return CapabilityStageResult(output_paths=output_paths, rows_written=rows_written)
+    avg_rest = (rest_sum / rows_written) if rows_written else 0.0
+    avg_nut = (nut_sum / rows_written) if rows_written else 0.0
+    avg_care = (care_sum / rows_written) if rows_written else 0.0
+
+    experiments_dir = "experiments"
+    os.makedirs(experiments_dir, exist_ok=True)
+
+    moved_output_paths = {}
+    for capability_key, src_path in output_paths.items():
+        basename = os.path.basename(src_path)
+        dst_path = os.path.join(experiments_dir, f"{ctx.config.city_slug}_{basename}")
+        dst_path = _ensure_unique_path(dst_path)
+        shutil.move(src_path, dst_path)
+        moved_output_paths[capability_key] = dst_path
+
+    recap_path = os.path.join(experiments_dir, "capability_experiments_recap.csv")
+    recap_header = [
+        "city_slug",
+        "avg_capability_restorativeness",
+        "avg_capability_nutrition",
+        "avg_capability_care",
+    ]
+    should_write_header = (not os.path.exists(recap_path)) or os.path.getsize(recap_path) == 0
+    with open(recap_path, "a", newline="", encoding="utf-8") as recap_f:
+        writer = csv.writer(recap_f)
+        if should_write_header:
+            writer.writerow(recap_header)
+        writer.writerow([ctx.config.city_slug, avg_rest, avg_nut, avg_care])
+
+    return CapabilityStageResult(output_paths=moved_output_paths, rows_written=rows_written)

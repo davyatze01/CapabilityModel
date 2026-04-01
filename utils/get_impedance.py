@@ -21,7 +21,7 @@ def impedance_bus(route_distance,route_waiting):
         print("Problema con il calcolo della impedance...")
         exit()
 
-def impedance_base(distance,network_type):
+def impedance_base(distance,network_type,walk_score: float | None=None,lambda_walk: float = 0.15):
     """Convert distance to travel-time impedance for a given transport mode.
 
     Inputs:
@@ -39,6 +39,18 @@ def impedance_base(distance,network_type):
     elif network_type == "bike":
         speed = 15
     else: # network_type == "drive"
-        speed = 25
+        speed = 30
 
-    return (distance / speed) * 60.0 # impedance in minuti
+    base_impedance = (distance / speed) * 60.0
+    if network_type != "walk":
+        return base_impedance
+
+    # neutral fallback if walk score missing
+    if walk_score is None:
+        return base_impedance
+    w = float(walk_score)
+    coef = 1.0 + lambda_walk * ((5.0 - w) / 4.0)
+    return coef * base_impedance
+
+
+
