@@ -13,8 +13,14 @@ output_path <- Sys.getenv("R5_OUTPUT_PATH", unset = "outputs/r5r_expanded_travel
 chunk_dir <- Sys.getenv("R5_CHUNK_DIR", unset = "outputs/r5r_chunks")
 departure_dt_text <- Sys.getenv("R5_DEPARTURE_DATETIME", unset = "2025-10-15 12:00:00")
 
-origins <- fread(origin_path)
-destinations <- fread(dest_path)
+origins <- fread(
+  origin_path,
+  colClasses = list(character = "id")
+)
+destinations <- fread(
+  dest_path,
+  colClasses = list(character = "id")
+)
 
 download_r5(version = "7.4.0", force_update = FALSE)
 
@@ -48,6 +54,9 @@ process_chunk <- function(origins_chunk, chunk_index, n_chunks, chunk_path) {
       progress = TRUE,
       verbose = FALSE
   )
+  # Keep routing IDs as character to avoid numeric/bit64 coercion artifacts.
+  ettm[, from_id := as.character(from_id)]
+  ettm[, to_id := as.character(to_id)]
   setorder(ettm, from_id, to_id, total_time, wait_time, departure_time)
   best_ettm <- ettm[, .SD[1], by = .(from_id, to_id)]
 
@@ -106,7 +115,11 @@ for (chunk_index in seq_len(n_chunks)) {
   chunk_files <- c(chunk_files, chunk_path)
 }
 
-all_chunks <- lapply(chunk_files, fread)
+all_chunks <- lapply(
+  chunk_files,
+  fread,
+  colClasses = list(character = c("from_id", "to_id"))
+)
 final_ettm <- rbindlist(all_chunks)
 
 # Defensive filtering to avoid stale/mismatched IDs propagating downstream.
@@ -115,5 +128,9 @@ valid_destination_ids <- as.character(destinations$id)
 final_ettm <- final_ettm[
   from_id %in% valid_origin_ids & to_id %in% valid_destination_ids
 ]
+
+if (nrow(final_ettm) == 0) {
+  cat("Warning: final routing matrix is empty after ID filtering.\n")
+}
 
 fwrite(final_ettm, output_path)
