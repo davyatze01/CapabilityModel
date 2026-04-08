@@ -490,10 +490,22 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
         r_dest_csv,
     )
 
-    r_script_path = os.path.join("utils", "r5_routing.r")
-    print("[Bus] Launching Rscript...", flush=True)
-    _run_r5r_script(r_script_path)
-    print("[Bus] Rscript completed. Building routing cache from CSV...", flush=True)
+    reuse_existing_csv = (
+        cfg.skip_r5r_if_csv_exists
+        and os.path.isfile(routing_csv)
+        and os.path.getsize(routing_csv) > 0
+    )
+ 
+    if reuse_existing_csv:
+        print(f"[Bus] Reusing existing routing CSV: {routing_csv}", flush=True)
+    else:
+        r_script_path = os.path.join("utils", "r5_routing.r")
+        chunk_dir = os.path.join("outputs", "r5r_chunks")
+        if os.path.isdir(chunk_dir):
+            shutil.rmtree(chunk_dir)
+        print("[Bus] Launching Rscript...", flush=True)
+        _run_r5r_script(r_script_path)
+        print("[Bus] Rscript completed. Building routing cache from CSV...", flush=True)
 
     build_bus_impedance_cache(ctx, force_rebuild=True)
 

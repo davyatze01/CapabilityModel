@@ -6,7 +6,7 @@ import os
 @dataclass
 class PipelineConfig:
     worker_count: int | None = None
-    skip_routing: bool = False
+    skip_routing: bool = True
     accessibility_chunksize: int = 100
     accessibility_deduplicate_entries: bool = True
 
@@ -46,3 +46,5 @@ class PipelineConfig:
     bus_impedance_meta_path: str = os.path.join("outputs", "bus_impedance_meta.json")
     pool_max_retries: int = 4
     pool_retry_delay_s: float = 2.0
+
+    skip_r5r_if_csv_exists: bool = True

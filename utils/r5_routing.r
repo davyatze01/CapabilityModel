@@ -5,16 +5,30 @@ options(java.parameters = "-Xmx16G")
 library(r5r)
 library(data.table)
 
-# paths of the gtfs folder, and the two csvs with origin and destination routes
-gtfs_path <- "gtfs"
-origin_path <- "outputs/r5r_origins.csv"
-dest_path <- "outputs/r5r_dest.csv"
-output_path <- "outputs/r5r_expanded_travel_time_matrix.csv"
+# Paths can be injected by Python via env vars.
+gtfs_path <- Sys.getenv("R5_DATA_PATH", unset = "gtfs")
+origin_path <- Sys.getenv("R5_ORIGINS_PATH", unset = "outputs/r5r_origins.csv")
+dest_path <- Sys.getenv("R5_DEST_PATH", unset = "outputs/r5r_dest.csv")
+output_path <- Sys.getenv("R5_OUTPUT_PATH", unset = "outputs/r5r_expanded_travel_time_matrix.csv")
+chunk_dir <- Sys.getenv("R5_CHUNK_DIR", unset = "outputs/r5r_chunks")
+departure_dt_text <- Sys.getenv("R5_DEPARTURE_DATETIME", unset = "2025-10-15 12:00:00")
 
-origins <- fread(origin_path)
-destinations <- fread(dest_path)
+origins <- fread(
+  origin_path,
+  colClasses = list(character = "id")
+)
+destinations <- fread(
+  dest_path,
+  colClasses = list(character = "id")
+)
 
 download_r5(version = "7.4.0", force_update = FALSE)
+
+gtfs_files <- list.files(gtfs_path, pattern = "\\.zip$", full.names = TRUE)
+if (length(gtfs_files) == 0) {
+  stop(sprintf("No GTFS zip files found in %s", gtfs_path))
+}
+cat(sprintf("Found %d GTFS feed(s): %s\n", length(gtfs_files), paste(basename(gtfs_files), collapse = ", ")))
 
 # Use r5 with this routing file
 r5r_network <- build_network(gtfs_path)
@@ -40,6 +54,9 @@ process_chunk <- function(origins_chunk, chunk_index, n_chunks, chunk_path) {
       progress = TRUE,
       verbose = FALSE
   )
+  # Keep routing IDs as character to avoid numeric/bit64 coercion artifacts.
+  ettm[, from_id := as.character(from_id)]
+  ettm[, to_id := as.character(to_id)]
   setorder(ettm, from_id, to_id, total_time, wait_time, departure_time)
   best_ettm <- ettm[, .SD[1], by = .(from_id, to_id)]
 
@@ -57,11 +74,19 @@ if (n_origins == 0) {
   stop("No origins found.")
 }
 
-chunk_size <- 200L
+chunk_size <- 50L
 n_chunks <- ceiling(n_origins / chunk_size)
-chunk_dir <- "outputs/r5r_chunks"
 
 dir.create(chunk_dir, recursive = TRUE, showWarnings = FALSE)
+stale_chunk_files <- list.files(
+  chunk_dir,
+  pattern = "^chunk_[0-9]{3}\\.csv$",
+  full.names = TRUE
+)
+if (length(stale_chunk_files) > 0) {
+  cat(sprintf("Removing %d stale chunk file(s) from %s\n", length(stale_chunk_files), chunk_dir))
+  unlink(stale_chunk_files, force = TRUE)
+}
 chunk_files <- character()
 
 # routing inputs
@@ -70,8 +95,10 @@ max_trip_duration <- 60 # minutes
 
 
 # departure time
-departure_datetime <- as.POSIXct("15-10-2025 12:00:00",
-                                 format = "%d-%m-%Y %H:%M:%S")
+departure_datetime <- as.POSIXct(
+  departure_dt_text,
+  format = "%Y-%m-%d %H:%M:%S"
+)
 
 
 for (chunk_index in seq_len(n_chunks)) {
@@ -82,18 +109,28 @@ for (chunk_index in seq_len(n_chunks)) {
     next
   }
   chunk_path <- file.path(chunk_dir, sprintf("chunk_%03d.csv", chunk_index))
-  if (file.exists(chunk_path)) {
-    cat(sprintf("Skipping chunk %d, already present in memory\n", chunk_index))
-    chunk_files <- c(chunk_files, chunk_path)
-    next
-  }
 
   origins_chunk <- origins[start_idx:end_idx]
   chunk_path <- process_chunk(origins_chunk, chunk_index, n_chunks, chunk_path)
   chunk_files <- c(chunk_files, chunk_path)
 }
 
-all_chunks <- lapply(chunk_files, fread)
+all_chunks <- lapply(
+  chunk_files,
+  fread,
+  colClasses = list(character = c("from_id", "to_id"))
+)
 final_ettm <- rbindlist(all_chunks)
+
+# Defensive filtering to avoid stale/mismatched IDs propagating downstream.
+valid_origin_ids <- as.character(origins$id)
+valid_destination_ids <- as.character(destinations$id)
+final_ettm <- final_ettm[
+  from_id %in% valid_origin_ids & to_id %in% valid_destination_ids
+]
+
+if (nrow(final_ettm) == 0) {
+  cat("Warning: final routing matrix is empty after ID filtering.\n")
+}
 
 fwrite(final_ettm, output_path)
