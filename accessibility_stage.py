@@ -17,15 +17,13 @@ from utils import delta_g, services as serv
 import json
 import csv
 import numpy as np
-from numpy.typing import NDArray
 import hashlib
 
 _NON_BUS_CACHE_SCHEMA_VERSION = None        # Expected schema version for the cache to prevent reading incompatible cache files
 _ACCESS_PROGRESS_VALUE: Any | None = None   # Multiprocess counter shared by workers to update the progress bar
 
-_BUS_IMPEDANCE_MATRIX: NDArray[np.float32] | None = None
-_BUS_SOURCE_ID_TO_ROW: dict[str, int] | None = None
-_BUS_DEST_COORD_TO_COL: dict[tuple[float, float], int] | None = None
+_BUS_IMPEDANCE_BY_OD: dict[tuple[str, str], float] | None = None
+_BUS_DEST_COORD_TO_ID: dict[tuple[float, float], str] | None = None
 _ACCESS_DEDUPLICATE_ENTRIES: bool = True
 
 # --- incremental accessibility matrix cache helpers ---
@@ -326,9 +324,8 @@ def _write_node_result_to_matrix(
 # The global variables for each worker are initialized with the passed parameter
 def _init_accessibility_worker(
     non_bus_cache_schema_version,
-    matrix_path,
-    source_id_to_row_path,
-    dest_id_to_col_path,
+    routing_csv_path,
+    origins_csv_path,
     dest_csv_path,
     deduplicate_entries=True,
     access_progress_value=None,
@@ -337,9 +334,8 @@ def _init_accessibility_worker(
 
     Inputs:
     - non_bus_cache_schema_version: expected cache schema version.
-    - matrix_path: path to dense bus impedance matrix.
-    - source_id_to_row_path: path to origin-id -> row index JSON.
-    - dest_id_to_col_path: path to destination-id -> column index JSON.
+    - routing_csv_path: expanded routing CSV path.
+    - origins_csv_path: path to origin ids CSV.
     - dest_csv_path: path to destination CSV used to map coords to destination ids.
     - access_progress_value: optional shared progress counter.
 
@@ -347,53 +343,56 @@ def _init_accessibility_worker(
     - None. Populates worker globals used during node computation.
     """
     global _NON_BUS_CACHE_SCHEMA_VERSION, _ACCESS_PROGRESS_VALUE
-    global _BUS_SOURCE_ID_TO_ROW, _BUS_DEST_COORD_TO_COL, _BUS_IMPEDANCE_MATRIX
+    global _BUS_IMPEDANCE_BY_OD, _BUS_DEST_COORD_TO_ID
     global _ACCESS_DEDUPLICATE_ENTRIES
     _NON_BUS_CACHE_SCHEMA_VERSION = non_bus_cache_schema_version
     _ACCESS_DEDUPLICATE_ENTRIES = bool(deduplicate_entries)
     _ACCESS_PROGRESS_VALUE = access_progress_value
-    with open(source_id_to_row_path, encoding="utf-8") as f:
-        source_id_to_row_raw = json.load(f)
-    _BUS_SOURCE_ID_TO_ROW = {str(k): int(v) for k, v in source_id_to_row_raw.items()}
+    valid_origin_ids: set[str] = set()
+    with open(origins_csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            valid_origin_ids.add(str(row["id"]))
 
-    with open(dest_id_to_col_path, encoding="utf-8") as f:
-        dest_id_to_col_raw = json.load(f)
-    dest_id_to_col = {str(k): int(v) for k, v in dest_id_to_col_raw.items()}
-
-    _BUS_DEST_COORD_TO_COL = {}
+    _BUS_DEST_COORD_TO_ID = {}
     with open(dest_csv_path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             coord = (round(float(row["lat"]), 6), round(float(row["lon"]), 6))
-            col = dest_id_to_col.get(row["id"])
-            if col is not None:
-                _BUS_DEST_COORD_TO_COL[coord] = int(col)
+            _BUS_DEST_COORD_TO_ID[coord] = str(row["id"])
 
-    _BUS_IMPEDANCE_MATRIX = np.memmap(
-        matrix_path, dtype=np.float32, mode="r",
-        shape=(len(_BUS_SOURCE_ID_TO_ROW), len(dest_id_to_col))
-    )
+    _BUS_IMPEDANCE_BY_OD = {}
+    missing_from_ids: set[str] = set()
+    missing_to_ids: set[str] = set()
+    valid_destination_ids = set(_BUS_DEST_COORD_TO_ID.values())
+    with open(routing_csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            from_id = str(row.get("from_id", ""))
+            to_id = str(row.get("to_id", ""))
+            if from_id not in valid_origin_ids:
+                missing_from_ids.add(from_id)
+                continue
+            if to_id not in valid_destination_ids:
+                missing_to_ids.add(to_id)
+                continue
+            total_time = row.get("total_time", "")
+            routes = row.get("routes", "")
+            if total_time == "" or routes in ["", "[WALK]"]:
+                imp = 0.0
+            else:
+                try:
+                    imp = float(total_time)
+                except Exception:
+                    continue
+            _BUS_IMPEDANCE_BY_OD[(from_id, to_id)] = imp
 
-def _validate_bus_matrix_meta(meta_path, expected_departure_iso, expected_origins_sig, expected_destinations_sig):
-    """Validate bus matrix metadata before accessibility computation starts.
-
-    Inputs:
-    - meta_path: metadata JSON path.
-    - expected_departure_iso: departure datetime expected by current run.
-    - expected_origins_sig: expected origin signature.
-    - expected_destinations_sig: expected destination signature.
-
-    Outputs:
-    - None. Raises RuntimeError when metadata is stale or incompatible.
-    """
-    with open(meta_path, encoding="utf-8") as f:
-        meta = json.load(f)
-
-    if meta.get("departure_iso") != expected_departure_iso:
-        raise RuntimeError("Bus impedance matrix metadata is stale (departure mismatch).")
-    if meta.get("origins_sig") != expected_origins_sig:
-        raise RuntimeError("Bus impedance matrix metadata is stale (origins signature mismatch).")
-    if meta.get("destinations_sig") != expected_destinations_sig:
-        raise RuntimeError("Bus impedance matrix metadata is stale (destinations signature mismatch).")
+    if missing_from_ids or missing_to_ids:
+        sample_from = sorted(missing_from_ids)[:5]
+        sample_to = sorted(missing_to_ids)[:5]
+        print(
+            "[Accessibility] Warning: routing CSV contains IDs not present in current inputs. "
+            f"unknown from_id count={len(missing_from_ids)} sample={sample_from}; "
+            f"unknown to_id count={len(missing_to_ids)} sample={sample_to}.",
+            flush=True,
+        )
 
 
 
@@ -424,14 +423,12 @@ def _compute_node_accessibility(item):
         poi_beta_cache: dict[str, float] = {}
         services_state = state.get("services", {})
 
-        source_id_to_row = _BUS_SOURCE_ID_TO_ROW
-        dest_coord_to_col = _BUS_DEST_COORD_TO_COL
-        impedance_matrix = _BUS_IMPEDANCE_MATRIX
-        if source_id_to_row is None or dest_coord_to_col is None or impedance_matrix is None:
-            raise RuntimeError("Bus impedance matrix is not initialized in worker.")
-        
-        
-        source_row = source_id_to_row.get(str(node_id))
+        dest_coord_to_id = _BUS_DEST_COORD_TO_ID
+        impedance_by_od = _BUS_IMPEDANCE_BY_OD
+        if dest_coord_to_id is None or impedance_by_od is None:
+            raise RuntimeError("Bus routing CSV lookup is not initialized in worker.")
+
+        source_id = str(node_id)
         imp_cache: dict[tuple[float, float], float | None] = {}
         coord_key_cache: dict[tuple[float, float], tuple[float, float]] = {}
         exp = math.exp
@@ -448,16 +445,12 @@ def _compute_node_accessibility(item):
             if coord_key in imp_cache:
                 return imp_cache[coord_key]
 
-            if source_row is None:
+            destination_id = dest_coord_to_id.get(coord_key)
+            if destination_id is None:
                 imp_cache[coord_key] = None
                 return None
 
-            dest_col = dest_coord_to_col.get(coord_key)
-            if dest_col is None:
-                imp_cache[coord_key] = None
-                return None
-
-            v = float(impedance_matrix[source_row, dest_col])
+            v = float(impedance_by_od.get((source_id, destination_id), 0.0))
             imp = v if v > 0 else None
             imp_cache[coord_key] = imp
             return imp
@@ -578,13 +571,6 @@ def run_accessibility_stage(
     node_to_row: dict[str, int] = {}
     poi_to_col: dict[str, int] = {}
 
-    _validate_bus_matrix_meta(
-        ctx.config.bus_impedance_meta_path,
-        bus.routing_departure_iso,
-        bus.origins_sig,
-        bus.destinations_sig,
-    )
-
     mat, node_to_row, poi_to_col = _open_or_create_accessibility_matrix_cache(ctx, bus)
 
     # Preload complete node rows from cache and compute only missing rows.
@@ -645,9 +631,8 @@ def run_accessibility_stage(
                     initializer=_init_accessibility_worker,
                     initargs=(
                         ctx.config.non_bus_cache_schema_version,
-                        ctx.config.bus_impedance_matrix_path,
-                        ctx.config.bus_source_id_to_row_path,
-                        ctx.config.bus_dest_id_to_col_path,
+                        ctx.config.bus_routing_matrix_path,
+                        ctx.config.bus_routing_origins_input_path,
                         ctx.config.bus_routing_destinations_input_path,
                         ctx.config.accessibility_deduplicate_entries,
                         shared_progress,

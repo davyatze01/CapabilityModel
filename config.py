@@ -37,13 +37,8 @@ class PipelineConfig:
 
     bus_departure_dt: dt.datetime = dt.datetime(2025, 10, 15, 12, 0, 0)
     bus_routing_matrix_path: str = os.path.join("outputs", "r5r_expanded_travel_time_matrix.csv")
-    bus_routing_cache_path: str = os.path.join("outputs", "r5r_best_routes.pkl")
     bus_routing_origins_input_path: str = os.path.join("outputs", "r5r_origins.csv")
     bus_routing_destinations_input_path: str = os.path.join("outputs", "r5r_dest.csv")
-    bus_source_id_to_row_path : str = os.path.join("outputs","source_id_to_row.json")
-    bus_dest_id_to_col_path : str = os.path.join("outputs","dest_id_to_col.json")
-    bus_impedance_matrix_path : str = os.path.join("outputs","bus_impedance_matrix.dat")
-    bus_impedance_meta_path: str = os.path.join("outputs", "bus_impedance_meta.json")
     pool_max_retries: int = 4
     pool_retry_delay_s: float = 2.0
 

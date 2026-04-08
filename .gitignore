@@ -232,3 +232,5 @@ outputs/bus_impedance_meta.json
 outputs/r5r_chunks/
 outputs/r5r_origins.csv
 outputs/r5r_dest.csv
+graph/
+gtfs/

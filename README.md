@@ -189,16 +189,13 @@ Goal: compute transit travel times from every origin node to every relevant snap
 
 1. The stage collects all snapped bus destination candidates from the snapping result.
 2. If any POI has multiple snapped candidates, it reduces the destination set with `build_selected_routing_destinations()` from the snapping stage.
-3. It computes signatures of the ordered origin and destination coordinate lists. These signatures are stored in the routing cache so cached transit results are tied to exact routing inputs.
+3. It computes signatures of the ordered origin and destination coordinate lists.
 4. It writes:
    - `outputs/r5r_origins.csv`
    - `outputs/r5r_dest.csv`
-5. If `skip_routing=True`, it validates the existing routing cache and bus-matrix metadata before reusing artifacts.
+5. If `skip_routing=True`, it reuses the existing expanded routing CSV and does not call R.
 6. Otherwise, it launches `Rscript utils/r5_routing.r`.
-7. After the R script writes the expanded travel-time matrix CSV, Python builds:
-   - a compact routing pickle cache keyed by `(origin_coord, destination_coord)`
-   - a dense bus impedance matrix (`.dat`) with row/column index JSON files
-   - a bus matrix metadata JSON (`departure_iso`, `origins_sig`, `destinations_sig`)
+7. The expanded travel-time matrix CSV is the single reusable transit artifact.
 
 #### What happens in R
 
@@ -211,12 +208,7 @@ Goal: compute transit travel times from every origin node to every relevant snap
 - keeps the best route per origin/destination pair
 - writes `outputs/r5r_expanded_travel_time_matrix.csv`
 
-The Python stage then turns that CSV into `outputs/r5r_best_routes.pkl` and builds matrix artifacts used by the accessibility stage:
-
-- `outputs/bus_impedance_matrix.dat`
-- `outputs/source_id_to_row.json`
-- `outputs/dest_id_to_col.json`
-- `outputs/bus_impedance_meta.json`
+The accessibility stage reads this CSV directly (in-memory OD lookup per worker).
 
 The stored route record includes:
 
@@ -283,19 +275,17 @@ Goal: combine non-bus modal decays with bus impedances, compute POI-level access
 #### Inputs
 
 - non-bus per-node cache files from `cache/non_bus`
-- bus impedance artifacts:
-  - `outputs/bus_impedance_matrix.dat`
-  - `outputs/source_id_to_row.json`
-  - `outputs/dest_id_to_col.json`
-  - `outputs/bus_impedance_meta.json`
+- bus routing CSV artifacts:
+  - `outputs/r5r_expanded_travel_time_matrix.csv`
+  - `outputs/r5r_origins.csv`
+  - `outputs/r5r_dest.csv`
 - decay and aggregation logic from [`utils/decay.py`](utils/decay.py) and [`utils/delta_g.py`](utils/delta_g.py)
 
 #### What happens
 
 1. Workers load each node's non-bus cache file.
-2. They validate bus matrix metadata (`departure_iso`, `origins_sig`, `destinations_sig`) against the current bus stage result.
-3. They load the bus matrix and index files once per worker.
-4. For each origin/destination lookup, they retrieve bus impedance from the dense matrix using source/destination indexes.
+2. Each worker loads `r5r_origins.csv`, `r5r_dest.csv`, and `r5r_expanded_travel_time_matrix.csv` once into an in-memory `(from_id,to_id) -> impedance` lookup.
+3. For each origin/destination lookup, they resolve IDs and retrieve bus impedance from that lookup.
 5. For each POI type entry:
    - compute the decay parameter `beta = log(2) / decay_constant`
    - convert each bus impedance into a bus decay value
@@ -400,11 +390,6 @@ Final capability CSVs plus intermediate routing artifacts such as:
 - `r5r_origins.csv`
 - `r5r_dest.csv`
 - `r5r_expanded_travel_time_matrix.csv`
-- `r5r_best_routes.pkl`
-- `bus_impedance_matrix.dat`
-- `source_id_to_row.json`
-- `dest_id_to_col.json`
-- `bus_impedance_meta.json`
 - `r5r_chunks/`
 
 ## Running the Pipeline

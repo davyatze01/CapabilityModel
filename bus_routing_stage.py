@@ -1,133 +1,19 @@
 import csv
 import hashlib
 import os
-import pickle
 import signal
 import shutil
 import subprocess
 from pathlib import Path
 
-import pandas as pd
-import numpy as np
 from pipeline_types import BusRoutingStageResult, PipelineContext, SnappingStageResult
 from snapping_stage import build_selected_routing_destinations
-import json
 
 COORD_ROUND = 6
 
-def _load_routing_cache(path: str):
-    """Load persisted routing cache payload from pickle.
-
-    Inputs:
-    - path: file path to routing pickle cache.
-
-    Outputs:
-    - dict-like payload containing routing metadata and routes.
-    """
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
-def _is_valid_routing_cache(payload, departure_iso: str, origins_sig: str | None = None,
-                            destinations_sig: str | None = None) -> bool:
-    """Validate routing cache schema and optional run signatures.
-
-    Inputs:
-    - payload: object loaded from routing cache file.
-    - departure_iso: expected departure datetime string.
-    - origins_sig: optional expected origin signature.
-    - destinations_sig: optional expected destination signature.
-
-    Outputs:
-    - bool: True when cache is compatible with the expected run context.
-    """
-    if not isinstance(payload, dict):
-        return False
-    if payload.get("departure_iso") != departure_iso:
-        return False
-    
-    routes = payload.get("routes")
-    if not isinstance(routes, dict):
-        return False
-    
-    if origins_sig is not None and payload.get("origins_sig") != origins_sig:
-        return False
-    
-    if destinations_sig is not None and payload.get("destinations_sig") != destinations_sig:
-        return False
-    
-    return True
-
-def _validate_routing_artifacts_for_skip(skip_routing: bool, cache_path: str, departure_iso: str,
-    origins_sig: str | None = None, destinations_sig: str | None = None,):
-    """Fail fast when skip mode is enabled but routing cache is missing/incompatible.
-
-    Inputs:
-    - skip_routing: whether the stage is configured to reuse existing artifacts.
-    - cache_path: routing pickle path to validate.
-    - departure_iso: expected departure datetime string.
-    - origins_sig: optional expected origin signature.
-    - destinations_sig: optional expected destination signature.
-
-    Outputs:
-    - None. Raises RuntimeError on invalid artifacts.
-    """
-    if not skip_routing:
-        return
-    if not os.path.isfile(cache_path):
-        raise RuntimeError(
-            "Missing routing cache while skip_routing=True. "
-            f"Expected file: {cache_path}"
-        )
-    try:
-        payload = _load_routing_cache(cache_path)
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load routing cache: {cache_path}") from exc
-    if not _is_valid_routing_cache(payload, departure_iso=departure_iso, origins_sig=origins_sig, destinations_sig=destinations_sig):
-        raise RuntimeError(
-            "Routing cache is invalid or incompatible while skip_routing=True. "
-            f"Cache file: {cache_path}"
-        )
-    
-def _validate_bus_matrix_meta(path: str, departure_iso: str, origins_sig: str, destinations_sig: str) -> None:
-    """Validate bus matrix metadata file against expected run signatures.
-
-    Inputs:
-    - path: metadata JSON path.
-    - departure_iso: expected departure datetime string.
-    - origins_sig: expected origin signature.
-    - destinations_sig: expected destination signature.
-
-    Outputs:
-    - None. Raises RuntimeError when metadata is missing or incompatible.
-    """
-    if not os.path.isfile(path):
-        raise RuntimeError(f"Missing bus matrix metadata while skip_routing=True. Expected file: {path}")
-    try:
-        with open(path, encoding="utf-8") as f:
-            meta = json.load(f)
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load bus matrix metadata: {path}") from exc
-
-    if (
-        meta.get("departure_iso") != departure_iso
-        or meta.get("origins_sig") != origins_sig
-        or meta.get("destinations_sig") != destinations_sig
-    ):
-        raise RuntimeError(
-            "Bus matrix metadata is invalid or incompatible while skip_routing=True. "
-            f"Meta file: {path}"
-        )
 
 def _coords_signature(coords: list[tuple[float, float]]) -> str:
-    """Hash ordered coordinates to identify exact routing inputs across runs.
-
-    Inputs:
-    - coords: ordered (lat, lon) list.
-
-    Outputs:
-    - str: stable SHA1 signature of the rounded coordinate sequence.
-    """
+    """Hash ordered coordinates to identify exact routing inputs across runs."""
     h = hashlib.sha1()
     for lat, lon in coords:
         h.update(f"{round(float(lat), COORD_ROUND)},{round(float(lon), COORD_ROUND)};".encode("ascii"))
@@ -135,22 +21,12 @@ def _coords_signature(coords: list[tuple[float, float]]) -> str:
 
 
 def _write_r5r_point_inputs(
-        nodes_with_coords,
-        destinations,
-        origins_csv,
-        destinations_csv,
+    nodes_with_coords,
+    destinations,
+    origins_csv,
+    destinations_csv,
 ):
-    """Write origin/destination CSV files consumed by the R routing script.
-
-    Inputs:
-    - nodes_with_coords: iterable of graph node ids with x/y coordinates.
-    - destinations: selected destination coordinates as (lat, lon).
-    - origins_csv: output path for origins CSV.
-    - destinations_csv: output path for destinations CSV.
-
-    Outputs:
-    - None. Writes CSV files to disk.
-    """
+    """Write origin/destination CSV files consumed by the R routing script."""
     Path(origins_csv).parent.mkdir(parents=True, exist_ok=True)
 
     with open(origins_csv, "w", newline="", encoding="utf-8") as f:
@@ -167,14 +43,7 @@ def _write_r5r_point_inputs(
 
 
 def _run_r5r_script(script_path: str) -> None:
-    """Run the external R routing script and stream its logs.
-
-    Inputs:
-    - script_path: path to the R script entrypoint.
-
-    Outputs:
-    - None. Raises if Rscript fails or is not available.
-    """
+    """Run the external R routing script and stream its logs."""
     rscript_exe = shutil.which("Rscript")
     if not rscript_exe:
         raise RuntimeError(
@@ -206,7 +75,6 @@ def _run_r5r_script(script_path: str) -> None:
         if return_code != 0:
             raise subprocess.CalledProcessError(return_code, [rscript_exe, script_path])
     except KeyboardInterrupt:
-        # Forward interruption to child so Ctrl+C actually stops Rscript.
         if proc.poll() is None:
             try:
                 if os.name == "nt":
@@ -221,200 +89,26 @@ def _run_r5r_script(script_path: str) -> None:
                 proc.kill()
         raise
 
-def build_bus_impedance_cache(context: PipelineContext, force_rebuild: bool = False) -> None:
-    """Build dense bus impedance matrix and index files from routing CSV.
 
-    Inputs:
-    - context: pipeline context with bus artifact paths.
-    - force_rebuild: when True, rebuild matrix/indexes even if files exist.
-
-    Outputs:
-    - None. Writes matrix `.dat` and row/column index JSON files.
-    """
-    cfg = context.config
-    source_id_to_row = {}
-    dest_id_to_col = {}
-
-    matrix_path = Path(cfg.bus_impedance_matrix_path)
-    Path(matrix_path).parent.mkdir(parents=True, exist_ok=True)
-    source_index_path = Path(cfg.bus_source_id_to_row_path)
-    dest_index_path = Path(cfg.bus_dest_id_to_col_path)
-
-    if (
-        not force_rebuild
-        and matrix_path.is_file()
-        and matrix_path.stat().st_size > 0
-        and source_index_path.is_file()
-        and dest_index_path.is_file()
-    ):
-        return
-
-    # Read the source csv and create correspondance between id and row in the csv
-    with open(cfg.bus_routing_origins_input_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row_idx, row in enumerate(reader):
-            source_id = row["id"]
-            source_id_to_row[source_id] = row_idx
-
-    # Read the destination csv and create correspondance between id and row in the csv
-    with open(cfg.bus_routing_destinations_input_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for col_idx, row in enumerate(reader):
-            dest_id = row["id"]
-            dest_id_to_col[dest_id] = col_idx
-
-        
-    n_rows = len(source_id_to_row)
-    n_cols = len(dest_id_to_col)
-    impedance_matrix = np.memmap(
-        cfg.bus_impedance_matrix_path,
-        dtype=np.float32,
-        mode="w+",
-        shape=(n_rows, n_cols),
-    )
-    impedance_matrix[:] = 0
-
-    with open(cfg.bus_routing_matrix_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row_idx, row in enumerate(reader):
-            source_row = source_id_to_row[row["from_id"]]
-            dest_col = dest_id_to_col[row["to_id"]]
-            total_time = row["total_time"]
-            if total_time == "" or (row["routes"] in ["", "[WALK]"]):
-                total_time = 0
-            impedance_matrix[source_row][dest_col] = total_time
-    impedance_matrix.flush()
-
-    with open(cfg.bus_source_id_to_row_path, 'w') as f:
-        json.dump(source_id_to_row, f)
-    
-    with open(cfg.bus_dest_id_to_col_path, 'w') as f:
-        json.dump(dest_id_to_col, f)
-
-
-def _write_bus_matrix_meta(path, departure_iso, origins_sig, destinations_sig):
-    """Persist metadata used to validate matrix freshness across runs.
-
-    Inputs:
-    - path: metadata JSON destination.
-    - departure_iso: run departure datetime string.
-    - origins_sig: origin signature.
-    - destinations_sig: destination signature.
-
-    Outputs:
-    - None. Writes metadata JSON to disk.
-    """
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "departure_iso": departure_iso,
-                "origins_sig": origins_sig,
-                "destinations_sig": destinations_sig,
-            },
-            f,
+def _require_existing_routing_csv(path: str) -> None:
+    if not os.path.isfile(path):
+        raise RuntimeError(
+            "Missing routing CSV while skip_routing=True. "
+            f"Expected file: {path}"
+        )
+    if os.path.getsize(path) <= 0:
+        raise RuntimeError(
+            "Routing CSV is empty while skip_routing=True. "
+            f"File: {path}"
         )
 
 
-def _save_routing_cache(path: str, payload) -> None:
-    """Atomically persist routing cache payload to pickle.
-
-    Inputs:
-    - path: destination pickle path.
-    - payload: routing cache payload dictionary.
-
-    Outputs:
-    - None. Writes pickle file with atomic replace.
-    """
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "wb") as f:
-        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp_path, path)
-
-
-def _build_routing_cache_from_r5r_csv(
-    csv_path: str,
-    origin_id_to_coord: dict[str, tuple[float, float]],
-    destination_id_to_coord: dict[str, tuple[float, float]],
-    departure_iso: str,
-    origins_sig: str,
-    destinations_sig: str,
-):
-    """Build in-memory routing cache dictionary from expanded routing CSV.
-
-    Inputs:
-    - csv_path: expanded routing CSV path produced by R.
-    - origin_id_to_coord: mapping from origin ids to rounded coordinates.
-    - destination_id_to_coord: mapping from destination ids to rounded coordinates.
-    - departure_iso: departure datetime string.
-    - origins_sig: origin signature.
-    - destinations_sig: destination signature.
-
-    Outputs:
-    - dict: routing cache payload with metadata and `(origin,destination)` route map.
-    """
-    routes = {}
-    usecols = ["from_id", "to_id", "total_time", "wait_time", "routes"]
-
-    reader = pd.read_csv(
-        csv_path,
-        usecols=lambda c: c in usecols,
-        chunksize=200_000,
-        engine="python",   # avoids C parser native crash path
-    )
-
-    for chunk in reader:
-        for row in chunk.itertuples(index=False):
-            from_id = str(row.from_id)
-            to_id = str(row.to_id)
-
-            origin_coord = origin_id_to_coord.get(from_id)
-            destination_coord = destination_id_to_coord.get(to_id)
-            if origin_coord is None or destination_coord is None:
-                continue
-
-            total_time = row.total_time
-            wait_time = row.wait_time
-            if pd.isna(total_time) or pd.isna(wait_time):
-                continue
-
-            total_time = float(total_time)
-            wait_time = float(wait_time)
-            travel_time = total_time - wait_time
-            if travel_time < 0:
-                continue
-
-            routes[(origin_coord, destination_coord)] = {
-                "travel_time": travel_time,
-                "wait_time": wait_time,
-                "impedance": total_time,
-                "routes": getattr(row, "routes", None),
-            }
-
-    return {
-        "departure_iso": departure_iso,
-        "origins_sig": origins_sig,
-        "destinations_sig": destinations_sig,
-        "routes": routes,
-    }
-
-
-# This function runs the bus routing stage
 def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> BusRoutingStageResult:
-    """Execute transit routing stage and produce reusable bus routing artifacts.
-
-    Inputs:
-    - ctx: pipeline context with configuration and graph nodes.
-    - snap: snapping results with bus destination candidates.
-
-    Outputs:
-    - BusRoutingStageResult: paths and signatures for downstream stages.
-    """
+    """Execute transit routing stage and produce expanded routing CSV artifacts."""
     cfg = ctx.config
     departure_iso = cfg.bus_departure_dt.isoformat()
     routing_csv = cfg.bus_routing_matrix_path
-    routing_cache = cfg.bus_routing_cache_path
-    
+
     all_candidate_snapped_coords = set()
     has_multi_snap_candidates = False
     for snap_info_for_key in snap.poi_bus_snap_info_by_type.values():
@@ -443,59 +137,29 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
     origins_sig = _coords_signature(origins)
     destinations_sig = _coords_signature(destinations)
 
+    _write_r5r_point_inputs(
+        ctx.nodes_with_coords,
+        destinations,
+        cfg.bus_routing_origins_input_path,
+        cfg.bus_routing_destinations_input_path,
+    )
 
     if cfg.skip_routing:
-        _validate_routing_artifacts_for_skip(
-            cfg.skip_routing,
-            routing_cache,
-            departure_iso,
-            origins_sig=origins_sig,
-            destinations_sig=destinations_sig,
-        )
-        _validate_bus_matrix_meta(
-            cfg.bus_impedance_meta_path,
-            departure_iso,
-            origins_sig,
-            destinations_sig,
-        )
-        build_bus_impedance_cache(ctx, force_rebuild=False)
-
-        print(f"Skipping routing build. Reusing cache: {routing_cache}")
-
+        _require_existing_routing_csv(routing_csv)
+        print(f"[Bus] skip_routing=True. Reusing existing routing CSV: {routing_csv}", flush=True)
         return BusRoutingStageResult(
             routing_csv=routing_csv,
-            routing_pkl=routing_cache,
             routing_departure_iso=departure_iso,
             origins_sig=origins_sig,
             destinations_sig=destinations_sig,
         )
-
-    
-    origin_id_to_coord = {
-        str(node_id): (round(float(data["y"]), COORD_ROUND), round(float(data["x"]), COORD_ROUND))
-        for node_id, data in ctx.nodes_with_coords
-    }
-    destination_id_to_coord = {
-        f"d{idx}": (round(float(lat), COORD_ROUND), round(float(lon), COORD_ROUND))
-        for idx, (lat, lon) in enumerate(destinations)
-    }
-
-    r_origins_csv = cfg.bus_routing_origins_input_path
-    r_dest_csv = cfg.bus_routing_destinations_input_path
-
-    _write_r5r_point_inputs(
-        ctx.nodes_with_coords,
-        destinations,
-        r_origins_csv,
-        r_dest_csv,
-    )
 
     reuse_existing_csv = (
         cfg.skip_r5r_if_csv_exists
         and os.path.isfile(routing_csv)
         and os.path.getsize(routing_csv) > 0
     )
- 
+
     if reuse_existing_csv:
         print(f"[Bus] Reusing existing routing CSV: {routing_csv}", flush=True)
     else:
@@ -505,35 +169,11 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
             shutil.rmtree(chunk_dir)
         print("[Bus] Launching Rscript...", flush=True)
         _run_r5r_script(r_script_path)
-        print("[Bus] Rscript completed. Building routing cache from CSV...", flush=True)
+        print("[Bus] Rscript completed.", flush=True)
 
-    build_bus_impedance_cache(ctx, force_rebuild=True)
-
-    routing_payload = _build_routing_cache_from_r5r_csv(
-        routing_csv,
-        origin_id_to_coord=origin_id_to_coord,
-        destination_id_to_coord=destination_id_to_coord,
-        departure_iso=departure_iso,
-        origins_sig=origins_sig,
-        destinations_sig=destinations_sig,
-    )
-    _save_routing_cache(routing_cache, routing_payload)
-
-    _write_bus_matrix_meta(
-        cfg.bus_impedance_meta_path,
-        departure_iso,
-        origins_sig,
-        destinations_sig
-    )
     return BusRoutingStageResult(
         routing_csv=routing_csv,
-        routing_pkl=routing_cache,
         routing_departure_iso=departure_iso,
         origins_sig=origins_sig,
         destinations_sig=destinations_sig,
     )
-
-
-
-# compatibility shim
-validate_routing_artifacts_for_skip = _validate_routing_artifacts_for_skip
