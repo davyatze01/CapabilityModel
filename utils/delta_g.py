@@ -278,7 +278,7 @@ def accessibility_from_rra(RRA, poi_type=None, contribution_constant=None):
 
 
 def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origine, poi_snap_info_by_mode, feature=None, radius_m=None, tags=None):
-    """Compute non-bus decay ingredients for one origin/POI type from snap maps.
+    """Compute non-bus impedance ingredients for one origin/POI type from snap maps.
 
     Inputs:
     - poi_type: POI type key.
@@ -289,7 +289,7 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
     - tags: optional tags filter used for query identity.
 
     Outputs:
-    - dict with cache metadata and non-bus modal decay arrays.
+    - dict with cache metadata and non-bus modal impedance arrays.
     """
     _feature, _value, _tags = _resolve_query(poi_type, feature, tags)
 
@@ -304,15 +304,12 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
             source_keys_seen.add(src_key)
             source_coords.append((float(src_key[0]), float(src_key[1])))
 
-    decay_constant = float(serv.get_decay_constant(poi_type))
-    beta = math.log(2) / decay_constant
     if not source_coords:
         return {
             "source_coords": [],
-            "beta": beta,
-            "decay_walk": [],
-            "decay_bike": [],
-            "decay_drive": [],
+            "imp_walk": [],
+            "imp_bike": [],
+            "imp_drive": [],
         }
 
     global _G_CACHE
@@ -362,9 +359,9 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
             logger.warning("Walk routing fallback: mode=%s origin=%s reason=%s", mode, origine, exc)
             mode_distances[mode] = [None] * len(source_coords)
 
-    decay_walk = []
-    decay_bike = []
-    decay_drive = []
+    imp_walk = []
+    imp_bike = []
+    imp_drive = []
     walk_edge_scores = None
     if walk_graph is not None:
         graph_obj_id = id(walk_graph)
@@ -386,7 +383,7 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
         walk_edge_scores = cached_scores
     
     for i in range(len(source_coords)):
-        dw = db = dd = None
+        iw = ib = idr = None
 
         w_i = None
         if (
@@ -422,23 +419,21 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
             
             if imp is None:
                 continue
-            d = decay.distance_decay(beta, imp)
             if mode == "walk":
-                dw = d
+                iw = imp
             elif mode == "bike":
-                db = d
+                ib = imp
             else:
-                dd = d
-        decay_walk.append(dw)
-        decay_bike.append(db)
-        decay_drive.append(dd)
+                idr = imp
+        imp_walk.append(iw)
+        imp_bike.append(ib)
+        imp_drive.append(idr)
 
     return {
         "source_coords": source_coords,
-        "beta": beta,
-        "decay_walk": decay_walk,
-        "decay_bike": decay_bike,
-        "decay_drive": decay_drive,
+        "imp_walk": imp_walk,
+        "imp_bike": imp_bike,
+        "imp_drive": imp_drive,
         "walk_path_scores": walk_paths_scores
     }
 

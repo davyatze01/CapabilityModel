@@ -9,6 +9,7 @@ from non_bus_routing_stage import run_non_bus_routing_stage
 from accessibility_stage import run_accessibility_stage
 from service_stage import run_service_stage
 from capability_stage import run_capability_stage
+from artifact_bundle import load_impedance_bundle, write_impedance_bundle
 import faulthandler
 import sys
 import traceback
@@ -29,18 +30,35 @@ def main():
     cfg = PipelineConfig()
     ctx = build_context(cfg)
 
-    print("[Stage] Snapping", flush=True)
-    # In the snapping stage, each of the pois is snapped to the closest point of the corresponding network.
-    # Pois that are lines or geometries are snapped to a candidate set of points and the closest to the origin is selected when performing routing.
-    snap = run_snapping_stage(ctx)
+    loaded = load_impedance_bundle(ctx)
+    if loaded is not None:
+        print(
+            "[Artifact] Loaded impedance bundle. "
+            "Skipping snapping, bus routing, and non-bus routing.",
+            flush=True,
+        )
+        bus, non_bus = loaded
+    else:
+        print(
+            "[Artifact] No valid impedance bundle found; recomputing impedances "
+            "(this may take a while).",
+            flush=True,
+        )
+        print("[Stage] Snapping", flush=True)
+        # In the snapping stage, each of the pois is snapped to the closest point of the corresponding network.
+        # Pois that are lines or geometries are snapped to a candidate set of points and the closest to the origin is selected when performing routing.
+        snap = run_snapping_stage(ctx)
 
-    # Using the snapped pois, we compute bus routes and distances.
-    print("[Stage] Bus Routing", flush=True)
-    bus = run_bus_routing_stage(ctx, snap)
+        # Using the snapped pois, we compute bus routes and distances.
+        print("[Stage] Bus Routing", flush=True)
+        bus = run_bus_routing_stage(ctx, snap)
 
-    # Using the snapped pois, we compute walk, car and bike routes and distances (non-bus).
-    print("[Stage] Non-Bus Routing", flush=True)
-    non_bus = run_non_bus_routing_stage(ctx, snap)
+        # Using the snapped pois, we compute walk, car and bike routes and distances (non-bus).
+        print("[Stage] Non-Bus Routing", flush=True)
+        non_bus = run_non_bus_routing_stage(ctx, snap)
+
+        write_impedance_bundle(ctx, bus, non_bus)
+        print(f"[Artifact] Wrote impedance bundle: {cfg.impedance_artifact_path}", flush=True)
 
     # We compute impedances, decay and accessibilities for each Origin-Destination pair based on the routing results. The Accessibility values are then aggregated for POI type
     print("[Stage] Accessibility", flush=True)

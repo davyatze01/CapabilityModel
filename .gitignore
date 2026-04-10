@@ -239,6 +239,7 @@ outputs/service_matrix.dat
 outputs/service_meta.json
 outputs/service_node_to_row.json
 outputs/capability_*.csv
+artifacts/
 experiments/
 walkability_model/
 

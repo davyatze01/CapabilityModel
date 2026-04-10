@@ -30,6 +30,11 @@ def build_context(config: PipelineConfig) -> PipelineContext:
 
     os.makedirs("outputs", exist_ok=True)
     os.makedirs(config.non_bus_cache_dir, exist_ok=True)
+    os.makedirs(config.poi_snap_cache_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(config.bus_impedance_matrix_path) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(config.accessibility_matrix_path) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(config.service_matrix_path) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(config.impedance_artifact_path) or ".", exist_ok=True)
 
     output_paths = {
         "restorativeness": os.path.join("outputs", "capability_restorativeness.csv"),

@@ -7,6 +7,7 @@ import time
 from typing import Any, cast
 
 from tqdm import tqdm
+import walkability
 
 from context import PipelineContext
 from pipeline_types import SnappingStageResult, NonBusRoutingStageResult
@@ -179,9 +180,9 @@ def _process_node(node_item):
                     f"Non-bus routing failed for node_id={node_id}, poi_type={query.poi_type}, cause={exc!r}"
                 ) from exc
 
-            decay_walk = data["decay_walk"]
-            decay_bike = data["decay_bike"]
-            decay_drive = data["decay_drive"]
+            imp_walk = data["imp_walk"]
+            imp_bike = data["imp_bike"]
+            imp_drive = data["imp_drive"]
             source_coords = data.get("source_coords", [])
             poi_coords = []
             snap_info_for_key = _POI_BUS_SNAP_INFO.get(poi_key, {}) if _POI_BUS_SNAP_INFO else {}
@@ -192,9 +193,9 @@ def _process_node(node_item):
 
             entries.append({
                 "poi_type": query.poi_type,
-                "decay_walk": decay_walk,
-                "decay_bike": decay_bike,
-                "decay_drive": decay_drive,
+                "imp_walk": imp_walk,
+                "imp_bike": imp_bike,
+                "imp_drive": imp_drive,
                 "poi_coords": poi_coords,
                 "walk_path_scores" : data.get("walk_path_scores", [])
             })
@@ -243,6 +244,25 @@ def run_non_bus_routing_stage(
             continue
         nodes_to_compute.append((node_id, data))
 
+    # Warm walkability edge cache once in parent process so workers do not all
+    # attempt an expensive first-time build concurrently.
+    walk_graph = snap.shared_mode_graphs.get("walk")
+    if walk_graph is not None:
+        try:
+            print("[Non-bus] Preparing walkability edge cache...", flush=True)
+            walkability.get_or_build_edge_walkability_index(
+                cfg=_PIPELINE_CONFIG,
+                G=walk_graph,
+                force_rebuild=False,
+                schema_version=1,
+            )
+            print("[Non-bus] Walkability edge cache ready.", flush=True)
+        except Exception as exc:
+            print(
+                f"[Non-bus] Walkability cache warm-up skipped due to error: {exc}",
+                flush=True,
+            )
+
     total_non_bus_pois = 0
     for service in serv.SERVICE_KEYS:
         for query in serv.get_service_queries(service):
@@ -280,6 +300,14 @@ def run_non_bus_routing_stage(
 
     pending_non_bus = {node_id: data for node_id, data in nodes_to_compute}
     non_bus_pool_workers = ctx.workers
+    safe_cap = max(1, int(getattr(_PIPELINE_CONFIG, "non_bus_max_workers", non_bus_pool_workers)))
+    original = non_bus_pool_workers
+    non_bus_pool_workers = max(1, min(non_bus_pool_workers, safe_cap))
+    print(
+        f"[Non-bus] Using workers={non_bus_pool_workers} "
+        f"(requested={original}, cap={safe_cap}).",
+        flush=True,
+    )
     non_bus_attempt = 0
     try:
         while pending_non_bus:
@@ -320,6 +348,31 @@ def run_non_bus_routing_stage(
                          f"Non-bus pool made no progress; remaining_nodes={len(pending_non_bus)}"
                     )
             except Exception as e:
+                if isinstance(e, PermissionError):
+                    print(
+                        "[Non-bus] Multiprocessing unavailable (PermissionError). "
+                        "Falling back to sequential execution.",
+                        flush=True,
+                    )
+                    _init_worker(
+                        ctx.config,
+                        snap.poi_bus_snap_info_by_type,
+                        snap.poi_mode_snap_info_by_type,
+                        ctx.graph,
+                        snap.shared_mode_graphs,
+                        None,
+                        _PIPELINE_CONFIG.non_bus_cache_dir,
+                        _PIPELINE_CONFIG.non_bus_cache_schema_version,
+                    )
+                    pending_batch = list(pending_non_bus.items())
+                    for node_id, data in pending_batch:
+                        partial = _process_node((node_id, data))
+                        if partial is None:
+                            continue
+                        cache_path = _non_bus_cache_path(node_id)
+                        _write_non_bus_cache(cache_path, partial)
+                        pending_non_bus.pop(node_id, None)
+                    break
                 non_bus_attempt += 1
                 if non_bus_attempt > _PIPELINE_CONFIG.pool_max_retries:
                     raise RuntimeError(

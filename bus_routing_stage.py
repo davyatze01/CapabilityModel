@@ -328,7 +328,7 @@ def _run_r5r_script(script_path: str, ctx: PipelineContext) -> None:
     env["R5_ORIGINS_PATH"] = cfg.bus_routing_origins_input_path
     env["R5_DEST_PATH"] = cfg.bus_routing_destinations_input_path
     env["R5_OUTPUT_PATH"] = cfg.bus_routing_matrix_path
-    env["R5_CHUNK_DIR"] = os.path.join("outputs", "r5r_chunks", cfg.city_slug)
+    env["R5_CHUNK_DIR"] = os.path.join(os.path.dirname(cfg.bus_routing_matrix_path), "r5r_chunks")
     env["R5_DEPARTURE_DATETIME"] = cfg.bus_departure_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     if os.name == "nt":
@@ -639,12 +639,6 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
                 "routes": {},
             },
         )
-        _write_bus_matrix_meta(
-            cfg.bus_impedance_meta_path,
-            departure_iso,
-            origins_sig,
-            destinations_sig,
-        )
         return BusRoutingStageResult(
             routing_csv=routing_csv,
             routing_pkl=routing_cache,
@@ -661,12 +655,6 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
             departure_iso,
             origins_sig=origins_sig,
             destinations_sig=destinations_sig,
-        )
-        _validate_bus_matrix_meta(
-            cfg.bus_impedance_meta_path,
-            departure_iso,
-            origins_sig,
-            destinations_sig,
         )
         build_bus_impedance_cache(ctx, force_rebuild=False)
 
@@ -701,7 +689,7 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
     )
 
     r_script_path = os.path.join("utils", "r5_routing.r")
-    chunk_dir = os.path.join("outputs", "r5r_chunks", cfg.city_slug)
+    chunk_dir = os.path.join(os.path.dirname(cfg.bus_routing_matrix_path), "r5r_chunks")
     if os.path.isdir(chunk_dir):
         shutil.rmtree(chunk_dir)
     print("[Bus] Launching Rscript...", flush=True)
@@ -720,12 +708,6 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
     )
     _save_routing_cache(routing_cache, routing_payload)
 
-    _write_bus_matrix_meta(
-        cfg.bus_impedance_meta_path,
-        departure_iso,
-        origins_sig,
-        destinations_sig
-    )
     return BusRoutingStageResult(
         routing_csv=routing_csv,
         routing_pkl=routing_cache,

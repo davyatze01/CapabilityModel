@@ -502,11 +502,24 @@ def _compute_node_accessibility(item):
                 else:
                     decay_bus.append(exp(neg_beta * imp_bus))
 
+            imp_walk = entry.get("imp_walk", [])
+            imp_bike = entry.get("imp_bike", [])
+            imp_drive = entry.get("imp_drive", [])
+            decay_walk = []
+            decay_bike = []
+            decay_drive = []
+            for imp in imp_walk:
+                decay_walk.append(0.0 if imp is None else exp(neg_beta * float(imp)))
+            for imp in imp_bike:
+                decay_bike.append(0.0 if imp is None else exp(neg_beta * float(imp)))
+            for imp in imp_drive:
+                decay_drive.append(0.0 if imp is None else exp(neg_beta * float(imp)))
+
             # Use RRA to aggregate decays for each modality
             _, acc = delta_g.merge_rra_and_accessibility(
-                entry["decay_walk"],
-                entry["decay_bike"],
-                entry["decay_drive"],
+                decay_walk,
+                decay_bike,
+                decay_drive,
                 decay_bus,
                 poi_type=entry.get("poi_type"),
             )
@@ -578,13 +591,6 @@ def run_accessibility_stage(
     node_to_row: dict[str, int] = {}
     poi_to_col: dict[str, int] = {}
 
-    _validate_bus_matrix_meta(
-        ctx.config.bus_impedance_meta_path,
-        bus.routing_departure_iso,
-        bus.origins_sig,
-        bus.destinations_sig,
-    )
-
     mat, node_to_row, poi_to_col = _open_or_create_accessibility_matrix_cache(ctx, bus)
 
     # Preload complete node rows from cache and compute only missing rows.
@@ -601,9 +607,19 @@ def run_accessibility_stage(
                     _build_node_result_from_matrix_row(node_id, data, row, mat, poi_to_col)
                 )
             else:
-                pending[node_id] = non_bus.cache_paths[node_id]
+                cache_path = non_bus.cache_paths.get(node_id)
+                if cache_path is None:
+                    cache_path = non_bus.cache_paths.get(str(node_id))
+                if cache_path is not None:
+                    pending[node_id] = cache_path
     else:
-        pending = {node_id: non_bus.cache_paths[node_id] for node_id, _ in ctx.nodes_with_coords}
+        pending = {}
+        for node_id, _ in ctx.nodes_with_coords:
+            cache_path = non_bus.cache_paths.get(node_id)
+            if cache_path is None:
+                cache_path = non_bus.cache_paths.get(str(node_id))
+            if cache_path is not None:
+                pending[node_id] = cache_path
     
     total_nodes = len(pending)
     pbar = tqdm(total=total_nodes, desc="Accessibility stage", mininterval=1) if ctx.config.enable_progress else None
