@@ -10,6 +10,8 @@ from accessibility_stage import run_accessibility_stage
 from service_stage import run_service_stage
 from capability_stage import run_capability_stage
 from artifact_bundle import load_impedance_bundle, write_impedance_bundle
+from plot_shapefile import plot_all_experiments
+from generate_experiment_shapefiles import generate_shapefile_by_csv
 import faulthandler
 import sys
 import traceback
@@ -76,6 +78,15 @@ def main():
     print("Wrote results to:", flush=True)
     for path in cap.output_paths.values():
         print(f"- {path}", flush=True)
+
+    # Create the plot for every experiment
+    generated_plots = plot_all_experiments(k_meters=10)
+    for plot_path in generated_plots:
+        print(plot_path)
+
+    # Generate shapefile for every experiment
+    for path in generate_shapefile_by_csv():
+        print(path)
 
 if __name__ == "__main__":
     try:
