@@ -14,17 +14,14 @@ CAP_RESTORATIVENESS_IDX = {
 
 CAP_NUTRITION_IDX = {
     "eating_out": 0,
-    "fresh_food_access": 1,
-    "ready_food_access": 2,
+    "food_access": 1,
 }
 
 CAP_CARE_IDX = {
     "medicines_and_supplies": 0,
-    "impatient_and_care": 1,
-    "rehabilitation_services": 2,
-    "diagnosis_and_prevention": 3,
-    "emergency_services": 4,
-    "care_services": 5,
+    "diagnosis_and_prevention": 1,
+    "emergency_services": 2,
+    "care_services": 3,
 }
 
 CAP_SINGLETON_M = {
@@ -38,15 +35,12 @@ CAP_SINGLETON_M = {
 
     "nutrition": {
         "eating_out": 0.6,             # provides nutrition but quality/control varies
-        "fresh_food_access": 1.0,      # core for adequate nutrition
-        "ready_food_access": 0.8,      # strong contributor (availability), less ideal than fresh
+        "food_access": 1.0,            # unified access to fresh and ready food retail
     },
 
     "care": {
         "medicines_and_supplies": 0.8,       # strong contributor
-        "impatient_and_care": 1.0,           # core
-        "rehabilitation_services": 0.8,      # strong contributor
-        "diagnosis_and_prevention": 0.8,     # strong contributor
+        "diagnosis_and_prevention": 1.0,     # core diagnostic/preventive access
         "emergency_services": 1.0,           # core
         "care_services": 1.0,                # core (ongoing care)
     },

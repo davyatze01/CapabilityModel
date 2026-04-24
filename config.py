@@ -56,6 +56,7 @@ class PipelineConfig:
     poi_snap_cache_dir: str = ""
 
     bus_departure_dt: dt.datetime = dt.datetime(2025, 10, 15, 12, 0, 0)
+    bus_gamma: float = 1.0
     routing_data_dir: str = "gtfs"
     osm_pbf_autobuild: bool = True
     osm_autobuild_network_type: str = "all"

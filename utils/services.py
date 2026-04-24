@@ -1,5 +1,6 @@
 import csv
 import json
+import re
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ class PoiQuery:
     service: str
     poi_type: str
     tags: dict | None = None
+    labels: tuple[str, ...] = ()
 
 
 def _config_error(row_num: int | None, column: str | None, message: str) -> ValueError:
@@ -105,6 +107,19 @@ def _load_rows() -> list[dict[str, Any]]:
             if not isinstance(tags, dict):
                 raise _config_error(idx, "tags", f"expected JSON object, got {type(tags).__name__}")
 
+            labels_raw = (row.get("labels") or "").strip()
+            if labels_raw:
+                labels = _parse_json_cell(labels_raw, idx, "labels")
+                if not isinstance(labels, list) or not labels:
+                    raise _config_error(idx, "labels", "expected non-empty JSON array of strings")
+                if not all(isinstance(label, str) and label.strip() for label in labels):
+                    raise _config_error(idx, "labels", "expected non-empty strings in array")
+                normalized_labels = [label.strip() for label in labels]
+                if len(set(normalized_labels)) != len(normalized_labels):
+                    raise _config_error(idx, "labels", f"duplicate labels in row: {normalized_labels}")
+            else:
+                normalized_labels = [poi_type]
+
             services = _parse_json_cell(row.get("services") or "", idx, "services")
             if not isinstance(services, list) or not services:
                 raise _config_error(idx, "services", "expected non-empty JSON array of strings")
@@ -117,54 +132,85 @@ def _load_rows() -> list[dict[str, Any]]:
                 if not s.isidentifier():
                     raise _config_error(idx, "services", f"service name must be a valid identifier, got {s!r}")
 
-            choquet_capacity = _parse_json_cell(row.get("choquet_capacity") or "", idx, "choquet_capacity")
-            if not isinstance(choquet_capacity, list) or not choquet_capacity:
-                raise _config_error(idx, "choquet_capacity", "expected non-empty JSON array of numbers")
-            if len(choquet_capacity) != len(services):
-                raise _config_error(
-                    idx,
-                    "choquet_capacity",
-                    f"length mismatch: len(services)={len(services)} len(choquet_capacity)={len(choquet_capacity)}",
-                )
-            choquet_capacity_floats: list[float] = []
-            for j, value in enumerate(choquet_capacity):
+            choquet_capacity_raw = _parse_json_cell(row.get("choquet_capacity") or "", idx, "choquet_capacity")
+            if isinstance(choquet_capacity_raw, list):
+                if not choquet_capacity_raw:
+                    raise _config_error(idx, "choquet_capacity", "expected non-empty JSON array of numbers")
+                if len(choquet_capacity_raw) != len(services):
+                    raise _config_error(
+                        idx,
+                        "choquet_capacity",
+                        f"length mismatch: len(services)={len(services)} len(choquet_capacity)={len(choquet_capacity_raw)}",
+                    )
+                choquet_capacity_floats: list[float] = []
+                for j, value in enumerate(choquet_capacity_raw):
+                    try:
+                        choquet_capacity_floats.append(float(value))
+                    except Exception as exc:
+                        raise _config_error(
+                            idx,
+                            "choquet_capacity",
+                            f"entry {j} expected number, got {value!r}",
+                        ) from exc
+            else:
                 try:
-                    choquet_capacity_floats.append(float(value))
+                    choquet_capacity_floats = [float(choquet_capacity_raw)] * len(services)
                 except Exception as exc:
                     raise _config_error(
                         idx,
                         "choquet_capacity",
-                        f"entry {j} expected number, got {value!r}",
+                        f"expected number or JSON array of numbers, got {choquet_capacity_raw!r}",
                     ) from exc
 
-            contribution_constant = _parse_json_cell(row.get("contribution_constant") or "", idx, "contribution_constant")
-            if not isinstance(contribution_constant, list) or not contribution_constant:
-                raise _config_error(idx, "contribution_constant", "expected non-empty JSON array of numbers")
-            if len(contribution_constant) != len(services):
-                raise _config_error(
-                    idx,
-                    "contribution_constant",
-                    f"length mismatch: len(services)={len(services)} len(contribution_constant)={len(contribution_constant)}",
-                )
-            contribution_constant_floats: list[float] = []
-            for j, value in enumerate(contribution_constant):
+            contribution_raw = _parse_json_cell(row.get("contribution_constant") or "", idx, "contribution_constant")
+            if isinstance(contribution_raw, list):
+                if not contribution_raw:
+                    raise _config_error(idx, "contribution_constant", "expected non-empty JSON array of numbers")
+                if len(contribution_raw) != len(services):
+                    raise _config_error(
+                        idx,
+                        "contribution_constant",
+                        f"length mismatch: len(services)={len(services)} len(contribution_constant)={len(contribution_raw)}",
+                    )
+                contribution_constant_floats: list[float] = []
+                for j, value in enumerate(contribution_raw):
+                    try:
+                        contribution_constant_floats.append(float(value))
+                    except Exception as exc:
+                        raise _config_error(
+                            idx,
+                            "contribution_constant",
+                            f"entry {j} expected number, got {value!r}",
+                        ) from exc
+            else:
                 try:
-                    contribution_constant_floats.append(float(value))
+                    contribution_constant_floats = [float(contribution_raw)] * len(services)
                 except Exception as exc:
                     raise _config_error(
                         idx,
                         "contribution_constant",
-                        f"entry {j} expected number, got {value!r}",
+                        f"expected number or JSON array of numbers, got {contribution_raw!r}",
                     ) from exc
+
+            interactions_cell = (row.get("choquet_interactions") or "").strip()
+            if interactions_cell:
+                interactions_normalized = re.sub(r"\bNone\b", "null", interactions_cell)
+                choquet_interactions = _parse_json_cell(interactions_normalized, idx, "choquet_interactions")
+                if not isinstance(choquet_interactions, list) or not choquet_interactions:
+                    raise _config_error(idx, "choquet_interactions", "expected non-empty JSON-like array")
+            else:
+                choquet_interactions = None
 
             parsed_rows.append(
                 {
                     "poi_type": poi_type,
                     "decay_constant": decay_constant,
                     "tags": tags,
+                    "labels": tuple(normalized_labels),
                     "services": services,
                     "choquet_capacity": choquet_capacity_floats,
                     "contribution_constant": contribution_constant_floats,
+                    "choquet_interactions": choquet_interactions,
                 }
             )
 
@@ -184,26 +230,91 @@ def _build_runtime_structures(rows: list[dict[str, Any]]):
     service_singleton_m: "OrderedDict[str, dict[str, float]]" = OrderedDict()
     decay_constants: dict[str, float] = {}
     contribution_constants: dict[str, dict[str, float]] = {}
+    interaction_rows: "OrderedDict[str, dict[str, list[Any] | None]]" = OrderedDict()
     seen_pairs: set[tuple[str, str]] = set()
 
     for row in rows:
         poi_type = row["poi_type"]
         decay_constants[poi_type] = float(row["decay_constant"])
         tags = dict(row["tags"])
+        labels = tuple(row.get("labels", (poi_type,)))
         services = row["services"]
         choquet_caps = row["choquet_capacity"]
         contribs = row["contribution_constant"]
+        interactions_row = row.get("choquet_interactions")
 
         for service, choquet_weight, contrib_weight in zip(services, choquet_caps, contribs):
             pair = (service, poi_type)
             if pair in seen_pairs:
                 raise _config_error(None, None, f"duplicate (service, poi_type) pair generated: {pair}")
             seen_pairs.add(pair)
-            service_poi_queries.setdefault(service, []).append(PoiQuery(service=service, poi_type=poi_type, tags=tags))
+            service_poi_queries.setdefault(service, []).append(
+                PoiQuery(service=service, poi_type=poi_type, tags=tags, labels=labels)
+            )
             service_singleton_m.setdefault(service, {})[poi_type] = float(choquet_weight)
             contribution_constants.setdefault(service, {})[poi_type] = float(contrib_weight)
+            interaction_rows.setdefault(service, {})[poi_type] = interactions_row
 
-    return dict(service_poi_queries), dict(service_singleton_m), decay_constants, dict(contribution_constants)
+    service_pairwise_m: "OrderedDict[str, dict[tuple[str, str], float]]" = OrderedDict()
+    for service, queries in service_poi_queries.items():
+        poi_types = [q.poi_type for q in queries]
+        n = len(poi_types)
+        pair_values: dict[tuple[int, int], list[float]] = {}
+        for i, poi in enumerate(poi_types):
+            row_vals = interaction_rows.get(service, {}).get(poi)
+            if row_vals is None:
+                # Backward-compatible default: no pairwise interactions.
+                row_vals = [None if j == i else 0.0 for j in range(n)]
+            if len(row_vals) != n:
+                raise _config_error(
+                    None,
+                    "choquet_interactions",
+                    f"service {service!r}, poi_type {poi!r}: expected length {n}, got {len(row_vals)}",
+                )
+            for j, raw_val in enumerate(row_vals):
+                if i == j:
+                    if raw_val is not None:
+                        raise _config_error(
+                            None,
+                            "choquet_interactions",
+                            f"service {service!r}, poi_type {poi!r}: diagonal entry at index {j} must be None/null",
+                        )
+                    continue
+                if raw_val is None:
+                    raise _config_error(
+                        None,
+                        "choquet_interactions",
+                        f"service {service!r}, poi_type {poi!r}: off-diagonal entry at index {j} cannot be None/null",
+                    )
+                try:
+                    value = float(raw_val)
+                except Exception as exc:
+                    raise _config_error(
+                        None,
+                        "choquet_interactions",
+                        f"service {service!r}, poi_type {poi!r}, index {j}: expected numeric, got {raw_val!r}",
+                    ) from exc
+                key = (i, j) if i < j else (j, i)
+                pair_values.setdefault(key, []).append(value)
+
+        service_pairwise_m[service] = {}
+        for i in range(n):
+            for j in range(i + 1, n):
+                vals = pair_values.get((i, j), [])
+                if not vals:
+                    pair_val = 0.0
+                else:
+                    # Use the mean when both directional entries are provided.
+                    pair_val = float(sum(vals) / len(vals))
+                service_pairwise_m[service][(poi_types[i], poi_types[j])] = float(pair_val)
+
+    return (
+        dict(service_poi_queries),
+        dict(service_singleton_m),
+        decay_constants,
+        dict(contribution_constants),
+        dict(service_pairwise_m),
+    )
 
 
 def _bootstrap_compatibility_checks() -> None:
@@ -276,7 +387,13 @@ def get_contribution_constant(poi_type: str, service: str | None = None) -> floa
 
 
 _ROWS = _load_rows()
-SERVICE_POI_QUERIES, SERVICE_SINGLETON_M, POI_DECAY_CONSTANTS, SERVICE_CONTRIBUTION_CONSTANTS = _build_runtime_structures(_ROWS)
+(
+    SERVICE_POI_QUERIES,
+    SERVICE_SINGLETON_M,
+    POI_DECAY_CONSTANTS,
+    SERVICE_CONTRIBUTION_CONSTANTS,
+    SERVICE_PAIRWISE_M,
+) = _build_runtime_structures(_ROWS)
 SERVICE_KEYS = list(SERVICE_POI_QUERIES.keys())
 _bootstrap_compatibility_checks()
 
@@ -367,20 +484,39 @@ def _service_idx_map(service: str) -> dict[str, int]:
     return {q.poi_type: i for i, q in enumerate(SERVICE_POI_QUERIES[service])}
 
 
+def _service_idx_map_optional(service: str) -> dict[str, int]:
+    """Return service index map when available, else empty mapping.
+
+    Inputs:
+    - service: service key.
+
+    Outputs:
+    - dict mapping POI type -> positional index, or empty dict when missing.
+    """
+    if service not in SERVICE_POI_QUERIES:
+        return {}
+    return _service_idx_map(service)
+
+
 SPORT_AND_MOVEMENT_IDX = _service_idx_map("sport_and_movement")
 SCENIC_VIEWS_IDX = _service_idx_map("scenic_views")
 QUIETNESS_IDX = _service_idx_map("quietness")
 CULTURAL_ACTIVITIES_IDX = _service_idx_map("cultural_activities")
 NATURE_CONTACT_IDX = _service_idx_map("nature_contact")
 EATING_OUT_IDX = _service_idx_map("eating_out")
-FRESH_FOOD_ACCESS_IDX = _service_idx_map("fresh_food_access")
-READY_FOOD_ACCESS_IDX = _service_idx_map("ready_food_access")
+FOOD_ACCESS_IDX = _service_idx_map_optional("food_access")
 MEDICINES_AND_SUPPLIES_IDX = _service_idx_map("medicines_and_supplies")
-IMPATIENT_AND_CARE_IDX = _service_idx_map("impatient_and_care")
-REHABILITATION_SERVICES_IDX = _service_idx_map("rehabilitation_services")
-DIAGNOSIS_AND_PREVENTION_IDX = _service_idx_map("diagnosis_and_prevention")
+DIAGNOSIS_AND_PREVENTION_IDX = _service_idx_map_optional("diagnosis_and_prevention")
 EMERGENCY_SERVICES_IDX = _service_idx_map("emergency_services")
 CARE_SERVICES_IDX = _service_idx_map("care_services")
+IMPATIENT_AND_REHABILITATION_SERVICE_IDX = _service_idx_map_optional("impatient_and_rehabilitation")
+
+# Backward-compatible aliases for legacy service names.
+FRESH_FOOD_ACCESS_IDX = FOOD_ACCESS_IDX
+READY_FOOD_ACCESS_IDX = FOOD_ACCESS_IDX
+IMPATIENT_AND_REHABILITATION_IDX = IMPATIENT_AND_REHABILITATION_SERVICE_IDX
+IMPATIENT_AND_CARE_IDX = IMPATIENT_AND_REHABILITATION_SERVICE_IDX
+REHABILITATION_SERVICES_IDX = IMPATIENT_AND_REHABILITATION_SERVICE_IDX
 
 
 def cap(S, service):
@@ -394,12 +530,15 @@ def cap(S, service):
     - float fuzzy measure used by Choquet aggregation.
     """
     if len(S) == 0:
-        return 0
-    if len(S) == 1:
-        return SERVICE_SINGLETON_M[service][S[0]]
-    singletons = [SERVICE_SINGLETON_M[service][k] for k in S]
-    m = max(singletons)
-    return min(1, m + 0.2 * (1 - m))
+        return 0.0
+    mu = 0.0
+    subset = list(S)
+    for i, poi_i in enumerate(subset):
+        mu += float(SERVICE_SINGLETON_M[service][poi_i])
+        for poi_j in subset[i + 1 :]:
+            pair = (poi_i, poi_j) if poi_i < poi_j else (poi_j, poi_i)
+            mu += float(SERVICE_PAIRWISE_M.get(service, {}).get(pair, 0.0))
+    return mu
 
 
 def choquet_integral(x, service):

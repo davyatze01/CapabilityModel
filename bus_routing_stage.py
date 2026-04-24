@@ -442,10 +442,22 @@ def build_bus_impedance_cache(context: PipelineContext, force_rebuild: bool = Fa
             if dest_col is None:
                 missing_to_ids.add(to_id)
                 continue
-            total_time = row["total_time"]
-            if total_time == "" or (row["routes"] in ["", "[WALK]"]):
-                total_time = 0
-            impedance_matrix[source_row][dest_col] = total_time
+            total_time_raw = row.get("total_time", "")
+            wait_time_raw = row.get("wait_time", "")
+            if total_time_raw == "" or (row["routes"] in ["", "[WALK]"]):
+                impedance = 0.0
+            else:
+                try:
+                    total_time = float(total_time_raw)
+                    wait_time = float(wait_time_raw) if wait_time_raw != "" else 0.0
+                except ValueError:
+                    impedance = 0.0
+                else:
+                    travel_time = max(0.0, total_time - wait_time)
+                    impedance = wait_time + float(cfg.bus_gamma) * travel_time
+                    if impedance < 0:
+                        impedance = 0.0
+            impedance_matrix[source_row][dest_col] = impedance
     impedance_matrix.flush()
 
     if missing_from_ids or missing_to_ids:
@@ -512,6 +524,7 @@ def _build_routing_cache_from_r5r_csv(
     departure_iso: str,
     origins_sig: str,
     destinations_sig: str,
+    bus_gamma: float,
 ):
     """Build in-memory routing cache dictionary from expanded routing CSV.
 
@@ -557,10 +570,14 @@ def _build_routing_cache_from_r5r_csv(
             if travel_time < 0:
                 continue
 
+            impedance = wait_time + float(bus_gamma) * travel_time
+            if impedance < 0:
+                continue
+
             routes[(origin_coord, destination_coord)] = {
                 "travel_time": travel_time,
                 "wait_time": wait_time,
-                "impedance": total_time,
+                "impedance": impedance,
                 "routes": getattr(row, "routes", None),
             }
 
@@ -656,7 +673,7 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
             origins_sig=origins_sig,
             destinations_sig=destinations_sig,
         )
-        build_bus_impedance_cache(ctx, force_rebuild=False)
+        build_bus_impedance_cache(ctx, force_rebuild=True)
 
         print(f"Skipping routing build. Reusing cache: {routing_cache}")
 
@@ -705,6 +722,7 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
         departure_iso=departure_iso,
         origins_sig=origins_sig,
         destinations_sig=destinations_sig,
+        bus_gamma=cfg.bus_gamma,
     )
     _save_routing_cache(routing_cache, routing_payload)
 

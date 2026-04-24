@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
 import math
 
 import matplotlib as mpl
+
+# On some Windows Python builds, Agg PNG rendering can crash with illegal
+# instruction errors in native extensions. Prefer SVG backend/output there.
+if os.name == "nt":
+    mpl.use("svg")
+
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 import networkx as nx
@@ -290,9 +297,16 @@ def plot_experiment(
 
     # Save one image per CSV using a filename derived from the experiment name.
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{csv_path.stem}_edge_interp_{k_meters}.png"
+    output_format = "svg" if os.name == "nt" else "png"
+    output_path = output_dir / f"{csv_path.stem}_edge_interp_{k_meters}.{output_format}"
     fig.tight_layout()
-    fig.savefig(output_path, dpi=dpi, facecolor=fig.get_facecolor(), bbox_inches="tight")
+    fig.savefig(
+        output_path,
+        dpi=dpi,
+        facecolor=fig.get_facecolor(),
+        bbox_inches="tight",
+        format=output_format,
+    )
     plt.close(fig)
     return output_path
 
