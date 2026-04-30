@@ -21,6 +21,7 @@ from numpy.typing import NDArray
 import hashlib
 
 _NON_BUS_CACHE_SCHEMA_VERSION = None        # Expected schema version for the cache to prevent reading incompatible cache files
+_NON_BUS_POI_CONFIG_SIGNATURE: str | None = None
 _ACCESS_PROGRESS_VALUE: Any | None = None   # Multiprocess counter shared by workers to update the progress bar
 
 _BUS_IMPEDANCE_MATRIX: NDArray[np.float32] | None = None
@@ -124,6 +125,8 @@ def _is_valid_non_bus_cache(payload):
         return False
     if payload.get("schema_version") != _NON_BUS_CACHE_SCHEMA_VERSION:
         return False
+    if payload.get("poi_config_signature") != _NON_BUS_POI_CONFIG_SIGNATURE:
+        return False
     if "origin" not in payload or "services" not in payload:
         return False
     if not isinstance(payload["services"], dict):
@@ -165,7 +168,7 @@ def _accessibility_run_signature(ctx: PipelineContext, bus: BusRoutingStageResul
         "bus_origins_sig": bus.origins_sig,
         "bus_destinations_sig": bus.destinations_sig,
         "non_bus_cache_schema": int(ctx.config.non_bus_cache_schema_version),
-        "poi_csv_path": str(serv.CONFIG_CSV_PATH),
+        "poi_config_signature": serv.config_signature(),
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
@@ -326,6 +329,7 @@ def _write_node_result_to_matrix(
 # The global variables for each worker are initialized with the passed parameter
 def _init_accessibility_worker(
     non_bus_cache_schema_version,
+    non_bus_poi_config_signature,
     matrix_path,
     source_id_to_row_path,
     dest_id_to_col_path,
@@ -346,10 +350,11 @@ def _init_accessibility_worker(
     Outputs:
     - None. Populates worker globals used during node computation.
     """
-    global _NON_BUS_CACHE_SCHEMA_VERSION, _ACCESS_PROGRESS_VALUE
+    global _NON_BUS_CACHE_SCHEMA_VERSION, _NON_BUS_POI_CONFIG_SIGNATURE, _ACCESS_PROGRESS_VALUE
     global _BUS_SOURCE_ID_TO_ROW, _BUS_DEST_COORD_TO_COL, _BUS_IMPEDANCE_MATRIX
     global _ACCESS_DEDUPLICATE_ENTRIES
     _NON_BUS_CACHE_SCHEMA_VERSION = non_bus_cache_schema_version
+    _NON_BUS_POI_CONFIG_SIGNATURE = str(non_bus_poi_config_signature or "")
     _ACCESS_DEDUPLICATE_ENTRIES = bool(deduplicate_entries)
     _ACCESS_PROGRESS_VALUE = access_progress_value
     with open(source_id_to_row_path, encoding="utf-8") as f:
@@ -661,6 +666,7 @@ def run_accessibility_stage(
                     initializer=_init_accessibility_worker,
                     initargs=(
                         ctx.config.non_bus_cache_schema_version,
+                        serv.config_signature(),
                         ctx.config.bus_impedance_matrix_path,
                         ctx.config.bus_source_id_to_row_path,
                         ctx.config.bus_dest_id_to_col_path,

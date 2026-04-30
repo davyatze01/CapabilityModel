@@ -21,6 +21,7 @@ _NON_BUS_PROGRESS_VALUE: Any | None = None
 _POI_WORK_UNITS_BY_KEY: dict[Any, int] | None = None
 _NON_BUS_CACHE_DIR: str = ""
 _NON_BUS_CACHE_SCHEMA_VERSION: int = 0
+_NON_BUS_POI_CONFIG_SIGNATURE: str = ""
 _PIPELINE_CONFIG: PipelineConfig | None = None
 
 def _non_bus_cache_path(node_id):
@@ -77,6 +78,8 @@ def _is_valid_non_bus_cache(payload):
         return False
     if payload.get("schema_version") != _NON_BUS_CACHE_SCHEMA_VERSION:
         return False
+    if payload.get("poi_config_signature") != _NON_BUS_POI_CONFIG_SIGNATURE:
+        return False
     if "origin" not in payload or "services" not in payload:
         return False
     if not isinstance(payload["services"], dict):
@@ -111,6 +114,7 @@ def _init_worker(
     non_bus_progress_value=None,
     non_bus_cache_dir: str = "",
     non_bus_cache_schema_version: int = 0,
+    non_bus_poi_config_signature: str = "",
 ):
     """Initialize worker state for non-bus multiprocessing stage.
 
@@ -127,10 +131,11 @@ def _init_worker(
     - None. Populates worker globals and warm caches.
     """
     global _POI_BUS_SNAP_INFO, _POI_MODE_SNAP_INFO, _NON_BUS_PROGRESS_VALUE, _POI_WORK_UNITS_BY_KEY
-    global _NON_BUS_CACHE_DIR, _NON_BUS_CACHE_SCHEMA_VERSION, _PIPELINE_CONFIG
+    global _NON_BUS_CACHE_DIR, _NON_BUS_CACHE_SCHEMA_VERSION, _NON_BUS_POI_CONFIG_SIGNATURE, _PIPELINE_CONFIG
     _PIPELINE_CONFIG = pipeline_config
     _NON_BUS_CACHE_DIR = non_bus_cache_dir or ""
     _NON_BUS_CACHE_SCHEMA_VERSION = int(non_bus_cache_schema_version)
+    _NON_BUS_POI_CONFIG_SIGNATURE = str(non_bus_poi_config_signature or "")
     _POI_BUS_SNAP_INFO = poi_bus_snap_info_by_type or {}
     _POI_WORK_UNITS_BY_KEY = {}
     for poi_key, snap_info_by_source in _POI_BUS_SNAP_INFO.items():
@@ -209,6 +214,7 @@ def _process_node(node_item):
 
     return {
         "schema_version": _NON_BUS_CACHE_SCHEMA_VERSION,
+        "poi_config_signature": _NON_BUS_POI_CONFIG_SIGNATURE,
         "node_id": node_id,
         "origin": origin,
         "services": service_results,
@@ -228,10 +234,11 @@ def run_non_bus_routing_stage(
     Outputs:
     - NonBusRoutingStageResult: cache paths and computed/cached node counters.
     """
-    global _NON_BUS_CACHE_DIR, _NON_BUS_CACHE_SCHEMA_VERSION, _PIPELINE_CONFIG
+    global _NON_BUS_CACHE_DIR, _NON_BUS_CACHE_SCHEMA_VERSION, _NON_BUS_POI_CONFIG_SIGNATURE, _PIPELINE_CONFIG
     _PIPELINE_CONFIG = ctx.config
     _NON_BUS_CACHE_DIR = _PIPELINE_CONFIG.non_bus_cache_dir
     _NON_BUS_CACHE_SCHEMA_VERSION = _PIPELINE_CONFIG.non_bus_cache_schema_version
+    _NON_BUS_POI_CONFIG_SIGNATURE = serv.config_signature()
 
     cache_paths = {}
     nodes_to_compute = []
@@ -328,6 +335,7 @@ def run_non_bus_routing_stage(
                         shared_progress,
                         _PIPELINE_CONFIG.non_bus_cache_dir,
                         _PIPELINE_CONFIG.non_bus_cache_schema_version,
+                        _NON_BUS_POI_CONFIG_SIGNATURE,
                     ),
                 ) as pool:
                     pending_batch = list(pending_non_bus.items())
@@ -363,6 +371,7 @@ def run_non_bus_routing_stage(
                         None,
                         _PIPELINE_CONFIG.non_bus_cache_dir,
                         _PIPELINE_CONFIG.non_bus_cache_schema_version,
+                        _NON_BUS_POI_CONFIG_SIGNATURE,
                     )
                     pending_batch = list(pending_non_bus.items())
                     for node_id, data in pending_batch:

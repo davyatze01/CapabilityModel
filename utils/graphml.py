@@ -9,7 +9,8 @@ from typing import TypeAlias
 from config import PipelineConfig
 
 TagValue: TypeAlias = bool | str | list[str]
-TagsDict: TypeAlias = dict[str, TagValue]
+TagClause: TypeAlias = dict[str, TagValue]
+TagQuery: TypeAlias = TagClause | list[TagClause]
 
 # In-memory caches to avoid repeated disk loads
 _GRAPH_CACHE = None
@@ -110,7 +111,7 @@ def _city_poi_cache_dir(city_slug: str) -> str:
     """Return city-scoped directory path for POI cache files."""
     return os.path.join("poi", city_slug)
 
-def _all_tags_file_name(query_tags: TagsDict) -> str:
+def _all_tags_file_name(query_tags: TagClause) -> str:
     payload = json.dumps(query_tags, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     key_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()
     return f"all_tags_{key_hash}.geojson"
@@ -118,25 +119,35 @@ def _all_tags_file_name(query_tags: TagsDict) -> str:
 def _normalize_value_list(values: set[TagValue]) -> list[TagValue]:
     return sorted(list(values), key=lambda x: json.dumps(x, sort_keys=True, ensure_ascii=True))
 
+def _iter_tag_clauses(tags: TagQuery | None) -> list[TagClause]:
+    if tags is None:
+        return []
+    if isinstance(tags, list):
+        return [clause for clause in tags if isinstance(clause, dict)]
+    if isinstance(tags, dict):
+        return [tags]
+    return []
+
+
 def _build_city_query_batches() -> dict[str, list[TagValue]]:
     """Group configured POI queries by tag key to enable batched extraction."""
     from utils import services as serv
 
     by_key: dict[str, set[TagValue]] = {}
     for q in serv.unique_query_keys():
-        tags = q.tags or {}
-        for key, value in tags.items():
-            if isinstance(value, list):
-                for item in value:
-                    by_key.setdefault(str(key), set()).add(str(item))
-            else:
-                by_key.setdefault(str(key), set()).add(value)
+        for clause in _iter_tag_clauses(q.tags):
+            for key, value in clause.items():
+                if isinstance(value, list):
+                    for item in value:
+                        by_key.setdefault(str(key), set()).add(str(item))
+                else:
+                    by_key.setdefault(str(key), set()).add(value)
     return {k: _normalize_value_list(v) for k, v in by_key.items()}
 
-def _build_city_universe_tags() -> TagsDict:
+def _build_city_universe_tags() -> TagClause:
     """Build one combined tags payload covering all configured POI queries."""
     key_batches = _build_city_query_batches()
-    out: TagsDict = {}
+    out: TagClause = {}
     for key, values in key_batches.items():
         if any(v is True for v in values):
             out[key] = True
@@ -144,7 +155,7 @@ def _build_city_universe_tags() -> TagsDict:
             out[key] = [str(v) for v in values]
     return out
 
-def _download_city_poi_universe(place_name: str, query_tags: TagsDict) -> gpd.GeoDataFrame:
+def _download_city_poi_universe(place_name: str, query_tags: TagClause) -> gpd.GeoDataFrame:
     """Download one city-wide POI dataset that covers all configured tags."""
     print(f"[POI] OSMnx city-universe download: keys={len(query_tags)}")
     return _download_poi_for_place(place_name, query_tags)
@@ -157,7 +168,7 @@ def _values_match(series: pd.Series, value: TagValue) -> pd.Series:
         return series.astype(str).isin(wanted)
     return series.astype(str) == str(value)
 
-def _filter_by_tags(gdf: gpd.GeoDataFrame, tags: TagsDict) -> gpd.GeoDataFrame:
+def _filter_by_clause(gdf: gpd.GeoDataFrame, tags: TagClause) -> gpd.GeoDataFrame:
     if gdf.empty:
         return gdf
     mask = pd.Series(True, index=gdf.index)
@@ -166,6 +177,26 @@ def _filter_by_tags(gdf: gpd.GeoDataFrame, tags: TagsDict) -> gpd.GeoDataFrame:
             return gpd.GeoDataFrame(geometry=[], crs=gdf.crs)
         mask = mask & _values_match(gdf[key], value)
     out = gdf.loc[mask].copy()
+    if "geometry" in out.columns:
+        out = out[out["geometry"].notna()].copy()
+    return out
+
+def _filter_by_tags(gdf: gpd.GeoDataFrame, tags: TagQuery) -> gpd.GeoDataFrame:
+    if isinstance(tags, dict):
+        return _filter_by_clause(gdf, tags)
+    if not isinstance(tags, list) or not tags:
+        return gpd.GeoDataFrame(geometry=[], crs=gdf.crs)
+    parts = []
+    for clause in tags:
+        if not isinstance(clause, dict):
+            continue
+        part = _filter_by_clause(gdf, clause)
+        if part is not None and not part.empty:
+            parts.append(part)
+    if not parts:
+        return gpd.GeoDataFrame(geometry=[], crs=gdf.crs)
+    out = gpd.GeoDataFrame(pd.concat(parts, ignore_index=False), crs=parts[0].crs)
+    out = out[~out.index.duplicated(keep="first")].copy()
     if "geometry" in out.columns:
         out = out[out["geometry"].notna()].copy()
     return out
@@ -194,7 +225,7 @@ def _get_city_poi_universe(place_name: str, city_slug: str, city_poi_dir: str) -
     _CITY_POI_UNIVERSE_CACHE[city_slug] = gdf
     return gdf
 
-def _download_poi_for_place(place_name: str, query_tags: TagsDict):
+def _download_poi_for_place(place_name: str, query_tags: TagClause):
     """Download POIs for one place with polygon fallback when place lookup fails."""
     try:
         return ox.features_from_place(place_name, query_tags)
@@ -227,7 +258,7 @@ def _load_cached_poi_if_nonempty(path: str):
 def get_poi(
     feature: str | None = None,
     value: TagValue | None = None,
-    tags: TagsDict | None = None,
+    tags: TagQuery | None = None,
 ):
     """Load POIs from local cache or download them from OSM.
 
@@ -301,7 +332,10 @@ def get_poi(
 
         try:
             if tags:
-                query_tags: TagsDict = tags
+                if not isinstance(tags, dict):
+                    # OR-queries are resolved from the city-universe dataset only.
+                    return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+                query_tags: TagClause = tags
             else:
                 query_tags = {feature_key: value_key}
             poi = _download_poi_for_place(place_name, query_tags)

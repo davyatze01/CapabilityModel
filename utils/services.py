@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import re
 from collections import OrderedDict
@@ -14,7 +15,7 @@ CONFIG_CSV_PATH = Path(__file__).resolve().parents[1] / "config" / "poi_types.cs
 class PoiQuery:
     service: str
     poi_type: str
-    tags: dict | None = None
+    tags: dict[str, Any] | list[dict[str, Any]] | None = None
     labels: tuple[str, ...] = ()
 
 
@@ -52,6 +53,68 @@ def _parse_json_cell(raw: str, row_num: int, column: str) -> Any:
         return json.loads(raw)
     except Exception as exc:
         raise _config_error(row_num, column, f"expected valid JSON, got {raw!r}") from exc
+
+
+def _normalize_tags_dict(tags: Any, row_num: int) -> dict[str, Any]:
+    """Normalize one tags-dict clause into validated key/value shapes.
+
+    Inputs:
+    - tags: parsed JSON value expected to be a dictionary.
+    - row_num: source CSV row number.
+
+    Outputs:
+    - normalized dict with string keys and values as bool/str/list[str].
+    """
+    if not isinstance(tags, dict) or not tags:
+        raise _config_error(row_num, "tags", "expected non-empty JSON object")
+    out: dict[str, Any] = {}
+    for key, value in tags.items():
+        key_s = str(key).strip()
+        if not key_s:
+            raise _config_error(row_num, "tags", f"invalid empty tag key: {key!r}")
+        if isinstance(value, list):
+            if not value:
+                raise _config_error(row_num, "tags", f"tag {key_s!r} has empty array")
+            vals: list[str] = []
+            for item in value:
+                item_s = str(item).strip()
+                if not item_s:
+                    raise _config_error(row_num, "tags", f"tag {key_s!r} has empty value in array")
+                vals.append(item_s)
+            out[key_s] = vals
+        elif isinstance(value, bool):
+            out[key_s] = value
+        else:
+            value_s = str(value).strip()
+            if not value_s:
+                raise _config_error(row_num, "tags", f"tag {key_s!r} has empty scalar value")
+            out[key_s] = value_s
+    return out
+
+
+def _normalize_tags_cell(tags_raw: Any, row_num: int) -> dict[str, Any] | list[dict[str, Any]]:
+    """Normalize tags payload supporting AND dict or OR list-of-dicts.
+
+    Inputs:
+    - tags_raw: parsed JSON from CSV `tags` column.
+    - row_num: source CSV row number.
+
+    Outputs:
+    - dict for one AND clause, or list[dict] for OR across clauses.
+    """
+    if isinstance(tags_raw, dict):
+        return _normalize_tags_dict(tags_raw, row_num)
+    if isinstance(tags_raw, list):
+        if not tags_raw:
+            raise _config_error(row_num, "tags", "expected non-empty JSON array of objects")
+        clauses: list[dict[str, Any]] = []
+        for i, clause in enumerate(tags_raw):
+            try:
+                clauses.append(_normalize_tags_dict(clause, row_num))
+            except ValueError as exc:
+                raise _config_error(row_num, "tags", f"invalid OR clause at index {i}: {exc}") from exc
+        return clauses
+    raise _config_error(row_num, "tags", f"expected JSON object or array of objects, got {type(tags_raw).__name__}")
 
 
 def _validate_required_columns(fieldnames: list[str] | None) -> None:
@@ -103,9 +166,8 @@ def _load_rows() -> list[dict[str, Any]]:
             except Exception as exc:
                 raise _config_error(idx, "decay_constant", f"expected float, got {row.get('decay_constant')!r}") from exc
 
-            tags = _parse_json_cell(row.get("tags") or "", idx, "tags")
-            if not isinstance(tags, dict):
-                raise _config_error(idx, "tags", f"expected JSON object, got {type(tags).__name__}")
+            tags_raw = _parse_json_cell(row.get("tags") or "", idx, "tags")
+            tags = _normalize_tags_cell(tags_raw, idx)
 
             labels_raw = (row.get("labels") or "").strip()
             if labels_raw:
@@ -236,7 +298,13 @@ def _build_runtime_structures(rows: list[dict[str, Any]]):
     for row in rows:
         poi_type = row["poi_type"]
         decay_constants[poi_type] = float(row["decay_constant"])
-        tags = dict(row["tags"])
+        tags_raw = row["tags"]
+        if isinstance(tags_raw, dict):
+            tags = dict(tags_raw)
+        elif isinstance(tags_raw, list):
+            tags = [dict(clause) for clause in tags_raw]
+        else:
+            raise _config_error(None, "tags", f"unexpected normalized tags type: {type(tags_raw).__name__}")
         labels = tuple(row.get("labels", (poi_type,)))
         services = row["services"]
         choquet_caps = row["choquet_capacity"]
@@ -386,6 +454,19 @@ def get_contribution_constant(poi_type: str, service: str | None = None) -> floa
     return first
 
 
+def _compute_config_signature() -> str:
+    """Compute deterministic signature for current POI config CSV bytes.
+
+    Inputs:
+    - none.
+
+    Outputs:
+    - SHA1 hex digest for `config/poi_types.csv`.
+    """
+    data = CONFIG_CSV_PATH.read_bytes()
+    return hashlib.sha1(data).hexdigest()
+
+
 _ROWS = _load_rows()
 (
     SERVICE_POI_QUERIES,
@@ -396,6 +477,7 @@ _ROWS = _load_rows()
 ) = _build_runtime_structures(_ROWS)
 SERVICE_KEYS = list(SERVICE_POI_QUERIES.keys())
 _bootstrap_compatibility_checks()
+POI_CONFIG_SIGNATURE = _compute_config_signature()
 
 
 def get_service_queries(service: str) -> list[PoiQuery]:
@@ -408,6 +490,18 @@ def get_service_queries(service: str) -> list[PoiQuery]:
     - list of `PoiQuery` definitions.
     """
     return SERVICE_POI_QUERIES[service]
+
+
+def config_signature() -> str:
+    """Return current POI configuration signature.
+
+    Inputs:
+    - none.
+
+    Outputs:
+    - SHA1 signature string of current CSV bytes.
+    """
+    return POI_CONFIG_SIGNATURE
 
 
 def get_service_poi_types() -> dict[str, list[str]]:
@@ -457,6 +551,22 @@ def unique_query_keys() -> list[PoiQuery]:
     return out
 
 
+def _freeze_json_like(value: Any) -> Any:
+    """Convert JSON-like values to hashable immutable structures.
+
+    Inputs:
+    - value: scalar, list, or dict parsed from JSON.
+
+    Outputs:
+    - hashable canonical representation preserving value semantics.
+    """
+    if isinstance(value, dict):
+        return tuple((str(k), _freeze_json_like(v)) for k, v in sorted(value.items(), key=lambda kv: str(kv[0])))
+    if isinstance(value, list):
+        return tuple(_freeze_json_like(v) for v in value)
+    return value
+
+
 def query_key(q: PoiQuery) -> tuple[str, tuple | None]:
     """Build hashable key for a POI query.
 
@@ -468,7 +578,7 @@ def query_key(q: PoiQuery) -> tuple[str, tuple | None]:
     """
     tags_key = None
     if q.tags:
-        tags_key = tuple(sorted(q.tags.items()))
+        tags_key = _freeze_json_like(q.tags)
     return (q.poi_type, tags_key)
 
 
@@ -552,8 +662,12 @@ def choquet_integral(x, service):
     - float aggregated service score.
     """
     n = len(x)
-    order = sorted(range(n), key=lambda i: x[i])
-    x_sorted = [x[i] for i in order]
+    if n == 0:
+        return 0.0
+    # Accessibility inputs are expected in [0, 1], but clamp defensively.
+    x_clamped = [max(0.0, min(1.0, float(v))) for v in x]
+    order = sorted(range(n), key=lambda i: x_clamped[i])
+    x_sorted = [x_clamped[i] for i in order]
     poi_types = [q.poi_type for q in SERVICE_POI_QUERIES[service]]
 
     total = 0.0
@@ -562,7 +676,13 @@ def choquet_integral(x, service):
         tail = [poi_types[i] for i in order[j:]]
         total += (x_sorted[j] - prev) * cap(tail, service)
         prev = x_sorted[j]
-    return total
+
+    # Normalize by measure of the full set so service scores are bounded in [0, 1].
+    mu_full = float(cap(poi_types, service))
+    if mu_full <= 0.0:
+        return 0.0
+    normalized = total / mu_full
+    return max(0.0, min(1.0, normalized))
 
 
 if __name__ == "__main__":
