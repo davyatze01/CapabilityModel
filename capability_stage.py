@@ -104,7 +104,7 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
     moved_output_paths = {}
     for capability_key, src_path in output_paths.items():
         basename = os.path.basename(src_path)
-        dst_path = os.path.join(experiments_dir, f"{ctx.config.city_slug}_{basename}")
+        dst_path = os.path.join(experiments_dir, f"{ctx.config.artifact_slug}_{basename}")
         dst_path = _ensure_unique_path(dst_path)
         shutil.move(src_path, dst_path)
         moved_output_paths[capability_key] = dst_path
@@ -112,6 +112,7 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
     recap_path = os.path.join(experiments_dir, "capability_experiments_recap.csv")
     recap_header = [
         "city_slug",
+        "artifact_slug",
         "avg_capability_restorativeness",
         "avg_capability_nutrition",
         "avg_capability_care",
@@ -121,6 +122,6 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
         writer = csv.writer(recap_f)
         if should_write_header:
             writer.writerow(recap_header)
-        writer.writerow([ctx.config.city_slug, avg_rest, avg_nut, avg_care])
+        writer.writerow([ctx.config.city_slug, ctx.config.artifact_slug, avg_rest, avg_nut, avg_care])
 
     return CapabilityStageResult(output_paths=moved_output_paths, rows_written=rows_written)

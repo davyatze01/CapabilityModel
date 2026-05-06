@@ -7,6 +7,7 @@ import json
 from typing import TypeAlias
 
 from config import PipelineConfig
+from utils.load_shapefile import graph_from_shapefile
 
 TagValue: TypeAlias = bool | str | list[str]
 TagsDict: TypeAlias = dict[str, TagValue]
@@ -63,21 +64,29 @@ def get_mode_graph(network_type):
     Outputs:
     - graph object for that mode, cached in memory.
     """
-    # Cache per-mode graphs on disk to avoid repeated Overpass downloads.
-    place_name, city_slug = _get_city_settings()
-    name_file = f"graph/{city_slug}_{network_type}.graphml"
+    cfg = PipelineConfig()
 
     if network_type in _MODE_GRAPH_CACHE:
-        return _MODE_GRAPH_CACHE[network_type]
-
+            return _MODE_GRAPH_CACHE[network_type]
+    
     graph = None
-    try:
-        graph = ox.io.load_graphml(name_file)
-    except Exception:
-        print(f"Grafo {network_type} non presente, scarico da OSM..")
-        graph = ox.graph_from_place(place_name, network_type=network_type)
-        ox.io.save_graphml(graph, filepath=name_file)
-        print("Grafo scaricato e salvato correttamente!")
+
+    if cfg.use_shapefile:
+        file_name,graph = graph_from_shapefile(cfg.name_shapefile,network_type=network_type)
+        ox.io.save_graphml(graph,filepath=f"graph/{file_name}_{network_type}.graphml")
+        _MODE_GRAPH_CACHE[network_type] = graph
+    else:
+        # Cache per-mode graphs on disk to avoid repeated Overpass downloads.
+        place_name, city_slug = _get_city_settings()
+        name_file = f"graph/{city_slug}_{network_type}.graphml"
+
+        try:
+            graph = ox.io.load_graphml(name_file)
+        except Exception:
+            print(f"Grafo {network_type} non presente, scarico da OSM..")
+            graph = ox.graph_from_place(place_name, network_type=network_type)
+            ox.io.save_graphml(graph, filepath=name_file)
+            print("Grafo scaricato e salvato correttamente!")
 
     _MODE_GRAPH_CACHE[network_type] = graph
     return graph

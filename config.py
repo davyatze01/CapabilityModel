@@ -19,10 +19,24 @@ def derive_city_slug(city_name: str) -> str:
     return slug
 
 
+def derive_artifact_slug(city_slug: str, use_shapefile: bool, shapefile_name: str) -> str:
+    """Build the artifact namespace slug for either city-wide or shapefile runs."""
+    if not use_shapefile:
+        return city_slug
+
+    shapefile_base = os.path.splitext(os.path.basename(shapefile_name))[0].strip()
+    if not shapefile_base:
+        return city_slug
+    return derive_city_slug(shapefile_base)
+
+
 @dataclass
 class PipelineConfig:
     city_name: str = field(default_factory=lambda: os.getenv("CAP_CITY_NAME", "Cagliari, Sardinia, Italy"))
     city_slug: str = field(init=False)
+    artifact_slug: str = field(init=False)
+    use_shapefile: bool = True
+    name_shapefile: str = "Cagliari_popolazione_abitazione.shp"
     worker_count: int | None = 12
     skip_routing: bool = True
     accessibility_chunksize: int = 100
@@ -78,7 +92,12 @@ class PipelineConfig:
 
     def __post_init__(self) -> None:
         self.city_slug = derive_city_slug(self.city_name)
-        city_artifacts = os.path.join(self.artifacts_root_dir, self.city_slug)
+        self.artifact_slug = derive_artifact_slug(
+            self.city_slug,
+            self.use_shapefile,
+            self.name_shapefile,
+        )
+        city_artifacts = os.path.join(self.artifacts_root_dir, self.artifact_slug)
         self.impedance_artifact_path = os.path.join(city_artifacts, "impedances.npz")
 
         self.poi_snap_cache_dir = os.path.join(city_artifacts, "snapping", "poi_snap_cache")

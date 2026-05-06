@@ -301,10 +301,14 @@ def plot_all_experiments(
     graph_dir: str | Path = "graph",
     experiments_dir: str | Path = "experiments",
     output_dir: str | Path = "plots/edge_interpolation",
+    csv_paths: list[str | Path] | None = None,
     graph_path: str | Path | None = None,
     k_meters: float = DEFAULT_K_METERS,
 ) -> list[Path]:
-    """Run the full workflow for every experiment CSV in the folder."""
+    """Run the full workflow for selected experiment CSVs.
+
+    When `csv_paths` is omitted, every CSV in `experiments_dir` is processed.
+    """
     graph_dir = Path(graph_dir)
     experiments_dir = Path(experiments_dir)
     output_dir = Path(output_dir)
@@ -313,8 +317,10 @@ def plot_all_experiments(
     selected_graph = Path(graph_path) if graph_path is not None else pick_graphml_file(graph_dir)
     graph = load_graph(selected_graph)
 
+    selected_csv_paths = [Path(path) for path in csv_paths] if csv_paths is not None else sorted(experiments_dir.glob("*.csv"))
+
     created_plots: list[Path] = []
-    for csv_path in sorted(experiments_dir.glob("*.csv")):
+    for csv_path in selected_csv_paths:
         try:
             plot_path = plot_experiment(graph, csv_path, output_dir, k_meters=k_meters)
         except ValueError:

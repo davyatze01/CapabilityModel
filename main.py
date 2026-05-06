@@ -1,5 +1,6 @@
 import shutup
 import io
+from pathlib import Path
 
 from config import PipelineConfig
 from context import build_context
@@ -11,7 +12,7 @@ from service_stage import run_service_stage
 from capability_stage import run_capability_stage
 from artifact_bundle import load_impedance_bundle, write_impedance_bundle
 from plot_shapefile import plot_all_experiments
-from generate_experiment_shapefiles import generate_shapefile_by_csv
+from generate_experiment_shapefiles import generate_combined_experiment_shapefile
 import faulthandler
 import sys
 import traceback
@@ -79,14 +80,19 @@ def main():
     for path in cap.output_paths.values():
         print(f"- {path}", flush=True)
 
-    # Create the plot for every experiment
-    generated_plots = plot_all_experiments(k_meters=10)
+    run_experiment_paths = list(cap.output_paths.values())
+
+    # Create one plot for each experiment generated during this run.
+    generated_plots = plot_all_experiments(csv_paths=run_experiment_paths, k_meters=10)
     for plot_path in generated_plots:
         print(plot_path)
 
-    # Generate shapefile for every experiment
-    for path in generate_shapefile_by_csv():
-        print(path)
+    # Generate one shapefile containing only the experiments from this run.
+    shapefile_path = generate_combined_experiment_shapefile(
+        run_experiment_paths,
+        output_path=Path("outputs") / "shapefiles" / cfg.artifact_slug / f"{cfg.artifact_slug}.shp",
+    )
+    print(shapefile_path)
 
 if __name__ == "__main__":
     try:
