@@ -7,7 +7,7 @@ import json
 from typing import TypeAlias
 
 from config import PipelineConfig
-from utils.load_shapefile import graph_from_shapefile
+from utils.load_shapefile import graph_from_shapefile, feature_from_shapefile
 
 TagValue: TypeAlias = bool | str | list[str]
 TagsDict: TypeAlias = dict[str, TagValue]
@@ -183,7 +183,12 @@ def _build_city_universe_tags() -> TagsDict:
 def _download_city_poi_universe(place_name: str, query_tags: TagsDict) -> gpd.GeoDataFrame:
     """Download one city-wide POI dataset that covers all configured tags."""
     print(f"[POI] OSMnx city-universe download: keys={len(query_tags)}")
-    return _download_poi_for_place(place_name, query_tags)
+    cfg = PipelineConfig()
+
+    if cfg.use_shapefile:
+        return feature_from_shapefile(cfg.name_shapefile, query_tags)
+    else:
+        return _download_poi_for_place(place_name, query_tags)
 
 def _values_match(series: pd.Series, value: TagValue) -> pd.Series:
     if value is True:
@@ -344,7 +349,12 @@ def get_poi(
                 query_tags: TagsDict = tags
             else:
                 query_tags = {feature_key: value_key}
-            poi = _download_poi_for_place(place_name, query_tags)
+            if cfg.use_shapefile:
+                print(f"[POI] Scarico POI da shapefile...")
+                poi = feature_from_shapefile(cfg.name_shapefile, query_tags=query_tags)
+            else:
+                print(f"[POI] Scarico POI da OSM per '{place_name}'...")
+                poi = _download_poi_for_place(place_name, query_tags)
         except Exception as e:
             # Nessun POI disponibile per questa query: ritorna GDF vuoto
             print(f"Nessun POI trovato per city={place_name} feature={feature} value={value} tags={tags}: {e}")

@@ -40,3 +40,23 @@ def graph_from_shapefile(
     )
 
     return shp_name,G
+
+
+def feature_from_shapefile(shp_name : str, query_tags: dict):
+    gdf = gpd.read_file(f"shapefile_base/{shp_name}")
+
+    if gdf.empty:
+        raise ValueError("Shapefile vuoto")
+    
+    if gdf.crs is None:
+        raise ValueError("CRS mancante")
+    
+    if gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(epsg=4326)
+
+    geometry: BaseGeometry = gdf.union_all()
+
+    if not isinstance(geometry, (Polygon, MultiPolygon)):
+        raise TypeError(f"Geometria non suppertata: {type(geometry)}")
+    
+    return ox.features_from_polygon(geometry, query_tags)
