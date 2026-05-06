@@ -17,9 +17,15 @@ _GRAPH_CACHE = None
 _MODE_GRAPH_CACHE = {}
 _CITY_POI_UNIVERSE_CACHE: dict[str, gpd.GeoDataFrame] = {}
 
+
 def _get_city_settings() -> tuple[str, str]:
     cfg = PipelineConfig()
     return cfg.city_name, cfg.city_slug
+
+
+def _get_runtime_settings() -> tuple[str, str, str]:
+    cfg = PipelineConfig()
+    return cfg.city_name, cfg.city_slug, cfg.artifact_slug
 
 
 def get_graph():
@@ -72,9 +78,30 @@ def get_mode_graph(network_type):
     graph = None
 
     if cfg.use_shapefile:
-        file_name,graph = graph_from_shapefile(cfg.name_shapefile,network_type=network_type)
-        ox.io.save_graphml(graph,filepath=f"graph/{file_name}_{network_type}.graphml")
-        _MODE_GRAPH_CACHE[network_type] = graph
+        graph_path = f"graph/{cfg.artifact_slug}_{network_type}.graphml"
+        try:
+            print(
+                f"[Graph] Carico grafo {network_type} da cache shapefile: "
+                f"{graph_path}",
+                flush=True,
+            )
+            graph = ox.io.load_graphml(graph_path)
+        except Exception:
+            print(
+                f"[Graph] Grafo {network_type} da shapefile non presente. "
+                f"Costruisco da '{cfg.name_shapefile}'...",
+                flush=True,
+            )
+            _, graph = graph_from_shapefile(
+                cfg.name_shapefile,
+                network_type=network_type,
+            )
+            ox.io.save_graphml(graph, filepath=graph_path)
+            print(
+                f"[Graph] Grafo {network_type} da shapefile salvato in "
+                f"{graph_path}",
+                flush=True,
+            )
     else:
         # Cache per-mode graphs on disk to avoid repeated Overpass downloads.
         place_name, city_slug = _get_city_settings()
@@ -115,9 +142,9 @@ def _feature_value_file_name(feature: str, value: TagValue) -> str:
     key_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()
     return f"fv_{key_hash}.geojson"
 
-def _city_poi_cache_dir(city_slug: str) -> str:
-    """Return city-scoped directory path for POI cache files."""
-    return os.path.join("poi", city_slug)
+def _city_poi_cache_dir(cache_slug: str) -> str:
+    """Return scenario-scoped directory path for POI cache files."""
+    return os.path.join("poi", cache_slug)
 
 def _all_tags_file_name(query_tags: TagsDict) -> str:
     payload = json.dumps(query_tags, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -179,8 +206,8 @@ def _filter_by_tags(gdf: gpd.GeoDataFrame, tags: TagsDict) -> gpd.GeoDataFrame:
         out = out[out["geometry"].notna()].copy()
     return out
 
-def _get_city_poi_universe(place_name: str, city_slug: str, city_poi_dir: str) -> gpd.GeoDataFrame:
-    cached = _CITY_POI_UNIVERSE_CACHE.get(city_slug)
+def _get_city_poi_universe(place_name: str, cache_slug: str, city_poi_dir: str) -> gpd.GeoDataFrame:
+    cached = _CITY_POI_UNIVERSE_CACHE.get(cache_slug)
     if cached is not None:
         return cached
 
@@ -200,7 +227,7 @@ def _get_city_poi_universe(place_name: str, city_slug: str, city_poi_dir: str) -
                 print(f"[POI] Failed to persist city-universe cache {path}: {exc}")
     if gdf is None:
         gdf = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-    _CITY_POI_UNIVERSE_CACHE[city_slug] = gdf
+    _CITY_POI_UNIVERSE_CACHE[cache_slug] = gdf
     return gdf
 
 def _download_poi_for_place(place_name: str, query_tags: TagsDict):
@@ -248,11 +275,15 @@ def get_poi(
     - GeoDataFrame: POI features matching requested filters.
     """
 
+    cfg = PipelineConfig()
+
     # Nomi file
-    place_name, city_slug = _get_city_settings()
+    place_name = cfg.city_name
+    city_slug = cfg.city_slug
+    poi_cache_slug = cfg.artifact_slug if cfg.use_shapefile else city_slug
 
     os.makedirs("poi", exist_ok=True)
-    city_poi_dir = _city_poi_cache_dir(city_slug)
+    city_poi_dir = _city_poi_cache_dir(poi_cache_slug)
     os.makedirs(city_poi_dir, exist_ok=True)
 
     if (feature is None or value is None) and not tags:
@@ -292,7 +323,7 @@ def get_poi(
     if poi is None:
         if tags:
             try:
-                universe = _get_city_poi_universe(place_name, city_slug, city_poi_dir)
+                universe = _get_city_poi_universe(place_name, poi_cache_slug, city_poi_dir)
                 if universe is not None and not universe.empty:
                     poi = _filter_by_tags(universe, tags)
                     if poi is not None and not poi.empty:
@@ -427,4 +458,3 @@ def get_poi_amenity_types(poi):
     if "amenity" not in poi.columns:
         return []
     return sorted(poi["amenity"].dropna().astype(str).unique().tolist())
-
