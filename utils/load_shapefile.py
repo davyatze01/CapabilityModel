@@ -72,6 +72,10 @@ def feature_from_shapefile(shp_name : str, query_tags: dict):
     
 
 def poi_from_shp(query_tags: dict):
+    import csv
+    import json
+    from pathlib import Path
+
     paths = [
         "pois_shp/poi_points.shp",
         "pois_shp/poi_lines.shp",
@@ -98,18 +102,45 @@ def poi_from_shp(query_tags: dict):
         crs=frames[0].crs,
     )
 
-    mask = pd.Series(True, index=pois.index)
+    if "type" not in pois.columns:
+        return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
 
-    for key, value in query_tags.items():
-        if key not in pois.columns:
-            return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
+    poi_types = set()
+    config_csv_path = "config/poi_types.csv"
 
-        if value is True:
-            mask = mask & pois[key].notna()
-        elif isinstance(value, list):
-            mask = mask & pois[key].astype(str).isin([str(v) for v in value])
-        else:
-            mask = mask & (pois[key].astype(str) == str(value))
+    with config_csv_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
 
+        for row in reader:
+            poi_type = (row.get("poi_type") or "").strip()
+            tags_raw = row.get("tags") or ""
+
+            if not poi_type or not tags_raw:
+                continue
+
+            tags = json.loads(tags_raw)
+            matches = True
+            for key, value in tags.items():
+                if key not in query_tags:
+                    matches = False
+                    break
+
+                query_value = query_tags[key]
+                if query_value is True:
+                    continue
+                if isinstance(query_value, list):
+                    if str(value) not in {str(v) for v in query_value}:
+                        matches = False
+                        break
+                elif str(query_value) != str(value):
+                    matches = False
+                    break
+
+            if matches:
+                poi_types.add(poi_type)
+
+    if not poi_types:
+        return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
+
+    mask = pois["type"].astype(str).isin(poi_types)
     return pois.loc[mask].copy()
-
