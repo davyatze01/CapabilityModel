@@ -103,10 +103,13 @@ def poi_from_shp(query_tags: dict):
         crs=frames[0].crs,
     )
 
+
     if "poi_type" not in pois.columns:
         return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
 
-    poi_types = set()
+    query_poi_types = set()
+    csv_poi_types = set()
+
     config_csv_path = Path(__file__).resolve().parents[1] / "config" / "poi_types.csv"
 
     with config_csv_path.open("r", newline="", encoding="utf-8") as f:
@@ -116,7 +119,12 @@ def poi_from_shp(query_tags: dict):
             poi_type = (row.get("poi_type") or "").strip()
             tags_raw = row.get("tags") or ""
 
-            if not poi_type or not tags_raw:
+            if not poi_type:
+                continue
+
+            csv_poi_types.add(poi_type)
+
+            if not tags_raw:
                 continue
 
             tags = json.loads(tags_raw)
@@ -138,10 +146,24 @@ def poi_from_shp(query_tags: dict):
                     break
 
             if matches:
-                poi_types.add(poi_type)
+                query_poi_types.add(poi_type)
 
-    if not poi_types:
+    shp_poi_types = set(
+        pois["poi_type"]
+        .dropna()
+        .astype(str)
+        .unique()
+    )
+
+    missing_poi_types = shp_poi_types - csv_poi_types
+    if missing_poi_types:
+        raise ValueError(
+            "poi_type presenti negli shapefile ma assenti in config/poi_types.csv: "
+            + ", ".join(sorted(missing_poi_types))
+        )
+
+    if not query_poi_types:
         return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
 
-    mask = pois["poi_type"].astype(str).isin(poi_types)
+    mask = pois["poi_type"].astype(str).isin(query_poi_types)
     return pois.loc[mask].copy()
