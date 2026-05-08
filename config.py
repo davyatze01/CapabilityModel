@@ -36,7 +36,7 @@ class PipelineConfig:
     city_slug: str = field(init=False)
     artifact_slug: str = field(init=False)
     use_shapefile: bool = True
-    name_shapefile: str = "Cagliari_popolazione_abitazione.shp"
+    name_shapefile: str = "Cagliari Shapefile.shp"
     poi_from_shp: bool = True
     worker_count: int | None = 12
     skip_routing: bool = True
