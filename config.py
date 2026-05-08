@@ -39,7 +39,7 @@ class PipelineConfig:
     name_shapefile: str = "Cagliari Shapefile.shp"
     poi_from_shp: bool = True
     worker_count: int | None = 12
-    skip_routing: bool = True
+    skip_routing: bool = False
     accessibility_chunksize: int = 100
     accessibility_deduplicate_entries: bool = True
     artifacts_root_dir: str = "artifacts"

@@ -103,7 +103,7 @@ def poi_from_shp(query_tags: dict):
         crs=frames[0].crs,
     )
 
-    if "type" not in pois.columns:
+    if "poi_type" not in pois.columns:
         return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
 
     poi_types = set()
@@ -143,5 +143,5 @@ def poi_from_shp(query_tags: dict):
     if not poi_types:
         return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
 
-    mask = pois["type"].astype(str).isin(poi_types)
+    mask = pois["poi_type"].astype(str).isin(poi_types)
     return pois.loc[mask].copy()

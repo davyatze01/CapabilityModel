@@ -330,7 +330,7 @@ def get_poi(
     # Provo a caricare i POI gia salvati.
     poi = _load_cached_poi_if_nonempty(NAME_FILE)
     if poi is None:
-        if tags:
+        if tags and not cfg.poi_from_shp:
             try:
                 universe = _get_city_poi_universe(place_name, poi_cache_slug, city_poi_dir)
                 if universe is not None and not universe.empty:
@@ -345,8 +345,8 @@ def get_poi(
             print(f"[POI] No matches after city-universe filtering for tags={tags}. Skipping per-query OSMnx fallback.")
             return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
-        # Scarico POI da OSM
-        print(f"Scarico POI da OSM per '{place_name}'...")
+        # Scarico POI
+        print(f"Scarico POI per '{place_name}'...")
 
         try:
             if tags:
