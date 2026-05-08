@@ -6,6 +6,8 @@ import hashlib
 import json
 from typing import TypeAlias
 
+from utils.load_shapefile import poi_from_shp
+
 from config import PipelineConfig
 from utils.load_shapefile import graph_from_shapefile, feature_from_shapefile
 
@@ -187,6 +189,8 @@ def _download_city_poi_universe(place_name: str, query_tags: TagsDict) -> gpd.Ge
 
     if cfg.use_shapefile:
         return feature_from_shapefile(cfg.name_shapefile, query_tags)
+    elif cfg.poi_from_shp:
+        return poi_from_shp(query_tags=query_tags)
     else:
         return _download_poi_for_place(place_name, query_tags)
 

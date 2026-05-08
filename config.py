@@ -37,6 +37,7 @@ class PipelineConfig:
     artifact_slug: str = field(init=False)
     use_shapefile: bool = True
     name_shapefile: str = "Cagliari_popolazione_abitazione.shp"
+    poi_from_shp: bool = True
     worker_count: int | None = 12
     skip_routing: bool = True
     accessibility_chunksize: int = 100
@@ -99,7 +100,6 @@ class PipelineConfig:
         )
         city_artifacts = os.path.join(self.artifacts_root_dir, self.artifact_slug)
         self.impedance_artifact_path = os.path.join(city_artifacts, "impedances.npz")
-
         self.poi_snap_cache_dir = os.path.join(city_artifacts, "snapping", "poi_snap_cache")
         self.non_bus_cache_dir = os.path.join(city_artifacts, "non_bus")
         self.walkability_cache_dir = os.path.join(city_artifacts, "walkability")
