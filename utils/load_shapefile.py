@@ -68,6 +68,7 @@ def feature_from_shapefile(shp_name : str, query_tags: dict):
         # Caricamento poi da shapefile
         return poi_from_shp(query_tags)
     else:
+        print(f"[POI] OSMnx city-universe download: keys={len(query_tags)}")
         return ox.features_from_polygon(geometry, query_tags)
     
 
@@ -106,7 +107,7 @@ def poi_from_shp(query_tags: dict):
         return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
 
     poi_types = set()
-    config_csv_path = "config/poi_types.csv"
+    config_csv_path = Path(__file__).resolve().parents[1] / "config" / "poi_types.csv"
 
     with config_csv_path.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)

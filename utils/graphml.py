@@ -184,7 +184,6 @@ def _build_city_universe_tags() -> TagsDict:
 
 def _download_city_poi_universe(place_name: str, query_tags: TagsDict) -> gpd.GeoDataFrame:
     """Download one city-wide POI dataset that covers all configured tags."""
-    print(f"[POI] OSMnx city-universe download: keys={len(query_tags)}")
     cfg = PipelineConfig()
 
     if cfg.use_shapefile:
@@ -192,6 +191,7 @@ def _download_city_poi_universe(place_name: str, query_tags: TagsDict) -> gpd.Ge
     elif cfg.poi_from_shp:
         return poi_from_shp(query_tags=query_tags)
     else:
+        print(f"[POI] OSMnx city-universe download: keys={len(query_tags)}")
         return _download_poi_for_place(place_name, query_tags)
 
 def _values_match(series: pd.Series, value: TagValue) -> pd.Series:
