@@ -27,6 +27,17 @@ CAP_CARE_IDX = {
     "care_services": 5,
 }
 
+# 
+
+# servizi
+sport_and_movement,poi_type,choquet_capacity
+[amenity_supermarket,]....[]
+
+
+restorativeness,False,[servizi...],[singleton servizi]
+[sport_and_movement,...] [1.0,...]
+
+
 CAP_SINGLETON_M = {
     "restorativeness": {
         "sport_and_movement": 1.0,     # direct restorative mechanism (activity, stress relief)
