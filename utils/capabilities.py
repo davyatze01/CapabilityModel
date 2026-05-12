@@ -1,5 +1,7 @@
 import os
 from collections import Counter, OrderedDict
+from pathlib import Path
+
 import geopandas as gpd
 import pandas as pd
 import osmnx as ox
@@ -133,4 +135,5 @@ for capability,services in CAPABILITY_SERVICES.items():
 
 df = pd.DataFrame(rows)
 
-df.to_csv("capability_new.csv", index=False)
+output_path = Path(__file__).resolve().parents[1] / "config" / "capability.csv"
+df.to_csv(output_path, index=False)

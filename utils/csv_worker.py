@@ -1,10 +1,13 @@
-import pandas as pd
 import ast
 from collections import defaultdict
+from pathlib import Path
 
-df = pd.read_csv(f"config/poi_types.csv")
+import pandas as pd
 
-df_services = pd.read_csv("service_new.csv")
+config_dir = Path(__file__).resolve().parents[1] / "config"
+df = pd.read_csv(config_dir / "poi_types.csv")
+
+df_services = pd.read_csv(config_dir / "services.csv")
 
 target_services = df_services["service"]
 
@@ -39,4 +42,4 @@ for service, data in service_map.items():
 
 result_df = pd.DataFrame(rows)
 
-result_df.to_csv("services_new2.csv", index=False)
+result_df.to_csv(config_dir / "services.csv", index=False)

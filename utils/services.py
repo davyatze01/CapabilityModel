@@ -1,3 +1,4 @@
+import ast
 import csv
 import json
 from collections import OrderedDict
@@ -7,6 +8,7 @@ from typing import Any
 
 
 CONFIG_CSV_PATH = Path(__file__).resolve().parents[1] / "config" / "poi_types.csv"
+SERVICES_CSV_PATH = Path(__file__).resolve().parents[1] / "config" / "services.csv"
 
 
 @dataclass(frozen=True)
@@ -35,6 +37,15 @@ def _config_error(row_num: int | None, column: str | None, message: str) -> Valu
     return ValueError(f"Invalid POI config CSV ({where}): {message}")
 
 
+def _service_config_error(row_num: int | None, column: str | None, message: str) -> ValueError:
+    where = f"path={SERVICES_CSV_PATH}"
+    if row_num is not None:
+        where += f" row={row_num}"
+    if column is not None:
+        where += f" column={column}"
+    return ValueError(f"Invalid services CSV ({where}): {message}")
+
+
 def _parse_json_cell(raw: str, row_num: int, column: str) -> Any:
     """Parse JSON from a CSV cell and raise contextual errors.
 
@@ -61,12 +72,62 @@ def _validate_required_columns(fieldnames: list[str] | None) -> None:
     Outputs:
     - None. Raises ValueError if required columns are missing.
     """
-    required = ["poi_type", "decay_constant", "choquet_capacity", "contribution_constant", "tags", "services"]
+    required = ["poi_type", "decay_constant", "tags", "services"]
     if fieldnames is None:
         raise _config_error(None, None, f"missing header row, expected columns {required}")
     missing = [c for c in required if c not in fieldnames]
     if missing:
         raise _config_error(None, None, f"missing required columns {missing}; found {fieldnames}")
+
+
+def _parse_list_cell(raw: str, row_num: int, column: str) -> list[Any]:
+    try:
+        value = ast.literal_eval(raw)
+    except Exception as exc:
+        raise _service_config_error(row_num, column, f"expected list, got {raw!r}") from exc
+    if not isinstance(value, list):
+        raise _service_config_error(row_num, column, f"expected list, got {type(value).__name__}")
+    return value
+
+
+def _load_service_weights() -> dict[str, dict[str, list[Any]]]:
+    if not SERVICES_CSV_PATH.is_file():
+        raise _service_config_error(None, None, f"file not found: {SERVICES_CSV_PATH}")
+
+    service_map: dict[str, dict[str, list[Any]]] = {}
+    with SERVICES_CSV_PATH.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise _service_config_error(None, None, "missing header row")
+        for idx, row in enumerate(reader, start=2):
+            service = (row.get("service") or "").strip()
+            if not service:
+                raise _service_config_error(idx, "service", "expected non-empty string")
+
+            poi_types = _parse_list_cell(row.get("poi_types") or "", idx, "poi_types")
+            choquet_capacity = _parse_list_cell(row.get("choquet_capacity") or "", idx, "choquet_capacity")
+            contribution_constant = _parse_list_cell(row.get("contribution_constant") or "", idx, "contribution_constant")
+
+            if len(poi_types) != len(choquet_capacity):
+                raise _service_config_error(
+                    idx,
+                    "choquet_capacity",
+                    f"length mismatch: len(poi_types)={len(poi_types)} len(choquet_capacity)={len(choquet_capacity)}",
+                )
+            if len(poi_types) != len(contribution_constant):
+                raise _service_config_error(
+                    idx,
+                    "contribution_constant",
+                    f"length mismatch: len(poi_types)={len(poi_types)} len(contribution_constant)={len(contribution_constant)}",
+                )
+
+            service_map[service] = {
+                "poi_types": poi_types,
+                "choquet_capacity": [float(v) for v in choquet_capacity],
+                "contribution_constant": [float(v) for v in contribution_constant],
+            }
+
+    return service_map
 
 
 def _load_rows() -> list[dict[str, Any]]:
@@ -83,6 +144,7 @@ def _load_rows() -> list[dict[str, Any]]:
 
     parsed_rows: list[dict[str, Any]] = []
     seen_poi_types: set[str] = set()
+    service_weights = _load_service_weights()
 
     with CONFIG_CSV_PATH.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -117,45 +179,22 @@ def _load_rows() -> list[dict[str, Any]]:
                 if not s.isidentifier():
                     raise _config_error(idx, "services", f"service name must be a valid identifier, got {s!r}")
 
-            choquet_capacity = _parse_json_cell(row.get("choquet_capacity") or "", idx, "choquet_capacity")
-            if not isinstance(choquet_capacity, list) or not choquet_capacity:
-                raise _config_error(idx, "choquet_capacity", "expected non-empty JSON array of numbers")
-            if len(choquet_capacity) != len(services):
-                raise _config_error(
-                    idx,
-                    "choquet_capacity",
-                    f"length mismatch: len(services)={len(services)} len(choquet_capacity)={len(choquet_capacity)}",
-                )
             choquet_capacity_floats: list[float] = []
-            for j, value in enumerate(choquet_capacity):
-                try:
-                    choquet_capacity_floats.append(float(value))
-                except Exception as exc:
-                    raise _config_error(
-                        idx,
-                        "choquet_capacity",
-                        f"entry {j} expected number, got {value!r}",
-                    ) from exc
-
-            contribution_constant = _parse_json_cell(row.get("contribution_constant") or "", idx, "contribution_constant")
-            if not isinstance(contribution_constant, list) or not contribution_constant:
-                raise _config_error(idx, "contribution_constant", "expected non-empty JSON array of numbers")
-            if len(contribution_constant) != len(services):
-                raise _config_error(
-                    idx,
-                    "contribution_constant",
-                    f"length mismatch: len(services)={len(services)} len(contribution_constant)={len(contribution_constant)}",
-                )
             contribution_constant_floats: list[float] = []
-            for j, value in enumerate(contribution_constant):
-                try:
-                    contribution_constant_floats.append(float(value))
-                except Exception as exc:
+            for service in services:
+                weights = service_weights.get(service)
+                if weights is None:
+                    raise _config_error(idx, "services", f"service {service!r} not found in services.csv")
+                poi_types = weights["poi_types"]
+                if poi_type not in poi_types:
                     raise _config_error(
                         idx,
-                        "contribution_constant",
-                        f"entry {j} expected number, got {value!r}",
-                    ) from exc
+                        "services",
+                        f"poi_type {poi_type!r} not listed for service {service!r} in services.csv",
+                    )
+                index = poi_types.index(poi_type)
+                choquet_capacity_floats.append(float(weights["choquet_capacity"][index]))
+                contribution_constant_floats.append(float(weights["contribution_constant"][index]))
 
             parsed_rows.append(
                 {
