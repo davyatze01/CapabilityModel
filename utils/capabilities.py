@@ -30,12 +30,12 @@ CAP_CARE_IDX = {
 # 
 
 # servizi
-sport_and_movement,poi_type,choquet_capacity
+""" sport_and_movement,poi_type,choquet_capacity
 [amenity_supermarket,]....[]
 
 
 restorativeness,False,[servizi...],[singleton servizi]
-[sport_and_movement,...] [1.0,...]
+[sport_and_movement,...] [1.0,...] """
 
 
 CAP_SINGLETON_M = {
@@ -112,3 +112,25 @@ CAPABILITY_SERVICES = {
     "nutrition": list(CAP_NUTRITION_IDX.keys()),
     "care": list(CAP_CARE_IDX.keys()),
 }
+
+
+rows = []
+
+for capability,services in CAPABILITY_SERVICES.items():
+    singleton_values = [
+        CAP_SINGLETON_M[capability][service]
+        for service in services
+    ]
+
+
+    rows.append({
+        "capability": capability,
+        "services":services,
+        "choquet_singleton": singleton_values,
+        "enabled": True
+    })
+
+
+df = pd.DataFrame(rows)
+
+df.to_csv("capability_new.csv", index=False)
