@@ -25,6 +25,7 @@ def _service_run_signature(ctx: PipelineContext) -> str:
 
     payload = {
         "schema": int(ctx.config.service_matrix_schema_version),
+        "aggregation_version": "v2_normalized_service_choquet",
         "access_signature": access_sig,
         "services": list(serv.SERVICE_KEYS),
         "poi_csv_path": str(serv.CONFIG_CSV_PATH),

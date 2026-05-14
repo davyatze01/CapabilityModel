@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from pipeline_types import BusRoutingStageResult, NonBusRoutingStageResult, PipelineContext
+from utils import services as serv
 
 
 ARTIFACT_SCHEMA_VERSION = 1
@@ -22,6 +23,7 @@ def _required_keys() -> set[str]:
         "routing_departure_iso",
         "origins_sig",
         "destinations_sig",
+        "poi_config_signature",
     }
 
 
@@ -81,6 +83,11 @@ def load_impedance_bundle(
         with np.load(path, allow_pickle=True) as z:
             data = {k: z[k] for k in z.files}
         _validate_shape_only(ctx, data)
+
+        # Compare against a precomputed hash of config/poi_types.csv bytes.
+        artifact_poi_sig = str(np.array(data["poi_config_signature"]).item())
+        if artifact_poi_sig != serv.config_signature():
+            raise ValueError("POI configuration signature mismatch")
     except Exception as exc:
         print(
             "[Artifact] Existing impedance artifact is missing/invalid; "
@@ -209,4 +216,5 @@ def write_impedance_bundle(
         routing_departure_iso=np.array(bus.routing_departure_iso, dtype=object),
         origins_sig=np.array(bus.origins_sig, dtype=object),
         destinations_sig=np.array(bus.destinations_sig, dtype=object),
+        poi_config_signature=np.array(serv.config_signature(), dtype=object),
     )
