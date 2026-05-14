@@ -54,10 +54,10 @@ def get_graph():
     try:
         graph = ox.io.load_graphml(name_file)
     except Exception:
-        print(f"Grafo non presente, scarico il grafo di {place_name}..")
+        print(f"[Graph] Cached graph not found. Downloading graph for {place_name}...", flush=True)
         graph = ox.graph_from_place(place_name)
         ox.io.save_graphml(graph, filepath=name_file)
-        print("Grafo scaricato e salvato correttamente!")
+        print(f"[Graph] Graph downloaded and saved: {name_file}", flush=True)
 
     _GRAPH_CACHE = graph
     return graph
@@ -83,15 +83,15 @@ def get_mode_graph(network_type):
         graph_path = f"graph/{cfg.artifact_slug}_{network_type}.graphml"
         try:
             print(
-                f"[Graph] Carico grafo {network_type} da cache shapefile: "
+                f"[Graph] Loading {network_type} graph from shapefile cache: "
                 f"{graph_path}",
                 flush=True,
             )
             graph = ox.io.load_graphml(graph_path)
         except Exception:
             print(
-                f"[Graph] Grafo {network_type} da shapefile non presente. "
-                f"Costruisco da '{cfg.name_shapefile}'...",
+                f"[Graph] Cached shapefile graph not found for mode '{network_type}'. "
+                f"Building from '{cfg.name_shapefile}'...",
                 flush=True,
             )
             _, graph = graph_from_shapefile(
@@ -100,7 +100,7 @@ def get_mode_graph(network_type):
             )
             ox.io.save_graphml(graph, filepath=graph_path)
             print(
-                f"[Graph] Grafo {network_type} da shapefile salvato in "
+                f"[Graph] Shapefile graph for mode '{network_type}' saved to "
                 f"{graph_path}",
                 flush=True,
             )
@@ -112,10 +112,10 @@ def get_mode_graph(network_type):
         try:
             graph = ox.io.load_graphml(name_file)
         except Exception:
-            print(f"Grafo {network_type} non presente, scarico da OSM..")
+            print(f"[Graph] Cached graph not found for mode '{network_type}'. Downloading from OSM...", flush=True)
             graph = ox.graph_from_place(place_name, network_type=network_type)
             ox.io.save_graphml(graph, filepath=name_file)
-            print("Grafo scaricato e salvato correttamente!")
+            print(f"[Graph] Graph downloaded and saved: {name_file}", flush=True)
 
     _MODE_GRAPH_CACHE[network_type] = graph
     return graph
@@ -245,7 +245,7 @@ def _download_poi_for_place(place_name: str, query_tags: TagsDict):
         return ox.features_from_place(place_name, query_tags)
     except Exception as place_exc:
         print(
-            f"features_from_place failed for '{place_name}' ({place_exc}); "
+            f"[POI] features_from_place failed for '{place_name}' ({place_exc}); "
             "retrying with geocoded polygon..."
         )
         place_gdf = ox.geocode_to_gdf(place_name)
@@ -316,7 +316,7 @@ def get_poi(
                 )
                 return poi
 
-        # Fallback: scarica tutti gli amenity se non ci sono file locali
+        # Fallback: download all amenities when no local cache is available.
         feature = "amenity"
         value = True
 
@@ -345,8 +345,7 @@ def get_poi(
             print(f"[POI] No matches after city-universe filtering for tags={tags}. Skipping per-query OSMnx fallback.")
             return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
-        # Scarico POI
-        print(f"Scarico POI per '{place_name}'...")
+        print(f"[POI] Downloading POIs for '{place_name}'...", flush=True)
 
         try:
             if tags:
@@ -354,14 +353,16 @@ def get_poi(
             else:
                 query_tags = {feature_key: value_key}
             if cfg.use_shapefile:
-                print(f"[POI] Scarico POI da shapefile...")
+                print("[POI] Loading POIs from shapefile source...", flush=True)
                 poi = feature_from_shapefile(cfg.name_shapefile, query_tags=query_tags)
             else:
-                print(f"[POI] Scarico POI da OSM per '{place_name}'...")
+                print(f"[POI] Downloading POIs from OSM for '{place_name}'...", flush=True)
                 poi = _download_poi_for_place(place_name, query_tags)
         except Exception as e:
-            # Nessun POI disponibile per questa query: ritorna GDF vuoto
-            print(f"Nessun POI trovato per city={place_name} feature={feature} value={value} tags={tags}: {e}")
+            print(
+                f"[POI] No POIs found for city={place_name}, feature={feature}, value={value}, tags={tags}: {e}",
+                flush=True,
+            )
             return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
         if poi.empty:
@@ -382,9 +383,8 @@ def get_poi(
             print(f"POI download has no usable geometry. Cache not persisted for {NAME_FILE}")
             return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
-        # Salvo tutti i POI
         poi.to_file(NAME_FILE, driver="GeoJSON")
-        print(f"POI scaricati e salvati correttamente! count={len(poi)} file={NAME_FILE}")
+        print(f"[POI] POIs downloaded and cached. count={len(poi)} file={NAME_FILE}", flush=True)
 
     return poi
 
@@ -408,7 +408,7 @@ def print_poi(poi, print_start, print_end):
     subset = poi.iloc[print_start:print_end]
 
     for i, row in subset.iterrows():
-        print(f"{i+1}: {row.get('name', 'Senza nome')}")
+        print(f"{i+1}: {row.get('name', 'Unnamed')}")
 
 
 def get_poi_names(poi):

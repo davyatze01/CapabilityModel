@@ -206,6 +206,17 @@ def run_city(city_name: str) -> int:
 
     saw_completion_marker = False
     completion_seen_at = 0.0
+    visible_prefixes = (
+        "[Stage]",
+        "[Artifact]",
+        "[Output]",
+        "[Bus]",
+        "[Non-bus]",
+        "[Plot]",
+        "[POI]",
+        "[Graph]",
+        "[Walkability",
+    )
 
     while True:
         now = time.time()
@@ -226,8 +237,10 @@ def run_city(city_name: str) -> int:
             line = None
 
         if line:
-            print(line, end="", flush=True)
-            if "Wrote results to:" in line:
+            stripped = line.strip()
+            if stripped.startswith(visible_prefixes) or stripped.startswith("Traceback"):
+                print(line, end="", flush=True)
+            if "[Output] Capability CSV files:" in line:
                 saw_completion_marker = True
                 completion_seen_at = now
         elif line == "":

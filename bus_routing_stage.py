@@ -308,7 +308,7 @@ def _write_dummy_destination_csv(path: str) -> None:
 
 
 def _run_r5r_script(script_path: str, ctx: PipelineContext) -> None:
-    """Run the external R routing script and stream its logs.
+    """Run the external R routing script and keep shell output concise.
 
     Inputs:
     - script_path: path to the R script entrypoint.
@@ -353,11 +353,17 @@ def _run_r5r_script(script_path: str, ctx: PipelineContext) -> None:
 
     try:
         assert proc.stdout is not None
+        captured_lines: list[str] = []
         for line in proc.stdout:
-            print(line, end="", flush=True)
+            captured_lines.append(line.rstrip("\n"))
+            if len(captured_lines) > 50:
+                captured_lines.pop(0)
         return_code = proc.wait()
         if return_code != 0:
-            raise subprocess.CalledProcessError(return_code, [rscript_exe, script_path])
+            tail = "\n".join(captured_lines[-20:])
+            raise RuntimeError(
+                f"Rscript failed with exit code {return_code}. Last output lines:\n{tail}"
+            )
     except KeyboardInterrupt:
         # Forward interruption to child so Ctrl+C actually stops Rscript.
         if proc.poll() is None:
@@ -658,7 +664,7 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
         )
         build_bus_impedance_cache(ctx, force_rebuild=False)
 
-        print(f"Skipping routing build. Reusing cache: {routing_cache}")
+        print(f"[Bus] Skipping routing build; reusing cache: {routing_cache}", flush=True)
 
         return BusRoutingStageResult(
             routing_csv=routing_csv,

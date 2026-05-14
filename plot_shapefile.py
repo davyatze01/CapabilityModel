@@ -335,5 +335,4 @@ def plot_all_experiments(
 if __name__ == "__main__":
     # Script entry point so the file can be launched directly with Python.
     generated_plots = plot_all_experiments()
-    for plot_path in generated_plots:
-        print(plot_path)
+    print(f"[Plot] Generated plots: {len(generated_plots)}")

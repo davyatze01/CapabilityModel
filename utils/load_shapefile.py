@@ -16,10 +16,10 @@ def graph_from_shapefile(
     gdf = gpd.read_file(f"shapefile_base/{shp_name}")
 
     if gdf.empty:
-        raise ValueError("Shapefile vuoto")
+        raise ValueError("Shapefile is empty")
 
     if gdf.crs is None:
-        raise ValueError("CRS mancante")
+        raise ValueError("Missing CRS")
 
     # Conversione a WGS84 richiesta da osmnx
     if gdf.crs.to_epsg() != 4326:
@@ -33,9 +33,7 @@ def graph_from_shapefile(
         polygon = cast(Polygon | MultiPolygon, geometry)
 
     else:
-        raise TypeError(
-            f"Geometria non supportata: {type(geometry)}"
-        )
+        raise TypeError(f"Unsupported geometry type: {type(geometry)}")
 
     G = ox.graph_from_polygon(
         polygon,
@@ -51,10 +49,10 @@ def feature_from_shapefile(shp_name : str, query_tags: dict):
     gdf = gpd.read_file(f"shapefile_base/{shp_name}")
 
     if gdf.empty:
-        raise ValueError("Shapefile vuoto")
+        raise ValueError("Shapefile is empty")
     
     if gdf.crs is None:
-        raise ValueError("CRS mancante")
+        raise ValueError("Missing CRS")
     
     if gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs(epsg=4326)
@@ -62,7 +60,7 @@ def feature_from_shapefile(shp_name : str, query_tags: dict):
     geometry: BaseGeometry = gdf.union_all()
 
     if not isinstance(geometry, (Polygon, MultiPolygon)):
-        raise TypeError(f"Geometria non suppertata: {type(geometry)}")
+        raise TypeError(f"Unsupported geometry type: {type(geometry)}")
     
     if cfg.poi_from_shp:
         # Caricamento poi da shapefile
@@ -158,7 +156,7 @@ def poi_from_shp(query_tags: dict):
     missing_poi_types = shp_poi_types - csv_poi_types
     if missing_poi_types:
         raise ValueError(
-            "poi_type presenti negli shapefile ma assenti in config/poi_types.csv: "
+            "poi_type values found in shapefiles but missing from config/poi_types.csv: "
             + ", ".join(sorted(missing_poi_types))
         )
 

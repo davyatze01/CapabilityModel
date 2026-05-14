@@ -334,7 +334,8 @@ def get_path_walkability_score(cfg, G, path_nodes, force_rebuild=False, schema_v
     return float(score)
 
 if __name__ == '__main__':
-    print(predict_walkability_from_image())
+    score = predict_walkability_from_image()
+    print(f"[Walkability] Predicted score: {score}")
 
 
 

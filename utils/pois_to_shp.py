@@ -51,4 +51,4 @@ lines.to_file("pois_shp/poi_lines.shp")
 
 polygons.to_file("pois_shp/poi_polygons.shp")
 
-print("Export completato")
+print("[POI] Shapefile export completed")

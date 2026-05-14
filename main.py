@@ -76,23 +76,24 @@ def main():
     cap = run_capability_stage(ctx, svc)
 
     # The results are written as csv in the outputs folder, one for each capability
-    print("Wrote results to:", flush=True)
-    for path in cap.output_paths.values():
-        print(f"- {path}", flush=True)
+    print(
+        "[Output] Capability CSV files: "
+        + ", ".join(str(path) for path in cap.output_paths.values()),
+        flush=True,
+    )
 
     run_experiment_paths = list(cap.output_paths.values())
 
     # Create one plot for each experiment generated during this run.
     generated_plots = plot_all_experiments(csv_paths=run_experiment_paths, k_meters=10)
-    for plot_path in generated_plots:
-        print(plot_path)
+    print(f"[Output] Generated plots: {len(generated_plots)}", flush=True)
 
     # Generate one shapefile containing only the experiments from this run.
     shapefile_path = generate_combined_experiment_shapefile(
         run_experiment_paths,
         output_path=Path("outputs") / "shapefiles" / cfg.artifact_slug / f"{cfg.artifact_slug}.shp",
     )
-    print(shapefile_path)
+    print(f"[Output] Combined shapefile: {shapefile_path}", flush=True)
 
 if __name__ == "__main__":
     try:

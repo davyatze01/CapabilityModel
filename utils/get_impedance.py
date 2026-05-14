@@ -18,8 +18,7 @@ def impedance_bus(route_distance,route_waiting):
         #print(f"({route_distance}/{BUS_SPEED})*{route_waiting}={(route_distance/BUS_SPEED) * route_waiting}")
         return ((route_distance/BUS_SPEED) * route_waiting)*60 # in minuti
     else:
-        print("Problema con il calcolo della impedance...")
-        exit()
+        raise ValueError("Failed to compute bus impedance: route_distance or route_waiting is missing.")
 
 def impedance_base(distance,network_type,walk_score: float | None=None,lambda_walk: float = 0.15):
     """Convert distance to travel-time impedance for a given transport mode.
