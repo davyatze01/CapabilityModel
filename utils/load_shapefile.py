@@ -43,7 +43,7 @@ def graph_from_shapefile(
     return shp_name,G
 
 
-def feature_from_shapefile(shp_name : str, query_tags: dict):
+def feature_from_shapefile(shp_name : str, query_tags: dict, poi_type: str | None = None):
     cfg = PipelineConfig()
 
     gdf = gpd.read_file(f"shapefile_base/{shp_name}")
@@ -64,16 +64,14 @@ def feature_from_shapefile(shp_name : str, query_tags: dict):
     
     if cfg.poi_from_shp:
         # Caricamento poi da shapefile
-        return poi_from_shp(query_tags)
+        return poi_from_shp(poi_type=poi_type)
     else:
         print(f"[POI] OSMnx city-universe download: keys={len(query_tags)}")
         return ox.features_from_polygon(geometry, query_tags)
     
 
-def poi_from_shp(query_tags: dict):
-    import csv
-    import json
-    from pathlib import Path
+def poi_from_shp(poi_type: str | None = None):
+    from utils import services as serv
 
     paths = [
         "pois_shp/poi_points.shp",
@@ -105,46 +103,12 @@ def poi_from_shp(query_tags: dict):
     if "poi_type" not in pois.columns:
         return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
 
-    query_poi_types = set()
-    csv_poi_types = set()
-
-    config_csv_path = Path(__file__).resolve().parents[1] / "config" / "poi_types.csv"
-
-    with config_csv_path.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-
-        for row in reader:
-            poi_type = (row.get("poi_type") or "").strip()
-            tags_raw = row.get("tags") or ""
-
-            if not poi_type:
-                continue
-
-            csv_poi_types.add(poi_type)
-
-            if not tags_raw:
-                continue
-
-            tags = json.loads(tags_raw)
-            matches = True
-            for key, value in tags.items():
-                if key not in query_tags:
-                    matches = False
-                    break
-
-                query_value = query_tags[key]
-                if query_value is True:
-                    continue
-                if isinstance(query_value, list):
-                    if str(value) not in {str(v) for v in query_value}:
-                        matches = False
-                        break
-                elif str(query_value) != str(value):
-                    matches = False
-                    break
-
-            if matches:
-                query_poi_types.add(poi_type)
+    labels_by_poi_type: dict[str, set[str]] = {}
+    configured_labels = set()
+    for q in serv.unique_query_keys():
+        labels = {str(label).strip() for label in q.labels if str(label).strip()}
+        labels_by_poi_type[str(q.poi_type)] = labels
+        configured_labels.update(labels)
 
     shp_poi_types = set(
         pois["poi_type"]
@@ -153,13 +117,17 @@ def poi_from_shp(query_tags: dict):
         .unique()
     )
 
-    missing_poi_types = shp_poi_types - csv_poi_types
+    missing_poi_types = shp_poi_types - configured_labels
     if missing_poi_types:
         raise ValueError(
-            "poi_type values found in shapefiles but missing from config/poi_types.csv: "
+            "poi_type values found in shapefiles but missing from configured labels in config/poi_types.csv: "
             + ", ".join(sorted(missing_poi_types))
         )
 
+    if poi_type is None:
+        return pois.copy()
+
+    query_poi_types = labels_by_poi_type.get(str(poi_type), set())
     if not query_poi_types:
         return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
 

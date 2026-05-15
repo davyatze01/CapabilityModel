@@ -19,6 +19,7 @@ TagQuery: TypeAlias = TagClause | list[TagClause]
 _GRAPH_CACHE = None
 _MODE_GRAPH_CACHE = {}
 _CITY_POI_UNIVERSE_CACHE: dict[str, gpd.GeoDataFrame] = {}
+_POI_DOWNLOAD_LOGGED: set[tuple[str, str]] = set()
 
 
 def _get_city_settings() -> tuple[str, str]:
@@ -304,6 +305,7 @@ def get_poi(
     feature: str | None = None,
     value: TagValue | None = None,
     tags: TagQuery | None = None,
+    poi_type: str | None = None,
 ):
     """Load POIs from local cache or download them from OSM.
 
@@ -376,20 +378,25 @@ def get_poi(
             print(f"[POI] No matches after city-universe filtering for tags={tags}. Skipping per-query OSMnx fallback.")
             return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
-        print(f"[POI] Downloading POIs for '{place_name}'...", flush=True)
+        download_key = (poi_cache_slug, place_name)
+        if download_key not in _POI_DOWNLOAD_LOGGED:
+            print(f"[POI] Downloading POIs for '{place_name}'...", flush=True)
+            _POI_DOWNLOAD_LOGGED.add(download_key)
 
         try:
-            if tags:
-                if not isinstance(tags, dict):
-                    # OR-queries are resolved from the city-universe dataset only.
-                    return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-                query_tags: TagClause = tags
-            else:
-                query_tags = {feature_key: value_key}
             if cfg.use_shapefile:
                 print("[POI] Loading POIs from shapefile source...", flush=True)
-                poi = feature_from_shapefile(cfg.name_shapefile, query_tags=query_tags)
+                # In shapefile mode, selection is based on poi_type -> labels mapping.
+                # OSM tags are irrelevant for source filtering.
+                poi = feature_from_shapefile(cfg.name_shapefile, query_tags={}, poi_type=poi_type)
             else:
+                if tags:
+                    if not isinstance(tags, dict):
+                        # OR-queries are resolved from the city-universe dataset only.
+                        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+                    query_tags: TagClause = tags
+                else:
+                    query_tags = {feature_key: value_key}
                 print(f"[POI] Downloading POIs from OSM for '{place_name}'...", flush=True)
                 poi = _download_poi_for_place(place_name, query_tags)
         except Exception as e:

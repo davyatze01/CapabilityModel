@@ -207,9 +207,9 @@ def _get_query_geometries(query):
     if cache_key in delta_g._POI_GEOM_CACHE:
         return delta_g._POI_GEOM_CACHE[cache_key]
     if tags:
-        poi = graphml.get_poi(tags=tags)
+        poi = graphml.get_poi(tags=tags, poi_type=query.poi_type)
     else:
-        poi = graphml.get_poi(feature, value)
+        poi = graphml.get_poi(feature, value, poi_type=query.poi_type)
     geometries = graphml.get_poi_geometries(poi)
     delta_g._POI_GEOM_CACHE[cache_key] = geometries
     return geometries

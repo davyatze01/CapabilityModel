@@ -1,4 +1,4 @@
 capability,services,choquet_singleton,enabled
 restorativeness,"['sport_and_movement', 'scenic_views', 'quietness', 'cultural_activities', 'nature_contact']","[1.0, 0.8, 1.0, 0.6, 1.0]",True
-nutrition,"['eating_out', 'fresh_food_access', 'ready_food_access']","[0.6, 1.0, 0.8]",True
-care,"['medicines_and_supplies', 'impatient_and_care', 'rehabilitation_services', 'diagnosis_and_prevention', 'emergency_services', 'care_services']","[0.8, 1.0, 0.8, 0.8, 1.0, 1.0]",True
+nutrition,"['eating_out', 'food_access']","[0.6, 1.0]",True
+care,"['medicines_and_supplies', 'diagnosis_and_prevention', 'emergency_services', 'care_services']","[0.8, 1.0, 1.0, 1.0]",True
