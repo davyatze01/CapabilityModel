@@ -37,6 +37,14 @@ class PipelineConfig:
     artifact_slug: str = field(init=False)
     use_shapefile: bool = True
     name_shapefile: str = "Cagliari Shapefile.shp"
+    open_qgis_after_run: bool = True
+    qgis_bin_path: str = ""
+    qgis_project_path: str = ""
+    qgis_autostyle_project: bool = True
+    qgis_autostyle_field: str = "capability_care"
+    qgis_autostyle_classes: int = 5
+    qgis_autostyle_ramp: str = "Viridis"
+    qgis_autostyle_basemap: bool = True
     poi_from_shp: bool = True
     worker_count: int | None = 12
     skip_routing: bool = False

@@ -297,7 +297,7 @@ def plot_experiment(
 
     # Save one image per CSV using a filename derived from the experiment name.
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_format = "svg" if os.name == "nt" else "png"
+    output_format = "png"
     output_path = output_dir / f"{csv_path.stem}_edge_interp_{k_meters}.{output_format}"
     fig.tight_layout()
     fig.savefig(

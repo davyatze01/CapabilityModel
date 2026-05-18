@@ -133,8 +133,8 @@ def _safe_shapefile_columns(gdf: gpd.GeoDataFrame, value_column: str) -> gpd.Geo
 
 
 def _prepare_combined_geodataframe(csv_paths: list[Path], graph: nx.Graph) -> gpd.GeoDataFrame:
-    """Build one normalized GeoDataFrame containing all selected experiments."""
-    frames: list[gpd.GeoDataFrame] = []
+    """Build one GeoDataFrame with one column per experiment metric."""
+    combined: gpd.GeoDataFrame | None = None
 
     for current_csv in csv_paths:
         try:
@@ -144,18 +144,67 @@ def _prepare_combined_geodataframe(csv_paths: list[Path], graph: nx.Graph) -> gp
             # Recap files or malformed CSVs are ignored in batch mode.
             continue
 
-        normalized = gdf[["node_id", "lon", "lat", value_column, "geometry"]].copy()
-        normalized = normalized.rename(columns={value_column: "value"})
-        normalized["experiment"] = current_csv.stem
-        normalized["metric"] = value_column
-        normalized = normalized[["node_id", "experiment", "metric", "value", "lon", "lat", "geometry"]]
-        frames.append(normalized)
+        if "node_id" in gdf.columns:
+            gdf["join_key"] = gdf["node_id"].astype(str)
+        else:
+            gdf["join_key"] = gdf["lon"].astype(str) + ":" + gdf["lat"].astype(str)
 
-    if not frames:
+        metric_name = value_column
+        if combined is not None and metric_name in combined.columns:
+            metric_name = f"{value_column}_{current_csv.stem}"
+
+        slim = gdf[["join_key", "node_id", "lon", "lat", "geometry", value_column]].copy()
+        slim = slim.rename(columns={value_column: metric_name})
+
+        if combined is None:
+            combined = slim
+            continue
+
+        merged = combined.merge(slim, on="join_key", how="outer", suffixes=("", "_new"))
+        for column in ["node_id", "lon", "lat", "geometry"]:
+            new_column = f"{column}_new"
+            if new_column in merged.columns:
+                if column in merged.columns:
+                    merged[column] = merged[column].combine_first(merged[new_column])
+                    merged = merged.drop(columns=[new_column])
+                else:
+                    merged = merged.rename(columns={new_column: column})
+
+        combined = merged
+
+    if combined is None:
         raise ValueError("No valid experiment CSVs were found for shapefile generation.")
 
-    combined = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), geometry="geometry", crs="EPSG:4326")
-    return combined
+    if "join_key" in combined.columns:
+        combined = combined.drop(columns=["join_key"])
+
+    return gpd.GeoDataFrame(combined, geometry="geometry", crs="EPSG:4326")
+
+
+def _safe_shapefile_columns_wide(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    rename_map: dict[str, str] = {
+        "capability_care": "cap_care",
+        "capability_restorativeness": "cap_rest",
+        "capability_nutrition": "cap_nutri",
+    }
+    used: set[str] = set()
+
+    for column in gdf.columns:
+        if column == "geometry":
+            continue
+
+        candidate = rename_map.get(column, str(column)[:10] or "field")
+        base = candidate
+        suffix = 1
+        while candidate in used:
+            trimmed = base[: max(0, 10 - len(str(suffix)))]
+            candidate = f"{trimmed}{suffix}"
+            suffix += 1
+
+        rename_map[column] = candidate
+        used.add(candidate)
+
+    return gdf.rename(columns=rename_map)
 
 
 def generate_combined_experiment_shapefile(
@@ -175,11 +224,34 @@ def generate_combined_experiment_shapefile(
 
     selected_csv_paths = [Path(path) for path in csv_paths]
     combined = _prepare_combined_geodataframe(selected_csv_paths, graph)
+    combined = _safe_shapefile_columns_wide(combined)
 
     shapefile_path = Path(output_path) if output_path is not None else output_dir / "combined_experiments.shp"
     shapefile_path.parent.mkdir(parents=True, exist_ok=True)
     combined.to_file(shapefile_path, driver="ESRI Shapefile")
     return shapefile_path
+
+
+def generate_combined_experiment_gpkg(
+    csv_paths: list[str | Path],
+    output_path: str | Path,
+    graph_dir: str | Path = "graph",
+    graph_path: str | Path | None = None,
+    preferred_mode: str = DEFAULT_GRAPH_MODE,
+) -> Path:
+    """Generate one GeoPackage containing all selected experiment CSVs."""
+    graph_dir = Path(graph_dir)
+
+    selected_graph = Path(graph_path) if graph_path is not None else pick_graphml_file(graph_dir, preferred_mode)
+    graph = load_graph(selected_graph)
+
+    selected_csv_paths = [Path(path) for path in csv_paths]
+    combined = _prepare_combined_geodataframe(selected_csv_paths, graph)
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_file(output_path, driver="GPKG")
+    return output_path
 
 
 def generate_shapefile_by_csv(
