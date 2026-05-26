@@ -2,6 +2,7 @@ import csv
 import hashlib
 import json
 import re
+import ast
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 
 
 CONFIG_CSV_PATH = Path(__file__).resolve().parents[1] / "config" / "poi_types.csv"
+SERVICES_CSV_PATH = Path(__file__).resolve().parents[1] / "config" / "services.csv"
 
 
 @dataclass(frozen=True)
@@ -126,7 +128,7 @@ def _validate_required_columns(fieldnames: list[str] | None) -> None:
     Outputs:
     - None. Raises ValueError if required columns are missing.
     """
-    required = ["poi_type", "decay_constant", "choquet_capacity", "contribution_constant", "tags", "services"]
+    required = ["poi_type", "decay_constant", "tags", "services"]
     if fieldnames is None:
         raise _config_error(None, None, f"missing header row, expected columns {required}")
     missing = [c for c in required if c not in fieldnames]
@@ -194,66 +196,6 @@ def _load_rows() -> list[dict[str, Any]]:
                 if not s.isidentifier():
                     raise _config_error(idx, "services", f"service name must be a valid identifier, got {s!r}")
 
-            choquet_capacity_raw = _parse_json_cell(row.get("choquet_capacity") or "", idx, "choquet_capacity")
-            if isinstance(choquet_capacity_raw, list):
-                if not choquet_capacity_raw:
-                    raise _config_error(idx, "choquet_capacity", "expected non-empty JSON array of numbers")
-                if len(choquet_capacity_raw) != len(services):
-                    raise _config_error(
-                        idx,
-                        "choquet_capacity",
-                        f"length mismatch: len(services)={len(services)} len(choquet_capacity)={len(choquet_capacity_raw)}",
-                    )
-                choquet_capacity_floats: list[float] = []
-                for j, value in enumerate(choquet_capacity_raw):
-                    try:
-                        choquet_capacity_floats.append(float(value))
-                    except Exception as exc:
-                        raise _config_error(
-                            idx,
-                            "choquet_capacity",
-                            f"entry {j} expected number, got {value!r}",
-                        ) from exc
-            else:
-                try:
-                    choquet_capacity_floats = [float(choquet_capacity_raw)] * len(services)
-                except Exception as exc:
-                    raise _config_error(
-                        idx,
-                        "choquet_capacity",
-                        f"expected number or JSON array of numbers, got {choquet_capacity_raw!r}",
-                    ) from exc
-
-            contribution_raw = _parse_json_cell(row.get("contribution_constant") or "", idx, "contribution_constant")
-            if isinstance(contribution_raw, list):
-                if not contribution_raw:
-                    raise _config_error(idx, "contribution_constant", "expected non-empty JSON array of numbers")
-                if len(contribution_raw) != len(services):
-                    raise _config_error(
-                        idx,
-                        "contribution_constant",
-                        f"length mismatch: len(services)={len(services)} len(contribution_constant)={len(contribution_raw)}",
-                    )
-                contribution_constant_floats: list[float] = []
-                for j, value in enumerate(contribution_raw):
-                    try:
-                        contribution_constant_floats.append(float(value))
-                    except Exception as exc:
-                        raise _config_error(
-                            idx,
-                            "contribution_constant",
-                            f"entry {j} expected number, got {value!r}",
-                        ) from exc
-            else:
-                try:
-                    contribution_constant_floats = [float(contribution_raw)] * len(services)
-                except Exception as exc:
-                    raise _config_error(
-                        idx,
-                        "contribution_constant",
-                        f"expected number or JSON array of numbers, got {contribution_raw!r}",
-                    ) from exc
-
             interactions_cell = (row.get("choquet_interactions") or "").strip()
             if interactions_cell:
                 interactions_normalized = re.sub(r"\bNone\b", "null", interactions_cell)
@@ -270,13 +212,96 @@ def _load_rows() -> list[dict[str, Any]]:
                     "tags": tags,
                     "labels": tuple(normalized_labels),
                     "services": services,
-                    "choquet_capacity": choquet_capacity_floats,
-                    "contribution_constant": contribution_constant_floats,
                     "choquet_interactions": choquet_interactions,
                 }
             )
 
     return parsed_rows
+
+
+def _parse_python_list_cell(raw: str, row_num: int, column: str) -> list[Any]:
+    try:
+        parsed = ast.literal_eval(raw)
+    except Exception as exc:
+        raise ValueError(
+            f"Invalid services config CSV (path={SERVICES_CSV_PATH} row={row_num} column={column}): "
+            f"expected Python list literal, got {raw!r}"
+        ) from exc
+    if not isinstance(parsed, list) or not parsed:
+        raise ValueError(
+            f"Invalid services config CSV (path={SERVICES_CSV_PATH} row={row_num} column={column}): "
+            "expected non-empty list"
+        )
+    return parsed
+
+
+def _load_service_weights(
+    valid_poi_types: set[str],
+) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]], dict[str, list[str]]]:
+    if not SERVICES_CSV_PATH.is_file():
+        raise ValueError(f"Invalid services config CSV (path={SERVICES_CSV_PATH}): file not found")
+
+    service_singleton_m: "OrderedDict[str, dict[str, float]]" = OrderedDict()
+    contribution_constants: "OrderedDict[str, dict[str, float]]" = OrderedDict()
+    service_poi_order: "OrderedDict[str, list[str]]" = OrderedDict()
+
+    with SERVICES_CSV_PATH.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames) if reader.fieldnames is not None else None
+        required = ["service", "poi_types", "choquet_capacity", "contribution_constant"]
+        if fieldnames is None:
+            raise ValueError(
+                f"Invalid services config CSV (path={SERVICES_CSV_PATH}): missing header row, expected {required}"
+            )
+        missing = [c for c in required if c not in fieldnames]
+        if missing:
+            raise ValueError(
+                f"Invalid services config CSV (path={SERVICES_CSV_PATH}): missing required columns {missing}; found {fieldnames}"
+            )
+
+        for idx, row in enumerate(reader, start=2):
+            service = (row.get("service") or "").strip()
+            if not service:
+                raise ValueError(
+                    f"Invalid services config CSV (path={SERVICES_CSV_PATH} row={idx} column=service): expected non-empty string"
+                )
+            poi_types_raw = (row.get("poi_types") or "").strip()
+            choquet_raw = (row.get("choquet_capacity") or "").strip()
+            contribution_raw = (row.get("contribution_constant") or "").strip()
+            poi_types = _parse_python_list_cell(poi_types_raw, idx, "poi_types")
+            choquet_values = _parse_python_list_cell(choquet_raw, idx, "choquet_capacity")
+            contribution_values = _parse_python_list_cell(contribution_raw, idx, "contribution_constant")
+
+            if len(poi_types) != len(choquet_values) or len(poi_types) != len(contribution_values):
+                raise ValueError(
+                    f"Invalid services config CSV (path={SERVICES_CSV_PATH} row={idx}): length mismatch "
+                    f"poi_types={len(poi_types)} choquet_capacity={len(choquet_values)} "
+                    f"contribution_constant={len(contribution_values)}"
+                )
+            poi_types_clean = [str(p).strip() for p in poi_types]
+            if not all(poi_types_clean):
+                raise ValueError(
+                    f"Invalid services config CSV (path={SERVICES_CSV_PATH} row={idx} column=poi_types): expected non-empty strings"
+                )
+            if len(set(poi_types_clean)) != len(poi_types_clean):
+                raise ValueError(
+                    f"Invalid services config CSV (path={SERVICES_CSV_PATH} row={idx} column=poi_types): duplicate POI types"
+                )
+            for poi in poi_types_clean:
+                if poi not in valid_poi_types:
+                    raise ValueError(
+                        f"Invalid services config CSV (path={SERVICES_CSV_PATH} row={idx} column=poi_types): "
+                        f"unknown poi_type {poi!r}"
+                    )
+
+            service_poi_order[service] = poi_types_clean
+            service_singleton_m[service] = {}
+            contribution_constants[service] = {}
+            for poi, cap_v, contrib_v in zip(poi_types_clean, choquet_values, contribution_values):
+                service_singleton_m[service][poi] = float(cap_v)
+                contribution_constants[service][poi] = float(contrib_v)
+
+    return dict(service_singleton_m), dict(contribution_constants), dict(service_poi_order)
 
 
 def _build_runtime_structures(rows: list[dict[str, Any]]):
@@ -288,30 +313,35 @@ def _build_runtime_structures(rows: list[dict[str, Any]]):
     Outputs:
     - tuple containing service queries, singleton measures, decay constants, and contribution constants.
     """
+    poi_by_type: dict[str, dict[str, Any]] = {r["poi_type"]: r for r in rows}
+    valid_poi_types = set(poi_by_type.keys())
+    service_singleton_m, contribution_constants, service_poi_order = _load_service_weights(valid_poi_types)
     service_poi_queries: "OrderedDict[str, list[PoiQuery]]" = OrderedDict()
-    service_singleton_m: "OrderedDict[str, dict[str, float]]" = OrderedDict()
     decay_constants: dict[str, float] = {}
-    contribution_constants: dict[str, dict[str, float]] = {}
     interaction_rows: "OrderedDict[str, dict[str, list[Any] | None]]" = OrderedDict()
     seen_pairs: set[tuple[str, str]] = set()
 
     for row in rows:
         poi_type = row["poi_type"]
         decay_constants[poi_type] = float(row["decay_constant"])
-        tags_raw = row["tags"]
-        if isinstance(tags_raw, dict):
-            tags = dict(tags_raw)
-        elif isinstance(tags_raw, list):
-            tags = [dict(clause) for clause in tags_raw]
-        else:
-            raise _config_error(None, "tags", f"unexpected normalized tags type: {type(tags_raw).__name__}")
-        labels = tuple(row.get("labels", (poi_type,)))
-        services = row["services"]
-        choquet_caps = row["choquet_capacity"]
-        contribs = row["contribution_constant"]
-        interactions_row = row.get("choquet_interactions")
-
-        for service, choquet_weight, contrib_weight in zip(services, choquet_caps, contribs):
+    for service, ordered_poi_types in service_poi_order.items():
+        for poi_type in ordered_poi_types:
+            row = poi_by_type[poi_type]
+            tags_raw = row["tags"]
+            if isinstance(tags_raw, dict):
+                tags = dict(tags_raw)
+            elif isinstance(tags_raw, list):
+                tags = [dict(clause) for clause in tags_raw]
+            else:
+                raise _config_error(None, "tags", f"unexpected normalized tags type: {type(tags_raw).__name__}")
+            labels = tuple(row.get("labels", (poi_type,)))
+            if service not in row["services"]:
+                raise _config_error(
+                    None,
+                    "services",
+                    f"service {service!r} in services.csv is not listed for poi_type {poi_type!r} in poi_types.csv",
+                )
+            interactions_row = row.get("choquet_interactions")
             pair = (service, poi_type)
             if pair in seen_pairs:
                 raise _config_error(None, None, f"duplicate (service, poi_type) pair generated: {pair}")
@@ -319,8 +349,6 @@ def _build_runtime_structures(rows: list[dict[str, Any]]):
             service_poi_queries.setdefault(service, []).append(
                 PoiQuery(service=service, poi_type=poi_type, tags=tags, labels=labels)
             )
-            service_singleton_m.setdefault(service, {})[poi_type] = float(choquet_weight)
-            contribution_constants.setdefault(service, {})[poi_type] = float(contrib_weight)
             interaction_rows.setdefault(service, {})[poi_type] = interactions_row
 
     service_pairwise_m: "OrderedDict[str, dict[tuple[str, str], float]]" = OrderedDict()
@@ -463,7 +491,7 @@ def _compute_config_signature() -> str:
     Outputs:
     - SHA1 hex digest for `config/poi_types.csv`.
     """
-    data = CONFIG_CSV_PATH.read_bytes()
+    data = CONFIG_CSV_PATH.read_bytes() + b"\n--services--\n" + SERVICES_CSV_PATH.read_bytes()
     return hashlib.sha1(data).hexdigest()
 
 

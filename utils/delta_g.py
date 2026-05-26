@@ -23,6 +23,7 @@ _MODE_LENGTHS_CACHE = {}  # key: (origin, network_type, radius_key) -> dict node
 _MODE_PATHS_CACHE = {}
 _WALK_EDGE_SCORES_CACHE: dict[str, dict[tuple[int, int, int], float]] = {}
 _WALK_GRAPH_SIG_BY_OBJID: dict[int, str] = {}
+_WALK_GRAPH_SIG_OVERRIDE: str | None = None
 
 
 
@@ -365,7 +366,7 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
     walk_edge_scores = None
     if walk_graph is not None:
         graph_obj_id = id(walk_graph)
-        graph_sig = _WALK_GRAPH_SIG_BY_OBJID.get(graph_obj_id)
+        graph_sig = _WALK_GRAPH_SIG_OVERRIDE or _WALK_GRAPH_SIG_BY_OBJID.get(graph_obj_id)
         if graph_sig is None:
             graph_sig = walkability.compute_graph_signature(walk_graph)
             _WALK_GRAPH_SIG_BY_OBJID[graph_obj_id] = graph_sig

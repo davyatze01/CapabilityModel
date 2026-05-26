@@ -47,7 +47,7 @@ class PipelineConfig:
     qgis_autostyle_basemap: bool = True
     poi_from_shp: bool = True
     worker_count: int | None = 12
-    skip_routing: bool = False
+    skip_routing: bool = True
     accessibility_chunksize: int = 100
     accessibility_deduplicate_entries: bool = True
     artifacts_root_dir: str = "artifacts"

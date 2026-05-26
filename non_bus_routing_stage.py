@@ -115,6 +115,7 @@ def _init_worker(
     non_bus_cache_dir: str = "",
     non_bus_cache_schema_version: int = 0,
     non_bus_poi_config_signature: str = "",
+    walk_graph_signature: str = "",
 ):
     """Initialize worker state for non-bus multiprocessing stage.
 
@@ -148,6 +149,7 @@ def _init_worker(
         for mode, mode_graph in mode_graphs.items():
             if mode not in delta_g._MODE_GRAPH_CACHE:
                 delta_g._MODE_GRAPH_CACHE[mode] = mode_graph
+    delta_g._WALK_GRAPH_SIG_OVERRIDE = str(walk_graph_signature or "") or None
 
 
 def _process_node(node_item):
@@ -254,15 +256,17 @@ def run_non_bus_routing_stage(
     # Warm walkability edge cache once in parent process so workers do not all
     # attempt an expensive first-time build concurrently.
     walk_graph = snap.shared_mode_graphs.get("walk")
+    walk_graph_signature = ""
     if walk_graph is not None:
         try:
             print("[Non-bus] Preparing walkability edge cache...", flush=True)
-            walkability.get_or_build_edge_walkability_index(
+            walk_cache_obj = walkability.get_or_build_edge_walkability_index(
                 cfg=_PIPELINE_CONFIG,
                 G=walk_graph,
                 force_rebuild=False,
                 schema_version=1,
             )
+            walk_graph_signature = walk_cache_obj.graph_signature
             print("[Non-bus] Walkability edge cache ready.", flush=True)
         except Exception as exc:
             print(
@@ -336,6 +340,7 @@ def run_non_bus_routing_stage(
                         _PIPELINE_CONFIG.non_bus_cache_dir,
                         _PIPELINE_CONFIG.non_bus_cache_schema_version,
                         _NON_BUS_POI_CONFIG_SIGNATURE,
+                        walk_graph_signature,
                     ),
                 ) as pool:
                     pending_batch = list(pending_non_bus.items())
@@ -372,6 +377,7 @@ def run_non_bus_routing_stage(
                         _PIPELINE_CONFIG.non_bus_cache_dir,
                         _PIPELINE_CONFIG.non_bus_cache_schema_version,
                         _NON_BUS_POI_CONFIG_SIGNATURE,
+                        walk_graph_signature,
                     )
                     pending_batch = list(pending_non_bus.items())
                     for node_id, data in pending_batch:
