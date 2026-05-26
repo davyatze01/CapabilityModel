@@ -25,7 +25,7 @@ def graph_from_shapefile(
     if gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs(epsg=4326)
 
-    geometry: BaseGeometry = gdf.union_all()
+    geometry: BaseGeometry = gdf.unary_union
 
 
     if isinstance(geometry, (Polygon, MultiPolygon)):
