@@ -32,11 +32,11 @@ def derive_artifact_slug(city_slug: str, use_shapefile: bool, shapefile_name: st
 
 @dataclass
 class PipelineConfig:
-    city_name: str = field(default_factory=lambda: os.getenv("CAP_CITY_NAME", "Cagliari, Sardinia, Italy"))
+    city_name: str = field(default_factory=lambda: os.getenv("CAP_CITY_NAME", "Paris, France"))
     city_slug: str = field(init=False)
     artifact_slug: str = field(init=False)
     use_shapefile: bool = True
-    name_shapefile: str = "Cagliari Shapefile.shp"
+    name_shapefile: str = "Paris/mgp_boundary.shp"
     open_qgis_after_run: bool = True
     qgis_bin_path: str = ""
     qgis_project_path: str = ""

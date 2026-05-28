@@ -242,6 +242,7 @@ outputs/capability_*.csv
 outputs/shapefiles
 artifacts/
 experiments/
+scenarios/
 walkability_model/
 plots/edge_interpolation
 
@@ -250,3 +251,6 @@ graph/*.graphml
 gtfs/*.osm.pbf
 gtfs/*.osm.xml
 gtfs/*.zip
+
+# Paris data folder (large POI/boundary shapefiles)
+Paris/

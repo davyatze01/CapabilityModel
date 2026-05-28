@@ -13,7 +13,13 @@ def graph_from_shapefile(
     shp_name: str,
     network_type: str = "drive"
 ):
-    gdf = gpd.read_file(f"shapefile_base/{shp_name}")
+    # Determine the full path to the shapefile
+    if os.path.exists(shp_name):
+        shp_path = shp_name
+    else:
+        shp_path = f"shapefile_base/{shp_name}"
+    
+    gdf = gpd.read_file(shp_path)
 
     if gdf.empty:
         raise ValueError("Shapefile is empty")
@@ -25,7 +31,7 @@ def graph_from_shapefile(
     if gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs(epsg=4326)
 
-    geometry: BaseGeometry = gdf.union_all()
+    geometry: BaseGeometry = gdf.unary_union
 
 
     if isinstance(geometry, (Polygon, MultiPolygon)):
@@ -46,7 +52,13 @@ def graph_from_shapefile(
 def feature_from_shapefile(shp_name : str, query_tags: dict, poi_type: str | None = None):
     cfg = PipelineConfig()
 
-    gdf = gpd.read_file(f"shapefile_base/{shp_name}")
+    # Determine the full path to the shapefile
+    if os.path.exists(shp_name):
+        shp_path = shp_name
+    else:
+        shp_path = f"shapefile_base/{shp_name}"
+    
+    gdf = gpd.read_file(shp_path)
 
     if gdf.empty:
         raise ValueError("Shapefile is empty")
@@ -73,15 +85,17 @@ def feature_from_shapefile(shp_name : str, query_tags: dict, poi_type: str | Non
 def poi_from_shp(poi_type: str | None = None):
     from utils import services as serv
 
+    # Load POI shapefiles from Paris folder
     paths = [
-        "pois_shp/poi_points.shp",
-        "pois_shp/poi_lines.shp",
-        "pois_shp/poi_polygons.shp",
+        "Paris/POI_point.shp",
+        "Paris/POI_line.shp",
+        "Paris/POI_polygon.shp",
     ]
 
     frames = []
     for path in paths:
         if not os.path.exists(path):
+            print(f"[POI] Warning: {path} not found, skipping", flush=True)
             continue
 
         gdf = gpd.read_file(path)
@@ -89,6 +103,10 @@ def poi_from_shp(poi_type: str | None = None):
         if gdf.crs is not None and gdf.crs.to_epsg() != 4326:
             gdf = gdf.to_crs(epsg=4326)
 
+        # Rename TYPEQU to poi_type for consistency
+        if 'TYPEQU' in gdf.columns:
+            gdf['poi_type'] = gdf['TYPEQU'].astype(str)
+        
         frames.append(gdf)
 
     if not frames:
@@ -99,37 +117,52 @@ def poi_from_shp(poi_type: str | None = None):
         crs=frames[0].crs,
     )
 
-
     if "poi_type" not in pois.columns:
         return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
 
-    labels_by_poi_type: dict[str, set[str]] = {}
-    configured_labels = set()
-    for q in serv.unique_query_keys():
-        labels = {str(label).strip() for label in q.labels if str(label).strip()}
-        labels_by_poi_type[str(q.poi_type)] = labels
-        configured_labels.update(labels)
-
+    # For Paris TYPEQU-based POIs, skip the strict label validation
+    # TYPEQU values (A101, BI07, etc.) are different from OSM-based labels
     shp_poi_types = set(
         pois["poi_type"]
         .dropna()
         .astype(str)
         .unique()
     )
+    
+    # Check if we're using TYPEQU codes (they typically start with A, B, C, D, E, F, G, BI, GI)
+    # rather than OSM-style labels (like amenity_pharmacy)
+    is_typequ_based = any(
+        str(ptype).strip()[0] in ['A', 'B', 'C', 'D', 'E', 'F', 'G'] or 
+        str(ptype).strip().startswith(('BI', 'GI'))
+        for ptype in shp_poi_types if str(ptype).strip()
+    )
+    
+    if not is_typequ_based:
+        # Original validation for OSM-based labels
+        labels_by_poi_type: dict[str, set[str]] = {}
+        configured_labels = set()
+        for q in serv.unique_query_keys():
+            labels = {str(label).strip() for label in q.labels if str(label).strip()}
+            labels_by_poi_type[str(q.poi_type)] = labels
+            configured_labels.update(labels)
 
-    missing_poi_types = shp_poi_types - configured_labels
-    if missing_poi_types:
-        raise ValueError(
-            "poi_type values found in shapefiles but missing from configured labels in config/poi_types.csv: "
-            + ", ".join(sorted(missing_poi_types))
-        )
+        missing_poi_types = shp_poi_types - configured_labels
+        if missing_poi_types:
+            raise ValueError(
+                "poi_type values found in shapefiles but missing from configured labels in config/poi_types.csv: "
+                + ", ".join(sorted(missing_poi_types))
+            )
 
-    if poi_type is None:
+        if poi_type is None:
+            return pois.copy()
+
+        query_poi_types = labels_by_poi_type.get(str(poi_type), set())
+        if not query_poi_types:
+            return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
+
+        mask = pois["poi_type"].astype(str).isin(query_poi_types)
+        return pois.loc[mask].copy()
+    else:
+        # For TYPEQU-based POIs, return all POIs (filtering will be handled by service configuration)
+        print(f"[POI] Loaded {len(pois)} POIs from Paris shapefile with TYPEQU codes: {sorted(list(shp_poi_types))[:10]}...", flush=True)
         return pois.copy()
-
-    query_poi_types = labels_by_poi_type.get(str(poi_type), set())
-    if not query_poi_types:
-        return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
-
-    mask = pois["poi_type"].astype(str).isin(query_poi_types)
-    return pois.loc[mask].copy()
