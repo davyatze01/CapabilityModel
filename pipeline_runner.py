@@ -94,19 +94,23 @@ def _resolve_qgis_python_launcher(qgis_exe: str) -> str | None:
 
 
 def _build_qgis_project(cfg: PipelineConfig, gpkg_path: Path, qgis_exe: str) -> Path | None:
-    if not cfg.qgis_autostyle_project:
-        return None
-
     if cfg.qgis_project_path:
         return None
+
+    output_path = Path("outputs") / "qgis" / cfg.artifact_slug / "capability.qgz"
+    
+    if not cfg.qgis_autostyle_project:
+        # Return the project path even if we're not auto-styling
+        # (it may have been created previously)
+        return output_path if output_path.exists() else None
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     python_launcher = _resolve_qgis_python_launcher(qgis_exe)
     if python_launcher is None:
         print("[QGIS] Skipping project generation: python-qgis launcher not found.", flush=True)
-        return None
-
-    output_path = Path("outputs") / "qgis" / cfg.artifact_slug / "capability.qgz"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Still return the path if it exists
+        return output_path if output_path.exists() else None
 
     gpkg_literal = repr(str(gpkg_path))
     output_literal = repr(str(output_path))
@@ -178,7 +182,8 @@ app.exitQgis()
         subprocess.run([python_launcher, script_path], check=True)
     except subprocess.CalledProcessError as exc:
         print(f"[QGIS] Failed to generate project: {exc}", flush=True)
-        return None
+        # Still return the path if it exists from a previous run
+        return output_path if output_path.exists() else None
 
     return output_path
 
@@ -195,11 +200,20 @@ def _maybe_open_qgis(cfg: PipelineConfig, gpkg_path: Path | None) -> None:
         )
 
     project_path: str | None = None
+    
+    # First, try to build/generate the auto-styled project
     if gpkg_path is not None:
         generated_project = _build_qgis_project(cfg, gpkg_path, qgis_exe)
         if generated_project is not None:
             project_path = str(generated_project)
+    
+    # If no auto-generated project, check for a pre-existing auto-generated one
+    if not project_path and gpkg_path is not None:
+        auto_project_path = Path("outputs") / "qgis" / cfg.artifact_slug / "capability.qgz"
+        if auto_project_path.exists():
+            project_path = str(auto_project_path)
 
+    # Finally, fall back to custom project path if set
     if not project_path and cfg.qgis_project_path:
         project_path = cfg.qgis_project_path
 
