@@ -99,6 +99,9 @@ def poi_from_shp(poi_type: str | None = None):
         crs=frames[0].crs,
     )
 
+    # Support both poi_type (new) and poiType (legacy) column names
+    if "poi_type" not in pois.columns and "poiType" in pois.columns:
+        pois = pois.rename(columns={"poiType": "poi_type"})
 
     if "poi_type" not in pois.columns:
         return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
