@@ -1,0 +1,4 @@
+Scenario,Capability Type,Mean,Median,Std Dev,Min,Max
+baseline,restorativeness,0.9944,0.9980,0.0220,0.2728,1.0000
+baseline,nutrition,0.9771,0.9962,0.0755,0.0404,0.9999
+baseline,care,0.9541,0.9856,0.0950,0.0144,0.9993
