@@ -28,13 +28,24 @@ def _resolve_qgis_executable(cfg: PipelineConfig) -> str | None:
     if env_path:
         return env_path
 
-    qgis_on_path = shutil.which("qgis-ltr-bin.exe") or shutil.which("qgis-bin.exe")
+    qgis_on_path = shutil.which("qgis-ltr-bin.exe") or shutil.which("qgis-bin.exe") or shutil.which("qgis")
     if qgis_on_path:
         return qgis_on_path
 
+    # Mac detection
     if os.name != "nt":
+        mac_candidates = [
+            "/Applications/QGIS.app/Contents/MacOS/QGIS",
+            "/Applications/QGIS-LTR.app/Contents/MacOS/QGIS",
+            "/usr/local/bin/qgis",
+            "/opt/homebrew/bin/qgis",
+        ]
+        for candidate in mac_candidates:
+            if os.path.exists(candidate):
+                return candidate
         return None
 
+    # Windows detection
     candidates: list[str] = []
     program_files = os.environ.get("ProgramFiles", "C:\\Program Files")
     for base in [program_files, os.path.join(program_files, "QGIS")]:
@@ -59,13 +70,26 @@ def _resolve_qgis_executable(cfg: PipelineConfig) -> str | None:
 
 def _resolve_qgis_python_launcher(qgis_exe: str) -> str | None:
     qgis_bin_dir = Path(qgis_exe).parent
-    candidates = [
+    
+    # Windows launcher candidates
+    windows_candidates = [
         qgis_bin_dir / "python-qgis-ltr.bat",
         qgis_bin_dir / "python-qgis.bat",
     ]
-    for candidate in candidates:
+    for candidate in windows_candidates:
         if candidate.exists():
             return str(candidate)
+    
+    # Mac launcher candidates
+    mac_candidates = [
+        qgis_bin_dir / "python-qgis-ltr",
+        qgis_bin_dir / "python-qgis",
+        qgis_bin_dir / "python3",
+    ]
+    for candidate in mac_candidates:
+        if candidate.exists():
+            return str(candidate)
+    
     return None
 
 
