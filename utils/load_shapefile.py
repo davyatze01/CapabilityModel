@@ -57,7 +57,7 @@ def feature_from_shapefile(shp_name : str, query_tags: dict, poi_type: str | Non
     if gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs(epsg=4326)
 
-    geometry: BaseGeometry = gdf.union_all()
+    geometry: BaseGeometry = gdf.unary_union
 
     if not isinstance(geometry, (Polygon, MultiPolygon)):
         raise TypeError(f"Unsupported geometry type: {type(geometry)}")
