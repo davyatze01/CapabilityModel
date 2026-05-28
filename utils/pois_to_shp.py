@@ -24,7 +24,7 @@ def extract_poi_type(row):
 
     return "unknown"
 
-pois["poiType"] = pois.apply(extract_poi_type, axis=1)
+pois["poi_type"] = pois.apply(extract_poi_type, axis=1)
 
 # Separazione geometrie
 points = pois[pois.geometry.geom_type == "Point"].copy()
