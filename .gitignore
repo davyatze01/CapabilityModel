@@ -240,6 +240,8 @@ outputs/service_meta.json
 outputs/service_node_to_row.json
 outputs/capability_*.csv
 outputs/shapefiles
+outputs/gpkg/
+outputs/qgis/
 artifacts/
 experiments/
 scenarios/
