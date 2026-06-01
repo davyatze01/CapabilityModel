@@ -209,6 +209,81 @@ def _safe_shapefile_columns_wide(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gdf.rename(columns=rename_map)
 
 
+def _safe_gpkg_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Normalize field names for robust GeoPackage writes across GDAL builds."""
+    rename_map: dict[str, str] = {}
+    used: set[str] = set()
+
+    for column in gdf.columns:
+        if column == "geometry":
+            continue
+
+        raw = str(column).strip() or "field"
+        cleaned = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in raw)
+        cleaned = cleaned.strip("_") or "field"
+        cleaned = cleaned[:63]
+
+        candidate = cleaned
+        suffix = 1
+        while candidate in used:
+            trimmed = cleaned[: max(1, 63 - len(str(suffix)) - 1)]
+            candidate = f"{trimmed}_{suffix}"
+            suffix += 1
+
+        rename_map[column] = candidate
+        used.add(candidate)
+
+    return gdf.rename(columns=rename_map)
+
+
+def _prepare_gpkg_layer(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Coerce columns to GIS-friendly dtypes to avoid OGR null-pointer write failures."""
+    prepared = _safe_gpkg_columns(gdf.copy())
+
+    # Keep only known-safe scalar dtypes for OGR-backed writers.
+    for column in prepared.columns:
+        if column == "geometry":
+            continue
+        series = prepared[column]
+        if pd.api.types.is_bool_dtype(series):
+            prepared[column] = series.astype("Int8")
+        elif pd.api.types.is_datetime64_any_dtype(series):
+            prepared[column] = series.astype("datetime64[ns]")
+        elif pd.api.types.is_numeric_dtype(series):
+            continue
+        else:
+            prepared[column] = series.astype(object)
+
+    prepared = prepared.dropna(subset=["geometry"])
+    if prepared.empty:
+        raise ValueError("No valid geometries available for GeoPackage export.")
+    return prepared
+
+
+def _write_gpkg_layer(
+    gdf: gpd.GeoDataFrame,
+    output_path: Path,
+    layer_name: str,
+    mode: str,
+) -> None:
+    """Write a GPKG layer with a fallback writer engine for portability."""
+    kwargs = {
+        "driver": "GPKG",
+        "layer": layer_name,
+        "mode": mode,
+    }
+    try:
+        gdf.to_file(output_path, **kwargs)
+        return
+    except Exception as first_exc:
+        first_message = str(first_exc)
+        if "NULL pointer" not in first_message and "null pointer" not in first_message:
+            raise
+
+    # Some environments fail with default engine but succeed with fiona.
+    gdf.to_file(output_path, engine="fiona", **kwargs)
+
+
 def generate_combined_experiment_shapefile(
     csv_paths: list[str | Path],
     output_path: str | Path | None = None,
@@ -253,6 +328,7 @@ def generate_combined_experiment_gpkg(
 
     selected_csv_paths = [Path(path) for path in csv_paths]
     combined = _prepare_combined_geodataframe(selected_csv_paths, graph)
+    combined = _prepare_gpkg_layer(combined)
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -260,7 +336,7 @@ def generate_combined_experiment_gpkg(
     # features when grid parameters (e.g., cell size) change between runs.
     if output_path.exists():
         output_path.unlink()
-    combined.to_file(output_path, driver="GPKG", layer="capability_points", mode="w")
+    _write_gpkg_layer(combined, output_path, layer_name="capability_points", mode="w")
 
     if grid_enabled and grid_cell_size_m > 0:
         grid_layer = _build_capability_grid(
@@ -270,7 +346,16 @@ def generate_combined_experiment_gpkg(
             max_cells=int(grid_max_cells),
         )
         if grid_layer is not None and not grid_layer.empty:
-            grid_layer.to_file(output_path, driver="GPKG", layer="capability_grid", mode="a")
+            grid_layer = _prepare_gpkg_layer(grid_layer)
+            try:
+                _write_gpkg_layer(grid_layer, output_path, layer_name="capability_grid", mode="a")
+            except Exception:
+                # Keep point-layer export successful even when some GDAL builds
+                # fail to append a second (polygon) layer with "NULL pointer".
+                sidecar_grid = output_path.with_name(f"{output_path.stem}_grid{output_path.suffix}")
+                if sidecar_grid.exists():
+                    sidecar_grid.unlink()
+                _write_gpkg_layer(grid_layer, sidecar_grid, layer_name="capability_grid", mode="w")
     return output_path
 
 

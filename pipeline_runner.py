@@ -113,6 +113,8 @@ def _build_qgis_project(cfg: PipelineConfig, gpkg_path: Path, qgis_exe: str) -> 
         return output_path if output_path.exists() else None
 
     gpkg_literal = repr(str(gpkg_path))
+    grid_sidecar_path = gpkg_path.with_name(f"{gpkg_path.stem}_grid{gpkg_path.suffix}")
+    grid_sidecar_literal = repr(str(grid_sidecar_path))
     output_literal = repr(str(output_path))
     field_literal = repr(str(cfg.qgis_autostyle_field))
     grid_field_literal = repr(str(cfg.qgis_autostyle_field))
@@ -186,6 +188,8 @@ if field_name:
     layer.setRenderer(renderer)
 
 grid_layer = QgsVectorLayer({gpkg_literal} + "|layername=capability_grid", "Capability grid", "ogr")
+if not grid_layer.isValid():
+    grid_layer = QgsVectorLayer({grid_sidecar_literal} + "|layername=capability_grid", "Capability grid", "ogr")
 if grid_layer.isValid():
     if "has_data" in [field.name() for field in grid_layer.fields()]:
         grid_layer.setSubsetString("has_data = 1")
@@ -236,6 +240,8 @@ if grid_layer.isValid():
     project.addMapLayer(grid_layer)
 
     grid_outline_layer = QgsVectorLayer({gpkg_literal} + "|layername=capability_grid", "Capability grid outline", "ogr")
+    if not grid_outline_layer.isValid():
+        grid_outline_layer = QgsVectorLayer({grid_sidecar_literal} + "|layername=capability_grid", "Capability grid outline", "ogr")
     if grid_outline_layer.isValid():
         outline_symbol = QgsFillSymbol.createSimple(
             {{
