@@ -45,6 +45,11 @@ class PipelineConfig:
     qgis_autostyle_classes: int = 5
     qgis_autostyle_ramp: str = "Viridis"
     qgis_autostyle_basemap: bool = True
+    qgis_grid_enabled: bool = True
+    qgis_grid_cell_size_m: float = 500.0
+    qgis_grid_capability_field: str = "capability_care"
+    qgis_grid_opacity: float = 0.55
+    qgis_grid_max_cells: int = 500000
     poi_from_shp: bool = True
     worker_count: int | None = 12
     skip_routing: bool = True

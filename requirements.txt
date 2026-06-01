@@ -13,3 +13,4 @@ beautifulsoup4>=4.12,<5.0
 scikit-learn>=1.4,<2.0
 matplotlib>=3.8,<4.0
 seaborn>=0.13,<1.0
+pyDecision>=5.1,<6.0

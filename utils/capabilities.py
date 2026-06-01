@@ -5,6 +5,9 @@ from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 import osmnx as ox
+import numpy as np
+from pyDecision.algorithm import electre_iii
+
 
 CAP_RESTORATIVENESS_IDX = {
     "sport_and_movement": 0,
@@ -101,6 +104,9 @@ def choquet_integral(x, capability):
         total += (x_sorted[j] - prev) * cap(tail, capability)
         prev = x_sorted[j]
     return total
+
+def electre_iii_integration():
+    pass
 
 
 CAPABILITY_SERVICES = {

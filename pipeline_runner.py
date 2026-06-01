@@ -115,6 +115,7 @@ def _build_qgis_project(cfg: PipelineConfig, gpkg_path: Path, qgis_exe: str) -> 
     gpkg_literal = repr(str(gpkg_path))
     output_literal = repr(str(output_path))
     field_literal = repr(str(cfg.qgis_autostyle_field))
+    grid_field_literal = repr(str(cfg.qgis_autostyle_field))
     ramp_literal = repr(str(cfg.qgis_autostyle_ramp))
     basemap_flag = "True" if cfg.qgis_autostyle_basemap else "False"
     classes_count = int(cfg.qgis_autostyle_classes)
@@ -124,11 +125,15 @@ from qgis.core import (
     QgsApplication,
     QgsClassificationEqualInterval,
     QgsCoordinateReferenceSystem,
+    QgsFillSymbol,
     QgsGradientColorRamp,
     QgsGraduatedSymbolRenderer,
     QgsReferencedRectangle,
+    QgsRendererRange,
     QgsProject,
     QgsRasterLayer,
+    QgsSingleSymbolRenderer,
+    QgsSymbol,
     QgsStyle,
     QgsVectorLayer,
 )
@@ -149,6 +154,8 @@ if {basemap_flag}:
         project.addMapLayer(osm_layer)
 
 layer = QgsVectorLayer({gpkg_literal}, "Capability model output", "ogr")
+if not layer.isValid():
+    layer = QgsVectorLayer({gpkg_literal} + "|layername=capability_points", "Capability model output", "ogr")
 if not layer.isValid():
     raise SystemExit("Failed to load GeoPackage layer: " + {gpkg_literal})
 
@@ -177,6 +184,68 @@ if field_name:
         ramp = QgsGradientColorRamp(QColor("#440154"), QColor("#FDE725"))
     renderer.updateColorRamp(ramp)
     layer.setRenderer(renderer)
+
+grid_layer = QgsVectorLayer({gpkg_literal} + "|layername=capability_grid", "Capability grid", "ogr")
+if grid_layer.isValid():
+    if "has_data" in [field.name() for field in grid_layer.fields()]:
+        grid_layer.setSubsetString("has_data = 1")
+
+    grid_available_fields = [field.name() for field in grid_layer.fields()]
+    preferred_grid_fields = [
+        "grid_mean_" + {grid_field_literal}.replace("capability_", ""),
+        "grid_mean_care",
+        "grid_mean_restorativeness",
+        "grid_mean_nutrition",
+        "grid_mean",
+    ]
+    grid_field_name = next((name for name in preferred_grid_fields if name in grid_available_fields), "grid_mean")
+    grid_ramp = QgsStyle.defaultStyle().colorRamp({ramp_literal})
+    if grid_ramp is None:
+        grid_ramp = QgsGradientColorRamp(QColor("#440154"), QColor("#FDE725"))
+    grid_renderer = QgsGraduatedSymbolRenderer()
+    grid_renderer.setClassAttribute(grid_field_name)
+
+    # Keep grid classification aligned with the point-layer value scale.
+    ranges = []
+    if field_name:
+        idx = layer.fields().indexFromName(field_name)
+        vmin = layer.minimumValue(idx)
+        vmax = layer.maximumValue(idx)
+        if vmin is not None and vmax is not None and float(vmax) > float(vmin):
+            step = (float(vmax) - float(vmin)) / float(int({classes_count}))
+            for i in range(int({classes_count})):
+                lower = float(vmin) + i * step
+                upper = float(vmin) + (i + 1) * step if i < int({classes_count}) - 1 else float(vmax)
+                symbol = QgsSymbol.defaultSymbol(grid_layer.geometryType())
+                if symbol is None:
+                    continue
+                color = grid_ramp.color(float(i) / max(1, int({classes_count}) - 1))
+                symbol.setColor(color)
+                ranges.append(QgsRendererRange(lower, upper, symbol, f"{{lower:.4f}} - {{upper:.4f}}"))
+
+    if ranges:
+        grid_renderer = QgsGraduatedSymbolRenderer(grid_field_name, ranges)
+    else:
+        grid_renderer.setMode(QgsGraduatedSymbolRenderer.EqualInterval)
+        grid_renderer.updateClasses(grid_layer, int({classes_count}))
+        grid_renderer.updateColorRamp(grid_ramp)
+
+    grid_layer.setRenderer(grid_renderer)
+
+    grid_layer.setOpacity(float({repr(float(cfg.qgis_grid_opacity))}))
+    project.addMapLayer(grid_layer)
+
+    grid_outline_layer = QgsVectorLayer({gpkg_literal} + "|layername=capability_grid", "Capability grid outline", "ogr")
+    if grid_outline_layer.isValid():
+        outline_symbol = QgsFillSymbol.createSimple(
+            {{
+                "style": "no",
+                "outline_color": "90,90,90,170",
+                "outline_width": "0.2",
+            }}
+        )
+        grid_outline_layer.setRenderer(QgsSingleSymbolRenderer(outline_symbol))
+        project.addMapLayer(grid_outline_layer)
 
 project.write({output_literal})
 app.exitQgis()
@@ -338,6 +407,10 @@ def generate_spatial_outputs(cfg, cap):
         gpkg_output_path = generate_combined_experiment_gpkg(
             run_experiment_paths,
             output_path=gpkg_output_path,
+            grid_enabled=cfg.qgis_grid_enabled,
+            grid_cell_size_m=cfg.qgis_grid_cell_size_m,
+            grid_capability_field=cfg.qgis_autostyle_field,
+            grid_max_cells=cfg.qgis_grid_max_cells,
         )
         print(f"[Output] Combined GeoPackage: {gpkg_output_path}", flush=True)
     except Exception as exc:

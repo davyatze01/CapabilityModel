@@ -4,8 +4,10 @@ from pathlib import Path
 
 import geopandas as gpd
 import networkx as nx
+import numpy as np
 import pandas as pd
 from shapely.geometry import Point
+from shapely.geometry import box
 
 from plot_shapefile import find_value_column, load_graph, pick_graphml_file
 
@@ -238,6 +240,10 @@ def generate_combined_experiment_gpkg(
     graph_dir: str | Path = "graph",
     graph_path: str | Path | None = None,
     preferred_mode: str = DEFAULT_GRAPH_MODE,
+    grid_enabled: bool = False,
+    grid_cell_size_m: float = 10.0,
+    grid_capability_field: str = "capability_care",
+    grid_max_cells: int = 500000,
 ) -> Path:
     """Generate one GeoPackage containing all selected experiment CSVs."""
     graph_dir = Path(graph_dir)
@@ -250,8 +256,114 @@ def generate_combined_experiment_gpkg(
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    combined.to_file(output_path, driver="GPKG")
+    # Always regenerate from a clean GeoPackage to avoid stale/duplicated
+    # features when grid parameters (e.g., cell size) change between runs.
+    if output_path.exists():
+        output_path.unlink()
+    combined.to_file(output_path, driver="GPKG", layer="capability_points", mode="w")
+
+    if grid_enabled and grid_cell_size_m > 0:
+        grid_layer = _build_capability_grid(
+            points_gdf=combined,
+            capability_field=grid_capability_field,
+            cell_size_m=float(grid_cell_size_m),
+            max_cells=int(grid_max_cells),
+        )
+        if grid_layer is not None and not grid_layer.empty:
+            grid_layer.to_file(output_path, driver="GPKG", layer="capability_grid", mode="a")
     return output_path
+
+
+def _build_capability_grid(
+    points_gdf: gpd.GeoDataFrame,
+    capability_field: str,
+    cell_size_m: float,
+    max_cells: int,
+) -> gpd.GeoDataFrame | None:
+    """Build full bbox grid and aggregate point capability means per square."""
+    capability_columns = [column for column in points_gdf.columns if str(column).startswith("capability_")]
+    if not capability_columns:
+        return None
+    if capability_field not in capability_columns:
+        capability_field = capability_columns[0]
+
+    work = points_gdf[["geometry"] + capability_columns].copy()
+    for column in capability_columns:
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    work = work.dropna(subset=["geometry"])
+    if work.empty:
+        return None
+
+    work = gpd.GeoDataFrame(work, geometry="geometry", crs=points_gdf.crs).to_crs("EPSG:3857")
+    x_vals = work.geometry.x.to_numpy(dtype=float)
+    y_vals = work.geometry.y.to_numpy(dtype=float)
+    finite_mask = np.isfinite(x_vals) & np.isfinite(y_vals)
+    work = work.loc[finite_mask].copy()
+    if work.empty:
+        return None
+
+    min_x, min_y, max_x, max_y = work.total_bounds
+    if not np.isfinite([min_x, min_y, max_x, max_y]).all():
+        return None
+    if min_x == max_x or min_y == max_y:
+        return None
+
+    start_ix = int(min_x // cell_size_m)
+    end_ix = int(max_x // cell_size_m)
+    if end_ix * cell_size_m < max_x:
+        end_ix += 1
+
+    start_iy = int(min_y // cell_size_m)
+    end_iy = int(max_y // cell_size_m)
+    if end_iy * cell_size_m < max_y:
+        end_iy += 1
+
+    n_x = max(0, end_ix - start_ix)
+    n_y = max(0, end_iy - start_iy)
+    total_cells = n_x * n_y
+    if total_cells == 0:
+        return None
+    if total_cells > max_cells:
+        raise ValueError(
+            f"Grid would create {total_cells:,} cells (limit: {max_cells:,}). "
+            "Increase qgis_grid_cell_size_m or clean coordinate outliers."
+        )
+
+    # Assign each point to a grid cell by integer cell index.
+    work["ix"] = (work.geometry.x // cell_size_m).astype(int)
+    work["iy"] = (work.geometry.y // cell_size_m).astype(int)
+    grouped_values = work.groupby(["ix", "iy"], dropna=False)[capability_columns].mean().reset_index()
+    rename_map = {column: f"grid_mean_{column.replace('capability_', '')}" for column in capability_columns}
+    grouped_values = grouped_values.rename(columns=rename_map)
+
+    # Build the complete square grid across the full point-layer bounding box.
+    all_cells: list[dict[str, object]] = []
+    for ix in range(start_ix, end_ix):
+        for iy in range(start_iy, end_iy):
+            all_cells.append(
+                {
+                    "ix": ix,
+                    "iy": iy,
+                    "geometry": box(
+                        ix * cell_size_m,
+                        iy * cell_size_m,
+                        (ix + 1) * cell_size_m,
+                        (iy + 1) * cell_size_m,
+                    ),
+                }
+            )
+
+    grid_gdf = gpd.GeoDataFrame(all_cells, geometry="geometry", crs="EPSG:3857")
+    grid_gdf = grid_gdf.merge(grouped_values, on=["ix", "iy"], how="left")
+    selected_col = f"grid_mean_{capability_field.replace('capability_', '')}"
+    if selected_col in grid_gdf.columns:
+        grid_gdf["grid_mean"] = grid_gdf[selected_col]
+    else:
+        grid_gdf["grid_mean"] = np.nan
+    grid_gdf["has_data"] = grid_gdf["grid_mean"].notna().astype(int)
+    grid_gdf["capability_field"] = capability_field
+    grid_gdf["cell_size_m"] = float(cell_size_m)
+    return grid_gdf.to_crs("EPSG:4326")
 
 
 def generate_shapefile_by_csv(
