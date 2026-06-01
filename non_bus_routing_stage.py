@@ -78,8 +78,6 @@ def _is_valid_non_bus_cache(payload):
         return False
     if payload.get("schema_version") != _NON_BUS_CACHE_SCHEMA_VERSION:
         return False
-    if payload.get("poi_config_signature") != _NON_BUS_POI_CONFIG_SIGNATURE:
-        return False
     if "origin" not in payload or "services" not in payload:
         return False
     if not isinstance(payload["services"], dict):
