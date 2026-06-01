@@ -126,6 +126,7 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsGradientColorRamp,
     QgsGraduatedSymbolRenderer,
+    QgsReferencedRectangle,
     QgsProject,
     QgsRasterLayer,
     QgsStyle,
@@ -154,6 +155,13 @@ if not layer.isValid():
 layer_crs = QgsCoordinateReferenceSystem("EPSG:4326")
 layer.setCrs(layer_crs)
 project.addMapLayer(layer)
+
+# Persist project startup extent so QGIS opens centered on the output layer.
+layer_extent = layer.extent()
+if not layer_extent.isEmpty():
+    project.viewSettings().setDefaultViewExtent(
+        QgsReferencedRectangle(layer_extent, layer.crs())
+    )
 
 available_fields = [field.name() for field in layer.fields()]
 preferred_fields = [{field_literal}, "capability_care", "capability_restorativeness", "capability_nutrition", "value"]
