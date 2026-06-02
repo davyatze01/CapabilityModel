@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from pathlib import Path
 
 from config import PipelineConfig
 from context import build_context
@@ -81,10 +82,16 @@ def _resolve_qgis_python_launcher(qgis_exe: str) -> str | None:
             return str(candidate)
     
     # Mac launcher candidates
+    qgis_contents_dir = qgis_bin_dir.parent
+    qgis_app_dir = qgis_contents_dir.parent
     mac_candidates = [
         qgis_bin_dir / "python-qgis-ltr",
         qgis_bin_dir / "python-qgis",
         qgis_bin_dir / "python3",
+        qgis_bin_dir / "bin" / "python3",
+        qgis_contents_dir / "Resources" / "python" / "bin" / "python3",
+        qgis_contents_dir / "Resources" / "bin" / "python3",
+        qgis_app_dir / "Contents" / "MacOS" / "bin" / "python3",
     ]
     for candidate in mac_candidates:
         if candidate.exists():
