@@ -36,22 +36,6 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
     rest_sum = 0.0
     nut_sum = 0.0
     care_sum = 0.0
-    zero_capability_counts = {
-        "restorativeness": 0,
-        "nutrition": 0,
-        "care": 0,
-    }
-    nonzero_input_zero_output_counts = {
-        "restorativeness": 0,
-        "nutrition": 0,
-        "care": 0,
-    }
-    sample_limit = 5
-    sampled_zero_capabilities = {
-        "restorativeness": 0,
-        "nutrition": 0,
-        "care": 0,
-    }
 
     with (
         open(output_paths["restorativeness"], "w", newline="", encoding="utf-8") as f_rest,
@@ -87,25 +71,6 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
                 capability_nut = cap.electre_iii_integration(nut_vals, "nutrition") if nut_vals else 0.0
                 capability_care = cap.electre_iii_integration(care_vals, "care") if care_vals else 0.0
 
-                capability_debug = [
-                    ("restorativeness", capability_rest, rest_vals, ctx.rest_services),
-                    ("nutrition", capability_nut, nut_vals, ctx.nut_services),
-                    ("care", capability_care, care_vals, ctx.care_services),
-                ]
-                for capability_name, capability_score, values, service_names in capability_debug:
-                    if capability_score == 0.0:
-                        zero_capability_counts[capability_name] += 1
-                        if values and max(values) > 0.0:
-                            nonzero_input_zero_output_counts[capability_name] += 1
-                            if sampled_zero_capabilities[capability_name] < sample_limit:
-                                print(
-                                    f"[Capability] Zero score with positive inputs: node_id={node.node_id} "
-                                    f"capability={capability_name} services={list(service_names)} "
-                                    f"service_scores={values}",
-                                    flush=True,
-                                )
-                                sampled_zero_capabilities[capability_name] += 1
-
                 row_rest = [node.node_id, node.lat, node.lon, capability_rest]
                 row_rest.extend(scores[s] for s in ctx.rest_services)
                 writer_rest.writerow(row_rest)
@@ -132,21 +97,6 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
     avg_rest = (rest_sum / rows_written) if rows_written else 0.0
     avg_nut = (nut_sum / rows_written) if rows_written else 0.0
     avg_care = (care_sum / rows_written) if rows_written else 0.0
-
-    print(
-        f"[Capability] Summary: rows={rows_written} "
-        f"zero_rest={zero_capability_counts['restorativeness']}/{rows_written or 1} "
-        f"zero_nutrition={zero_capability_counts['nutrition']}/{rows_written or 1} "
-        f"zero_care={zero_capability_counts['care']}/{rows_written or 1}",
-        flush=True,
-    )
-    print(
-        f"[Capability] Nonzero-input zero-output counts: "
-        f"restorativeness={nonzero_input_zero_output_counts['restorativeness']} "
-        f"nutrition={nonzero_input_zero_output_counts['nutrition']} "
-        f"care={nonzero_input_zero_output_counts['care']}",
-        flush=True,
-    )
 
     experiments_dir = "experiments"
     os.makedirs(experiments_dir, exist_ok=True)

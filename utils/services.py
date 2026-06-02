@@ -713,6 +713,67 @@ def choquet_integral(x, service):
     return max(0.0, min(1.0, normalized))
 
 
+def choquet_integral_details(x, service):
+    """Return a detailed Choquet integral breakdown for debugging."""
+    n = len(x)
+    if n == 0:
+        return {
+            "service": service,
+            "input": [],
+            "sorted_indices": [],
+            "sorted_values": [],
+            "poi_types": [],
+            "steps": [],
+            "mu_full": 0.0,
+            "total": 0.0,
+            "normalized": 0.0,
+        }
+
+    x_clamped = [max(0.0, min(1.0, float(v))) for v in x]
+    order = sorted(range(n), key=lambda i: x_clamped[i])
+    x_sorted = [x_clamped[i] for i in order]
+    poi_types = [q.poi_type for q in SERVICE_POI_QUERIES[service]]
+
+    steps = []
+    total = 0.0
+    prev = 0.0
+    for j in range(n):
+        tail_indices = order[j:]
+        tail = [poi_types[i] for i in tail_indices]
+        tail_cap = float(cap(tail, service))
+        delta = float(x_sorted[j] - prev)
+        term = delta * tail_cap
+        total += term
+        steps.append(
+            {
+                "j": j,
+                "index": int(order[j]),
+                "value": float(x_sorted[j]),
+                "prev": float(prev),
+                "delta": float(delta),
+                "tail": tail,
+                "capacity": tail_cap,
+                "term": float(term),
+                "running_total": float(total),
+            }
+        )
+        prev = x_sorted[j]
+
+    mu_full = float(cap(poi_types, service))
+    normalized = 0.0 if mu_full <= 0.0 else total / mu_full
+    return {
+        "service": service,
+        "input": [float(v) for v in x_clamped],
+        "sorted_indices": [int(i) for i in order],
+        "sorted_values": [float(v) for v in x_sorted],
+        "poi_types": list(poi_types),
+        "steps": steps,
+        "mu_full": float(mu_full),
+        "total": float(total),
+        "normalized": float(max(0.0, min(1.0, normalized))),
+    }
+
+
 if __name__ == "__main__":
     import pprint
 

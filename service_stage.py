@@ -181,14 +181,16 @@ def run_service_stage(ctx: PipelineContext, acc: AccessibilityStageResult) -> Se
                     empty_input_counts[service] += 1
                     score = 0.0
                 else:
-                    score = serv.choquet_integral(values, service)
+                    detail = serv.choquet_integral_details(values, service)
+                    score = float(detail["normalized"])
                     if score == 0.0 and max(values) > 0.0:
                         nonzero_input_zero_output_counts[service] += 1
                         if sampled_zero_services[service] < sample_limit:
                             print(
-                                f"[Service] Zero score with positive inputs: node_id={node.node_id} "
-                                f"service={service} poi_types={[item.get('poi_type') for item in items]} "
-                                f"accessibility={values}",
+                                "[Service] Choquet collapse to 0: "
+                                f"node_id={node.node_id} service={service} "
+                                f"poi_types={[item.get('poi_type') for item in items]} "
+                                f"detail={json.dumps(detail, ensure_ascii=False)}",
                                 flush=True,
                             )
                             sampled_zero_services[service] += 1
