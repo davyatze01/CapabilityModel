@@ -164,13 +164,39 @@ def run_service_stage(ctx: PipelineContext, acc: AccessibilityStageResult) -> Se
     # Slow path: aggregate from accessibility payload and then persist cache.
     out = ServiceStageResult()
     pbar = tqdm(total=len(acc.node_results), desc="Service stage", mininterval=1) if ctx.config.enable_progress else None
+    zero_service_counts = {service: 0 for service in serv.SERVICE_KEYS}
+    empty_input_counts = {service: 0 for service in serv.SERVICE_KEYS}
+    all_zero_node_count = 0
+    nonzero_input_zero_output_counts = {service: 0 for service in serv.SERVICE_KEYS}
+    sample_limit = 5
+    sampled_zero_services: dict[str, int] = {service: 0 for service in serv.SERVICE_KEYS}
     try:
         for node in acc.node_results:
             service_scores = {}
+            node_all_zero = True
             for service in serv.SERVICE_KEYS:
                 items = node.accessibility_by_service.get(service, [])
                 values = [float(item["accessibility"]) for item in items]
-                service_scores[service] = serv.choquet_integral(values, service) if values else 0.0
+                if not values:
+                    empty_input_counts[service] += 1
+                    score = 0.0
+                else:
+                    score = serv.choquet_integral(values, service)
+                    if score == 0.0 and max(values) > 0.0:
+                        nonzero_input_zero_output_counts[service] += 1
+                        if sampled_zero_services[service] < sample_limit:
+                            print(
+                                f"[Service] Zero score with positive inputs: node_id={node.node_id} "
+                                f"service={service} poi_types={[item.get('poi_type') for item in items]} "
+                                f"accessibility={values}",
+                                flush=True,
+                            )
+                            sampled_zero_services[service] += 1
+                service_scores[service] = score
+                if score > 0.0:
+                    node_all_zero = False
+                else:
+                    zero_service_counts[service] += 1
             out.node_results.append(
                 ServiceNodeResult(
                     node_id=node.node_id,
@@ -179,11 +205,27 @@ def run_service_stage(ctx: PipelineContext, acc: AccessibilityStageResult) -> Se
                     service_scores=service_scores,
                 )
             )
+            if node_all_zero:
+                all_zero_node_count += 1
             if pbar:
                 pbar.update(1)
     finally:
         if pbar:
             pbar.close()
+
+    total_nodes = len(acc.node_results)
+    print(
+        f"[Service] Summary: nodes={total_nodes} all_zero_nodes={all_zero_node_count} "
+        f"cache={'enabled' if ctx.config.service_matrix_cache_enabled else 'disabled'}",
+        flush=True,
+    )
+    for service in serv.SERVICE_KEYS:
+        print(
+            f"[Service] service={service} zero_scores={zero_service_counts[service]}/{total_nodes} "
+            f"empty_inputs={empty_input_counts[service]} "
+            f"nonzero_input_zero_output={nonzero_input_zero_output_counts[service]}",
+            flush=True,
+        )
 
     _write_service_matrix_cache(ctx, out)
     return out
