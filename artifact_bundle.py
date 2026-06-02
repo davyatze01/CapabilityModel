@@ -52,6 +52,13 @@ def load_impedance_bundle(
     )
     mat[:] = bus_matrix
     mat.flush()
+    nonzero_count = int(np.count_nonzero(bus_matrix))
+    total_count = int(bus_matrix.size)
+    print(
+        f"[Artifact] Loaded impedance bundle: bus_impedance_nonzero={nonzero_count}/{total_count} "
+        f"bus_impedance_zero={total_count - nonzero_count}",
+        flush=True,
+    )
 
     cache_paths: dict[str, str] = {}
     for idx, node_id in enumerate(node_ids.tolist()):
