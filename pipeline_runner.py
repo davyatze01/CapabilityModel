@@ -157,7 +157,7 @@ project_crs = QgsCoordinateReferenceSystem("EPSG:3857")
 project.setCrs(project_crs)
 
 if {basemap_flag}:
-    osm_uri = "type=xyz&url=https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png"
+    osm_uri = "type=xyz&url=https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png&zmin=0&zmax=19&crs=EPSG:3857"
     osm_layer = QgsRasterLayer(osm_uri, "OSM", "wms")
     if osm_layer.isValid():
         project.addMapLayer(osm_layer)
