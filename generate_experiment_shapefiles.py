@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import geopandas as gpd
 import networkx as nx
 import numpy as np
 import pandas as pd
-from shapely.geometry import Point
-from shapely.geometry import box
+from shapely.geometry import Point, Polygon
 
 from plot_shapefile import find_value_column, load_graph, pick_graphml_file
 
@@ -260,6 +260,20 @@ def _prepare_gpkg_layer(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return prepared
 
 
+def _regular_hexagon(center_x: float, center_y: float, radius_m: float) -> Polygon:
+    """Build a flat-top regular hexagon from a center and circumradius."""
+    vertices = []
+    for index in range(6):
+        angle = math.radians(60.0 * index)
+        vertices.append(
+            (
+                center_x + radius_m * math.cos(angle),
+                center_y + radius_m * math.sin(angle),
+            )
+        )
+    return Polygon(vertices)
+
+
 def _write_gpkg_layer(
     gdf: gpd.GeoDataFrame,
     output_path: Path,
@@ -365,7 +379,7 @@ def _build_capability_grid(
     cell_size_m: float,
     max_cells: int,
 ) -> gpd.GeoDataFrame | None:
-    """Build full bbox grid and aggregate point capability means per square."""
+    """Build full bbox hex grid and aggregate point capability means per cell."""
     capability_columns = [column for column in points_gdf.columns if str(column).startswith("capability_")]
     if not capability_columns:
         return None
@@ -393,52 +407,57 @@ def _build_capability_grid(
     if min_x == max_x or min_y == max_y:
         return None
 
-    start_ix = int(min_x // cell_size_m)
-    end_ix = int(max_x // cell_size_m)
-    if end_ix * cell_size_m < max_x:
-        end_ix += 1
+    # Interpret the configured size as the radius of the inscribed circle of
+    # each regular hexagon. Convert it to the circumradius used for geometry.
+    circle_radius_m = float(cell_size_m)
+    hex_radius_m = circle_radius_m / math.cos(math.pi / 6.0)
+    hex_width_m = 2.0 * hex_radius_m
+    hex_height_m = math.sqrt(3.0) * hex_radius_m
+    x_step_m = 1.5 * hex_radius_m
+    y_step_m = hex_height_m
 
-    start_iy = int(min_y // cell_size_m)
-    end_iy = int(max_y // cell_size_m)
-    if end_iy * cell_size_m < max_y:
-        end_iy += 1
-
-    n_x = max(0, end_ix - start_ix)
-    n_y = max(0, end_iy - start_iy)
-    total_cells = n_x * n_y
-    if total_cells == 0:
-        return None
-    if total_cells > max_cells:
-        raise ValueError(
-            f"Grid would create {total_cells:,} cells (limit: {max_cells:,}). "
-            "Increase qgis_grid_cell_size_m or clean coordinate outliers."
-        )
-
-    # Assign each point to a grid cell by integer cell index.
-    work["ix"] = (work.geometry.x // cell_size_m).astype(int)
-    work["iy"] = (work.geometry.y // cell_size_m).astype(int)
-    grouped_values = work.groupby(["ix", "iy"], dropna=False)[capability_columns].mean().reset_index()
-    rename_map = {column: f"grid_mean_{column.replace('capability_', '')}" for column in capability_columns}
-    grouped_values = grouped_values.rename(columns=rename_map)
-
-    # Build the complete square grid across the full point-layer bounding box.
     all_cells: list[dict[str, object]] = []
-    for ix in range(start_ix, end_ix):
-        for iy in range(start_iy, end_iy):
+    col_idx = 0
+    x = min_x - hex_radius_m
+    while x <= max_x + hex_radius_m:
+        y_offset = 0.0 if col_idx % 2 == 0 else hex_height_m / 2.0
+        y = min_y - hex_height_m
+        row_idx = 0
+        while y <= max_y + hex_height_m:
+            center_y = y + y_offset
             all_cells.append(
                 {
-                    "ix": ix,
-                    "iy": iy,
-                    "geometry": box(
-                        ix * cell_size_m,
-                        iy * cell_size_m,
-                        (ix + 1) * cell_size_m,
-                        (iy + 1) * cell_size_m,
-                    ),
+                    "ix": col_idx,
+                    "iy": row_idx,
+                    "geometry": _regular_hexagon(x, center_y, hex_radius_m),
                 }
             )
+            if len(all_cells) > max_cells:
+                raise ValueError(
+                    f"Grid would create more than {max_cells:,} hex cells. "
+                    "Increase qgis_grid_cell_size_m or clean coordinate outliers."
+                )
+            y += y_step_m
+            row_idx += 1
+        x += x_step_m
+        col_idx += 1
+
+    if not all_cells:
+        return None
 
     grid_gdf = gpd.GeoDataFrame(all_cells, geometry="geometry", crs="EPSG:3857")
+
+    points = work.copy().reset_index(drop=True)
+    points["point_id"] = np.arange(len(points), dtype=int)
+    joined = gpd.sjoin(
+        points[["point_id", "geometry"] + capability_columns],
+        grid_gdf[["ix", "iy", "geometry"]],
+        how="left",
+        predicate="within",
+    )
+    grouped_values = joined.groupby(["ix", "iy"], dropna=False)[capability_columns].mean().reset_index()
+    rename_map = {column: f"grid_mean_{column.replace('capability_', '')}" for column in capability_columns}
+    grouped_values = grouped_values.rename(columns=rename_map)
     grid_gdf = grid_gdf.merge(grouped_values, on=["ix", "iy"], how="left")
     selected_col = f"grid_mean_{capability_field.replace('capability_', '')}"
     if selected_col in grid_gdf.columns:
@@ -448,6 +467,9 @@ def _build_capability_grid(
     grid_gdf["has_data"] = grid_gdf["grid_mean"].notna().astype(int)
     grid_gdf["capability_field"] = capability_field
     grid_gdf["cell_size_m"] = float(cell_size_m)
+    grid_gdf["hex_radius_m"] = float(hex_radius_m)
+    grid_gdf["hex_width_m"] = float(hex_width_m)
+    grid_gdf["hex_height_m"] = float(hex_height_m)
     return grid_gdf.to_crs("EPSG:4326")
 
 
