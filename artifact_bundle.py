@@ -115,6 +115,13 @@ def write_impedance_bundle(
         shape=(n_rows, n_dest),
     )
     matrix = np.array(matrix_mem, dtype=np.float32)
+    nonzero_count = int(np.count_nonzero(matrix))
+    total_count = int(matrix.size)
+    print(
+        f"[Artifact] Restored bus impedance matrix: nonzero={nonzero_count}/{total_count} "
+        f"zero={total_count - nonzero_count}",
+        flush=True,
+    )
 
     blobs = np.empty((len(node_ids),), dtype=object)
     for idx, node_id in enumerate(node_ids.tolist()):

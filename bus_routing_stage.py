@@ -465,6 +465,13 @@ def build_bus_impedance_cache(context: PipelineContext, force_rebuild: bool = Fa
                         impedance = 0.0
             impedance_matrix[source_row][dest_col] = impedance
     impedance_matrix.flush()
+    nonzero_count = int(np.count_nonzero(impedance_matrix))
+    total_count = int(impedance_matrix.size)
+    print(
+        f"[Bus] Built bus impedance matrix: nonzero={nonzero_count}/{total_count} "
+        f"zero={total_count - nonzero_count}",
+        flush=True,
+    )
 
     if missing_from_ids or missing_to_ids:
         sample_from = sorted(missing_from_ids)[:5]
