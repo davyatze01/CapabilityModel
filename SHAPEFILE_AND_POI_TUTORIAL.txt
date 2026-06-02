@@ -1,0 +1,119 @@
+Capability Model - Shapefile and POI Loading Tutorial
+=====================================================
+
+This guide explains, in simple steps, how to change:
+1) the shapefile used to build the graph (study area boundary),
+2) the shapefiles used to load POIs (points/lines/polygons),
+3) the POI type column mapping (including TYPEQU).
+
+You do NOT need to edit Python code for normal changes.
+
+
+------------------------------------------------------------
+A) Change the boundary shapefile (graph extraction area)
+------------------------------------------------------------
+
+1. Put your boundary shapefile files in the project folder.
+   Recommended location:
+   - shapefile_base/
+
+   A shapefile is usually multiple files with the same name:
+   .shp, .shx, .dbf, .prj, etc.
+   Keep them together.
+
+2. Open file: config.py
+
+3. Find this setting in class PipelineConfig:
+   name_shapefile = "..."
+
+4. Set it to your boundary shapefile path (relative to project root).
+   Example:
+   name_shapefile = "shapefile_base/my_boundary.shp"
+
+
+------------------------------------------------------------
+B) Change POI shapefiles (where POIs are loaded from)
+------------------------------------------------------------
+
+1. Put your POI shapefiles in the project (any folder you want).
+   You can use 1, 2, or 3 shapefiles.
+
+2. Open file: config.py
+
+3. Find this setting:
+   poi_shapefile_paths = [
+       "pois_shp/poi_points.shp",
+       "pois_shp/poi_lines.shp",
+       "pois_shp/poi_polygons.shp",
+   ]
+
+4. Replace the paths with your files.
+   Example:
+   poi_shapefile_paths = [
+       "Paris/pois_points.shp",
+       "Paris/pois_lines.shp",
+       "Paris/pois_polygons.shp",
+   ]
+
+   If you only have one file, keep only one path:
+   poi_shapefile_paths = [
+       "Paris/all_pois.shp",
+   ]
+
+
+------------------------------------------------------------
+C) Use TYPEQU as POI type source
+------------------------------------------------------------
+
+The model expects an internal POI type column called:
+   poi_type
+
+Current loader already supports:
+   - poi_type
+   - poiType
+   - TYPEQU
+
+So if your shapefile has TYPEQU, it will be used automatically.
+
+
+------------------------------------------------------------
+D) Make TYPEQU values match model POI types
+------------------------------------------------------------
+
+Important:
+The values in your POI column (poi_type / poiType / TYPEQU) must match
+labels configured in:
+   config/poi_types.csv
+
+How matching works:
+- In poi_types.csv, each row has a model poi_type and a labels list.
+- A POI from shapefile is used for that model poi_type when its text value
+  appears in labels.
+
+Example:
+If TYPEQU contains "Farmacia", and you want it to count as
+"medicines_and_supplies", then in the row for medicines_and_supplies, include
+"Farmacia" in the labels list.
+
+
+------------------------------------------------------------
+E) Run the model
+------------------------------------------------------------
+
+After changes, run:
+   python main.py
+
+If a POI label is not mapped, you may get an error saying some shapefile POI
+types are missing from configured labels in config/poi_types.csv.
+In that case, add missing values to labels.
+
+
+------------------------------------------------------------
+F) Quick checklist
+------------------------------------------------------------
+
+[ ] Boundary shapefile path updated in config.py (name_shapefile)
+[ ] POI shapefile path list updated in config.py (poi_shapefile_paths)
+[ ] POI type values mapped in config/poi_types.csv labels
+[ ] Run python main.py
+

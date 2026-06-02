@@ -51,8 +51,15 @@ class PipelineConfig:
     qgis_grid_opacity: float = 0.55
     qgis_grid_max_cells: int = 500000
     poi_from_shp: bool = True
+    poi_shapefile_paths: list[str] = field(
+        default_factory=lambda: [
+            "pois_shp/poi_points.shp",
+            "pois_shp/poi_lines.shp",
+            "pois_shp/poi_polygons.shp",
+        ]
+    )
     worker_count: int | None = 12
-    skip_routing: bool = True
+    skip_routing: bool = False
     accessibility_chunksize: int = 100
     accessibility_deduplicate_entries: bool = True
     artifacts_root_dir: str = "artifacts"
@@ -90,7 +97,10 @@ class PipelineConfig:
     osm_autobuild_network_type: str = "all"
     osm_autobuild_simplify: bool = False
     osm_autobuild_retain_all: bool = True
-    gtfs_feeds: list[str] = field(default_factory=lambda: [os.path.join("gtfs", "GTFS.zip"), os.path.join("gtfs","arst-cagliari-it.zip")])
+    gtfs_feeds: list[str] = field(default_factory=lambda: [
+        os.path.join("gtfs", "GTFS.zip")
+    ])
+    # gtfs_feeds: list[str] = field(default_factory=lambda: [os.path.join("gtfs", "GTFS.zip"), os.path.join("gtfs", "arst-cagliari-it.zip")])
     bus_routing_matrix_path: str = ""
     bus_routing_cache_path: str = ""
     bus_routing_origins_input_path: str = ""

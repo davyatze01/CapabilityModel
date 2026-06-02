@@ -9,6 +9,9 @@ from shapely.geometry.base import BaseGeometry
 from config import PipelineConfig
 
 
+_UNUSED_POI_TYPES_WARNED: set[tuple[str, tuple[str, ...]]] = set()
+
+
 def graph_from_shapefile(
     shp_name: str,
     network_type: str = "drive"
@@ -29,15 +32,19 @@ def graph_from_shapefile(
 
 
     if isinstance(geometry, (Polygon, MultiPolygon)):
-
         polygon = cast(Polygon | MultiPolygon, geometry)
+        # Fix occasional invalid rings/self-intersections before OSMnx usage.
+        if not polygon.is_valid:
+            polygon = cast(Polygon | MultiPolygon, polygon.buffer(0))
 
     else:
         raise TypeError(f"Unsupported geometry type: {type(geometry)}")
 
     G = ox.graph_from_polygon(
         polygon,
-        network_type=network_type
+        network_type=network_type,
+        simplify=False,
+        retain_all=True,
     )
 
     return shp_name,G
@@ -72,12 +79,8 @@ def feature_from_shapefile(shp_name : str, query_tags: dict, poi_type: str | Non
 
 def poi_from_shp(poi_type: str | None = None):
     from utils import services as serv
-
-    paths = [
-        "pois_shp/poi_points.shp",
-        "pois_shp/poi_lines.shp",
-        "pois_shp/poi_polygons.shp",
-    ]
+    cfg = PipelineConfig()
+    paths = list(cfg.poi_shapefile_paths)
 
     frames = []
     for path in paths:
@@ -102,6 +105,8 @@ def poi_from_shp(poi_type: str | None = None):
     # Support both poi_type (new) and poiType (legacy) column names
     if "poi_type" not in pois.columns and "poiType" in pois.columns:
         pois = pois.rename(columns={"poiType": "poi_type"})
+    if "poi_type" not in pois.columns and "TYPEQU" in pois.columns:
+        pois = pois.rename(columns={"TYPEQU": "poi_type"})
 
     if "poi_type" not in pois.columns:
         return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
@@ -122,17 +127,32 @@ def poi_from_shp(poi_type: str | None = None):
 
     missing_poi_types = shp_poi_types - configured_labels
     if missing_poi_types:
-        raise ValueError(
-            "poi_type values found in shapefiles but missing from configured labels in config/poi_types.csv: "
-            + ", ".join(sorted(missing_poi_types))
-        )
+        missing_key = (str(cfg.name_shapefile), tuple(sorted(missing_poi_types)))
+        if missing_key not in _UNUSED_POI_TYPES_WARNED:
+            _UNUSED_POI_TYPES_WARNED.add(missing_key)
+            print(
+                "[POI] The following poi_types were found in the shapefile but are currently unused "
+                f"for config/poi_types.csv: {', '.join(sorted(missing_poi_types))}",
+                flush=True,
+            )
 
     if poi_type is None:
         return pois.copy()
 
     query_poi_types = labels_by_poi_type.get(str(poi_type), set())
     if not query_poi_types:
+        print(
+            f"[POI] No shapefile labels configured for poi_type='{poi_type}'. Returning empty result.",
+            flush=True,
+        )
         return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
 
     mask = pois["poi_type"].astype(str).isin(query_poi_types)
-    return pois.loc[mask].copy()
+    out = pois.loc[mask].copy()
+    if out.empty:
+        print(
+            f"[POI] No shapefile POIs matched poi_type='{poi_type}' "
+            f"labels={sorted(query_poi_types)}. Returning empty result.",
+            flush=True,
+        )
+    return out

@@ -67,9 +67,9 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
                 nut_vals = [scores[s] for s in cap.CAP_NUTRITION_IDX]
                 care_vals = [scores[s] for s in cap.CAP_CARE_IDX]
 
-                capability_rest = cap.choquet_integral(rest_vals, "restorativeness") if rest_vals else 0.0
-                capability_nut = cap.choquet_integral(nut_vals, "nutrition") if nut_vals else 0.0
-                capability_care = cap.choquet_integral(care_vals, "care") if care_vals else 0.0
+                capability_rest = cap.electre_iii_integration(rest_vals, "restorativeness") if rest_vals else 0.0
+                capability_nut = cap.electre_iii_integration(nut_vals, "nutrition") if nut_vals else 0.0
+                capability_care = cap.electre_iii_integration(care_vals, "care") if care_vals else 0.0
 
                 row_rest = [node.node_id, node.lat, node.lon, capability_rest]
                 row_rest.extend(scores[s] for s in ctx.rest_services)

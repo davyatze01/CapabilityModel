@@ -11,9 +11,14 @@ import csv
 import copy
 import shutil
 import json
+import time
+import gc
 import numpy as np
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+from types import SimpleNamespace
 import pandas as pd
 import matplotlib.pyplot as plt
 
@@ -24,6 +29,8 @@ from accessibility_stage import run_accessibility_stage
 from service_stage import run_service_stage
 from capability_stage import run_capability_stage
 from pipeline_runner import generate_spatial_outputs
+from pipeline_runner import _resolve_qgis_executable, _resolve_qgis_python_launcher
+from utils import graphml
 from pipeline_types import BusRoutingStageResult, NonBusRoutingStageResult
 
 
@@ -179,6 +186,9 @@ class ScenarioRunner:
             # Run capability stage
             print("[Stage] Capability Aggregation (Scenario)", flush=True)
             cap = run_capability_stage(self.ctx, svc)
+
+            # Generate scenario spatial outputs (shapefile + gpkg).
+            spatial_outputs = generate_spatial_outputs(self.ctx.config, cap)
             
             # Restore original settings
             self.ctx.config.artifact_slug = original_artifact_slug
@@ -200,6 +210,7 @@ class ScenarioRunner:
                 "accessibility": acc,
                 "service": svc,
                 "capability": cap,
+                "spatial_outputs": spatial_outputs,
             }
         
         finally:
@@ -358,10 +369,218 @@ class ScenarioRunner:
         
         print(f"[Output] Saved summary: {summary_path}", flush=True)
 
+    def rebuild_baseline_gpkg_from_csv(self, baseline_gpkg: Path, experiments_dir: str = "experiments") -> bool:
+        """Rebuild baseline geopackage from CSV data in experiments directory.
+        
+        Returns True if rebuilt successfully, False otherwise.
+        """
+        import geopandas as gpd
+        import pandas as pd
+        
+        print(f"[Baseline] Attempting to rebuild from CSV files in {experiments_dir}", flush=True)
+        
+        # Load baseline CSVs
+        baseline_csvs = {}
+        if os.path.isdir(experiments_dir):
+            for cap_type in ["restorativeness", "nutrition", "care"]:
+                pattern = f"capability_{cap_type}.csv"
+                for filename in sorted(os.listdir(experiments_dir), reverse=True):
+                    if pattern in filename:
+                        path = os.path.join(experiments_dir, filename)
+                        if os.path.isfile(path):
+                            baseline_csvs[cap_type] = path
+                            break
+        
+        if not baseline_csvs or len(baseline_csvs) < 3:
+            print("[Baseline] Could not find all required CSV files", flush=True)
+            return False
+        
+        # Load and merge CSVs
+        try:
+            baseline_df = pd.read_csv(baseline_csvs["restorativeness"])
+            baseline_df["capability_nutrition"] = pd.read_csv(baseline_csvs["nutrition"])["capability_nutrition"]
+            baseline_df["capability_care"] = pd.read_csv(baseline_csvs["care"])["capability_care"]
+            
+            # Convert to GeoDataFrame
+            from shapely.geometry import Point
+            geometry = [Point(xy) for xy in zip(baseline_df.lon, baseline_df.lat)]
+            baseline_gdf = gpd.GeoDataFrame(
+                baseline_df[["node_id", "lat", "lon", "capability_restorativeness", "capability_nutrition", "capability_care"]],
+                geometry=geometry,
+                crs="EPSG:4326"
+            )
+            
+            # Ensure output directory exists
+            baseline_gpkg.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Write to geopackage
+            baseline_gdf.to_file(baseline_gpkg, layer="capability_points", driver="GPKG")
+            print(f"[Baseline] Successfully rebuilt from CSV: {baseline_gpkg}", flush=True)
+            return True
+            
+        except Exception as e:
+            print(f"[Baseline] Failed to rebuild geopackage: {e}", flush=True)
+            return False
+
+    def create_scenario_comparison_project(
+        self,
+        baseline_gpkg: str | Path,
+        scenario_gpkg: str | Path,
+        scenario_name: str,
+    ) -> Path | None:
+        """Create a QGIS project with baseline and scenario layers side-by-side."""
+        qgis_exe = _resolve_qgis_executable(self.cfg)
+        if not qgis_exe:
+            print("[QGIS] Comparison project skipped: QGIS executable not found.", flush=True)
+            return None
+
+        python_launcher = _resolve_qgis_python_launcher(qgis_exe)
+        if python_launcher is None:
+            print("[QGIS] Comparison project skipped: python-qgis launcher not found.", flush=True)
+            return None
+
+        baseline_gpkg = Path(baseline_gpkg)
+        scenario_gpkg = Path(scenario_gpkg)
+        if not baseline_gpkg.exists() or not scenario_gpkg.exists():
+            print(
+                f"[QGIS] Comparison project skipped: missing inputs baseline={baseline_gpkg.exists()} scenario={scenario_gpkg.exists()}",
+                flush=True,
+            )
+            return None
+
+        output_dir = Path("scenarios") / scenario_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_project = output_dir / "scenario_comparison.qgz"
+
+        baseline_literal = repr(str(baseline_gpkg))
+        scenario_literal = repr(str(scenario_gpkg))
+        output_literal = repr(str(output_project))
+        field_literal = repr(str(self.cfg.qgis_autostyle_field))
+        ramp_literal = repr(str(self.cfg.qgis_autostyle_ramp))
+        classes_count = int(self.cfg.qgis_autostyle_classes)
+        basemap_flag = "True" if self.cfg.qgis_autostyle_basemap else "False"
+
+        script = f"""
+from qgis.core import (
+    QgsApplication,
+    QgsCoordinateReferenceSystem,
+    QgsGradientColorRamp,
+    QgsGraduatedSymbolRenderer,
+    QgsProject,
+    QgsRasterLayer,
+    QgsStyle,
+    QgsVectorLayer,
+)
+from qgis.PyQt.QtGui import QColor
+
+app = QgsApplication([], False)
+app.initQgis()
+project = QgsProject.instance()
+project.setCrs(QgsCoordinateReferenceSystem("EPSG:3857"))
+
+if {basemap_flag}:
+    osm_uri = "type=xyz&url=https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png"
+    osm_layer = QgsRasterLayer(osm_uri, "OSM", "wms")
+    if osm_layer.isValid():
+        project.addMapLayer(osm_layer)
+
+def load_layer(gpkg_path, layer_name):
+    layer = QgsVectorLayer(gpkg_path + "|layername=capability_points", layer_name, "ogr")
+    if not layer.isValid():
+        layer = QgsVectorLayer(gpkg_path, layer_name, "ogr")
+    return layer
+
+def style_layer(layer):
+    if not layer.isValid():
+        return
+    available_fields = [field.name() for field in layer.fields()]
+    preferred_fields = [{field_literal}, "capability_care", "capability_restorativeness", "capability_nutrition", "value"]
+    field_name = next((name for name in preferred_fields if name in available_fields), None)
+    if not field_name:
+        return
+    renderer = QgsGraduatedSymbolRenderer()
+    renderer.setClassAttribute(field_name)
+    renderer.setMode(QgsGraduatedSymbolRenderer.EqualInterval)
+    renderer.updateClasses(layer, int({classes_count}))
+    ramp = QgsStyle.defaultStyle().colorRamp({ramp_literal})
+    if ramp is None:
+        ramp = QgsGradientColorRamp(QColor("#440154"), QColor("#FDE725"))
+    renderer.updateColorRamp(ramp)
+    layer.setRenderer(renderer)
+
+baseline_layer = load_layer({baseline_literal}, "Scenario 1 - Baseline")
+scenario_layer = load_layer({scenario_literal}, "Scenario 2 - {scenario_name}")
+
+if not baseline_layer.isValid() and not scenario_layer.isValid():
+    raise SystemExit("Could not load either scenario layer.")
+
+if baseline_layer.isValid():
+    style_layer(baseline_layer)
+    project.addMapLayer(baseline_layer)
+if scenario_layer.isValid():
+    style_layer(scenario_layer)
+    project.addMapLayer(scenario_layer)
+    scenario_layer.setOpacity(0.65)
+
+project.write({output_literal})
+
+# Zoom to layers
+if baseline_layer.isValid() and scenario_layer.isValid():
+    extent = baseline_layer.extent()
+    extent.combineExtentWith(scenario_layer.extent())
+elif baseline_layer.isValid():
+    extent = baseline_layer.extent()
+else:
+    extent = scenario_layer.extent()
+
+canvas = project.layerTreeRoot()
+if canvas:
+    canvas.findLayer(baseline_layer.id()).setExpanded(True) if baseline_layer.isValid() else None
+    canvas.findLayer(scenario_layer.id()).setExpanded(True) if scenario_layer.isValid() else None
+
+app.exitQgis()
+"""
+
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as handle:
+            handle.write(script)
+            script_path = handle.name
+
+        try:
+            subprocess.run([python_launcher, script_path], check=True)
+        except subprocess.CalledProcessError as exc:
+            print(f"[QGIS] Failed to create scenario comparison project: {exc}", flush=True)
+            return None
+
+        print(f"[QGIS] Scenario comparison project: {output_project}", flush=True)
+        return output_project
+
 
 def run_all_scenarios():
     """Run baseline and all scenarios, then compare."""
     cfg = PipelineConfig()
+    
+    # Override config for Cagliari scenarios - always use Cagliari regardless of main config
+    cfg.city_name = "Cagliari, Sardinia, Italy"
+    cfg.use_shapefile = True
+    cfg.name_shapefile = "Cagliari_Shapefile.shp"
+    cfg.poi_from_shp = True
+    cfg.poi_shapefile_paths = [
+        "pois_shp/poi_points.shp",
+        "pois_shp/poi_lines.shp",
+        "pois_shp/poi_polygons.shp",
+    ]
+    # Recalculate derived configuration values
+    cfg.__post_init__()
+    
+    # Store Cagliari artifact slug for baseline lookup (both baseline and scenario use Cagliari)
+    cagliari_artifact_slug = cfg.artifact_slug
+    
+    # Clear cached graphs from previous runs so new config is used
+    graphml._GRAPH_CACHE = None
+    graphml._MODE_GRAPH_CACHE = {}
+    graphml._CITY_POI_UNIVERSE_CACHE = {}
+    graphml._POI_DOWNLOAD_LOGGED = set()
+    
     runner = ScenarioRunner(cfg)
     
     # Run public strike scenario
@@ -446,6 +665,61 @@ def run_all_scenarios():
         comparison_path = os.path.join(scenarios_dir, "comparison_results.csv")
         comparison_df.to_csv(comparison_path, index=False)
         print(f"\n[Output] Saved comparison: {comparison_path}", flush=True)
+
+        # Build one QGIS project with baseline + scenario spatial layers.
+        # Use the Cagliari artifact_slug since both baseline and scenario are Cagliari
+        baseline_gpkg = Path("outputs") / "gpkg" / cagliari_artifact_slug / f"{cagliari_artifact_slug}.gpkg"
+        
+        print(f"\n[QGIS] Looking for baseline geopackage: {baseline_gpkg}", flush=True)
+        print(f"[QGIS] Baseline exists: {baseline_gpkg.exists()}", flush=True)
+        
+        # Check if baseline geopackage has correct data (not scenario data)
+        if baseline_gpkg.exists():
+            try:
+                import geopandas as gpd
+                baseline_test_df = gpd.read_file(baseline_gpkg, layer="capability_points")
+                baseline_care_mean = baseline_test_df['capability_care'].mean()
+                print(f"[QGIS] Baseline geopackage care mean: {baseline_care_mean:.4f}", flush=True)
+                
+                # If baseline has scenario values (close to 0.8332), rebuild from CSV
+                if baseline_care_mean < 0.85:  # Scenario mean is ~0.8332, baseline should be ~0.9541
+                    print("[QGIS] Baseline geopackage contains scenario data, rebuilding from CSV...", flush=True)
+                    if runner.rebuild_baseline_gpkg_from_csv(baseline_gpkg):
+                        print("[QGIS] Baseline geopackage rebuilt successfully", flush=True)
+                    else:
+                        print("[QGIS] Failed to rebuild baseline geopackage", flush=True)
+            except Exception as e:
+                print(f"[QGIS] Error checking baseline geopackage: {e}", flush=True)
+        
+        if results:
+            scenario_gpkg = results[0].get("spatial_outputs", {}).get("gpkg_path")
+            if scenario_gpkg:
+                if baseline_gpkg.exists():
+                    comparison_project = runner.create_scenario_comparison_project(
+                        baseline_gpkg=baseline_gpkg,
+                        scenario_gpkg=scenario_gpkg,
+                        scenario_name=results[0]["name"],
+                    )
+                else:
+                    print(
+                        "[QGIS] Baseline geopackage not found. Make sure the main pipeline was run first.",
+                        flush=True
+                    )
+                    print(
+                        f"[QGIS] Expected baseline at: {baseline_gpkg}",
+                        flush=True
+                    )
+                    comparison_project = None
+                
+                # Open the comparison project in QGIS with a delay to ensure all file handles are released
+                if comparison_project and cfg.open_qgis_after_run:
+                    print("[QGIS] Waiting for file handles to release...", flush=True)
+                    gc.collect()  # Force garbage collection to release file handles
+                    time.sleep(2)  # Give OS time to release file locks
+                    qgis_exe = _resolve_qgis_executable(cfg)
+                    if qgis_exe:
+                        print(f"[QGIS] Opening scenario comparison project: {comparison_project}", flush=True)
+                        subprocess.Popen([str(qgis_exe), str(comparison_project)])
     
     print("\n[Done] Scenario analysis complete", flush=True)
 

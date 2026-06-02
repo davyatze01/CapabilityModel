@@ -65,16 +65,18 @@ def get_graph():
     return graph
 
 
-def get_mode_graph(network_type):
+def get_mode_graph(network_type, cfg: PipelineConfig | None = None):
     """Load or download graph for a specific travel mode.
 
     Inputs:
     - network_type: mode string (for example walk, bike, drive).
+    - cfg: optional PipelineConfig. If not provided, creates a new one.
 
     Outputs:
     - graph object for that mode, cached in memory.
     """
-    cfg = PipelineConfig()
+    if cfg is None:
+        cfg = PipelineConfig()
 
     if network_type in _MODE_GRAPH_CACHE:
             return _MODE_GRAPH_CACHE[network_type]
@@ -370,7 +372,11 @@ def get_poi(
                     poi = _filter_by_tags(universe, tags)
                     if poi is not None and not poi.empty:
                         poi.to_file(NAME_FILE, driver="GeoJSON")
-                        print(f"POI built from city-universe cache. count={len(poi)} file={NAME_FILE}")
+                        print(
+                            f"[POI] Built poi_type={poi_type} from city-universe cache. "
+                            f"count={len(poi)} file={NAME_FILE}",
+                            flush=True,
+                        )
                         return poi
             except Exception as batch_exc:
                 print(f"[POI] Batch resolution failed for tags={tags}: {batch_exc}")
@@ -385,7 +391,10 @@ def get_poi(
 
         try:
             if cfg.use_shapefile:
-                print("[POI] Loading POIs from shapefile source...", flush=True)
+                print(
+                    f"[POI] Loading poi_type={poi_type} from shapefile source...",
+                    flush=True,
+                )
                 # In shapefile mode, selection is based on poi_type -> labels mapping.
                 # OSM tags are irrelevant for source filtering.
                 poi = feature_from_shapefile(cfg.name_shapefile, query_tags={}, poi_type=poi_type)
@@ -397,15 +406,19 @@ def get_poi(
                     query_tags: TagClause = tags
                 else:
                     query_tags = {feature_key: value_key}
-                print(f"[POI] Downloading POIs from OSM for '{place_name}'...", flush=True)
+                print(
+                    f"[POI] Downloading poi_type={poi_type} from OSM for '{place_name}'...",
+                    flush=True,
+                )
                 poi = _download_poi_for_place(place_name, query_tags)
         except Exception as e:
             print(
-                f"[POI] No POIs found for city={place_name}, feature={feature}, value={value}, tags={tags}: {e}",
+                f"[POI] No POIs found for city={place_name}, poi_type={poi_type}, feature={feature}, value={value}, tags={tags}: {e}",
                 flush=True,
             )
             return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
+        source_name = "shapefile" if cfg.use_shapefile else "OSM"
         if poi.empty:
             # Do not persist empty payloads: they can mask transient Overpass/geocoding issues.
             try:
@@ -413,7 +426,11 @@ def get_poi(
                     os.remove(NAME_FILE)
             except Exception:
                 pass
-            print(f"POI download returned 0 features. Cache not persisted for {NAME_FILE}")
+            print(
+                f"[POI] {source_name.capitalize()} query returned 0 features "
+                f"for poi_type={poi_type}. Cache not persisted for {NAME_FILE}",
+                flush=True,
+            )
             return poi
         if "geometry" not in poi.columns or poi["geometry"].dropna().empty:
             try:
@@ -421,11 +438,18 @@ def get_poi(
                     os.remove(NAME_FILE)
             except Exception:
                 pass
-            print(f"POI download has no usable geometry. Cache not persisted for {NAME_FILE}")
+            print(
+                f"[POI] {source_name.capitalize()} query has no usable geometry "
+                f"for poi_type={poi_type}. Cache not persisted for {NAME_FILE}",
+                flush=True,
+            )
             return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
         poi.to_file(NAME_FILE, driver="GeoJSON")
-        print(f"[POI] POIs downloaded and cached. count={len(poi)} file={NAME_FILE}", flush=True)
+        print(
+            f"[POI] Cached poi_type={poi_type}. count={len(poi)} file={NAME_FILE}",
+            flush=True,
+        )
 
     return poi
 

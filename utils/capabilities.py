@@ -4,9 +4,8 @@ from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
-import osmnx as ox
 import numpy as np
-from pyDecision.algorithm import electre_iii
+from pyDecision.algorithm.e_iii import electre_iii
 
 
 CAP_RESTORATIVENESS_IDX = {
@@ -105,8 +104,32 @@ def choquet_integral(x, capability):
         prev = x_sorted[j]
     return total
 
-def electre_iii_integration():
-    pass
+def electre_iii_integration(x, capability):
+    """Aggregate service scores into one capability score via ELECTRE III."""
+    services = CAPABILITY_SERVICES[capability]
+    if not services:
+        return 0.0
+    if len(x) != len(services):
+        raise ValueError(
+            f"Expected {len(services)} service scores for capability={capability!r}, got {len(x)}."
+        )
+
+    x_arr = np.asarray([max(0.0, min(1.0, float(v))) for v in x], dtype=float)
+    n_criteria = len(services)
+    weights = np.asarray([CAP_ELECTRE_W[capability][service] for service in services], dtype=float)
+    # Single-pass setup: worst profile, observed node, best profile.
+    # With q=0 and p=v=1 on [0,1] inputs, node->best concordance yields a
+    # smooth weighted capability score without saturation artifacts.
+    q = np.zeros(n_criteria, dtype=float)
+    p = np.ones(n_criteria, dtype=float)
+    v = np.ones(n_criteria, dtype=float)
+    dataset = np.vstack(
+        [np.zeros(n_criteria, dtype=float), x_arr, np.ones(n_criteria, dtype=float)]
+    )
+
+    global_concordance, _, *_ = electre_iii(dataset, p, q, v, weights, graph=False)
+    score = float(global_concordance[1, 2])  # node outranking best-profile degree
+    return max(0.0, min(1.0, score))
 
 
 CAPABILITY_SERVICES = {
@@ -115,12 +138,17 @@ CAPABILITY_SERVICES = {
     "care": list(CAP_CARE_IDX.keys()),
 }
 
+CAP_ELECTRE_W = {
+    capability: {service: 1.0 / len(services) for service in services}
+    for capability, services in CAPABILITY_SERVICES.items()
+}
+
 
 rows = []
 
 for capability,services in CAPABILITY_SERVICES.items():
-    singleton_values = [
-        CAP_SINGLETON_M[capability][service]
+    electre_values = [
+        CAP_ELECTRE_W[capability][service]
         for service in services
     ]
 
@@ -128,7 +156,7 @@ for capability,services in CAPABILITY_SERVICES.items():
     rows.append({
         "capability": capability,
         "services":services,
-        "choquet_singleton": singleton_values,
+        "electre_weight": electre_values,
         "enabled": True
     })
 

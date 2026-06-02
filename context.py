@@ -16,7 +16,7 @@ def build_context(config: PipelineConfig) -> PipelineContext:
     Outputs:
     - PipelineContext: graph, node list, output paths, worker count, and service groupings.
     """
-    graph = graphml.get_mode_graph("walk")
+    graph = graphml.get_mode_graph("walk", config)
     nodes = list(graph.nodes(data=True))
     nodes_with_coords = [item for item in nodes if "y" in item[1] and "x" in item[1]]
 

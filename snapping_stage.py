@@ -512,9 +512,9 @@ def run_snapping_stage(ctx: PipelineContext) -> SnappingStageResult:
 
     # For each mode, gets the corresponding graph
     shared_mode_graphs = {
-        "walk": graphml.get_mode_graph("walk"),
-        "bike": graphml.get_mode_graph("bike"),
-        "drive": graphml.get_mode_graph("drive"),
+        "walk": graphml.get_mode_graph("walk", ctx.config),
+        "bike": graphml.get_mode_graph("bike", ctx.config),
+        "drive": graphml.get_mode_graph("drive", ctx.config),
     }
 
     # Snap POIs for walk, bike and drive networks.

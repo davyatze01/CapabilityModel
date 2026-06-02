@@ -161,21 +161,22 @@ def _select_best_snap_for_origin(origin, source_coord, candidates):
     return source_coord
 
 
-def _get_mode_graph(network_type):
+def _get_mode_graph(network_type, cfg: PipelineConfig | None = None):
     """Get mode-specific graph from in-memory cache or disk loader.
 
     Inputs:
     - network_type: mode key.
+    - cfg: optional PipelineConfig. If not provided, creates a new one.
 
     Outputs:
     - graph object for the requested mode.
     """
     if network_type not in _MODE_GRAPH_CACHE:
-        _MODE_GRAPH_CACHE[network_type] = graphml.get_mode_graph(network_type)
+        _MODE_GRAPH_CACHE[network_type] = graphml.get_mode_graph(network_type, cfg)
     return _MODE_GRAPH_CACHE[network_type]
 
 
-def _get_mode_lengths_and_paths(grafo, origin, network_type, radius_m, origin_node=None):
+def _get_mode_lengths_and_paths(grafo, origin, network_type, radius_m, origin_node=None, cfg: PipelineConfig | None = None):
     """Get/calculate shortest-path lengths and node paths from one origin.
 
     Inputs:
@@ -184,6 +185,7 @@ def _get_mode_lengths_and_paths(grafo, origin, network_type, radius_m, origin_no
     - network_type: mode key.
     - radius_m: optional routing radius.
     - origin_node: optional pre-snapped origin node id.
+    - cfg: optional PipelineConfig.
 
     Outputs:
     - tuple `(lengths, paths)` where:
@@ -201,7 +203,7 @@ def _get_mode_lengths_and_paths(grafo, origin, network_type, radius_m, origin_no
         return (_MODE_LENGTHS_CACHE[key], _MODE_PATHS_CACHE[key])
     
 
-    mode_graph = _get_mode_graph(network_type)
+    mode_graph = _get_mode_graph(network_type, cfg)
     if origin_node is None:
         origin_nodes = ox.distance.nearest_nodes(mode_graph, [origin[1]], [origin[0]])
         try:
@@ -330,7 +332,7 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
             src_key = (round(src[0], 6), round(src[1], 6))
             chosen_coords.append(_select_best_snap_for_origin(origine, src, info.get(src_key)))
         try:
-            mode_graph = _get_mode_graph(mode)
+            mode_graph = _get_mode_graph(mode, config)
             all_x = [origine[1]] + [coord[1] for coord in chosen_coords]
             all_y = [origine[0]] + [coord[0] for coord in chosen_coords]
             all_nodes = ox.distance.nearest_nodes(mode_graph, all_x, all_y)
@@ -344,7 +346,7 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
             origin_node = cast(Hashable, _normalize_node_id(all_nodes[0]))
             poi_nodes = [cast(Hashable, _normalize_node_id(n)) for n in all_nodes[1:]]
             lengths_raw, paths_raw = _get_mode_lengths_and_paths(
-                grafo, origine, mode, radius_m, origin_node=origin_node
+                grafo, origine, mode, radius_m, origin_node=origin_node, cfg=config
             )
             lengths: dict[Hashable, float] = cast(dict[Hashable, float], lengths_raw)
             paths: dict[Hashable, list[Hashable]] = cast(dict[Hashable, list[Hashable]], paths_raw)

@@ -1,74 +1,13 @@
 import csv
 import json
 import os
-import pickle
 from pathlib import Path
 
 import numpy as np
 
 from pipeline_types import BusRoutingStageResult, NonBusRoutingStageResult, PipelineContext
-from utils import services as serv
-
 
 ARTIFACT_SCHEMA_VERSION = 1
-
-
-def _required_keys() -> set[str]:
-    return {
-        "schema_version",
-        "node_ids",
-        "bus_impedance_matrix",
-        "bus_dest_coords",
-        "non_bus_blobs",
-        "routing_departure_iso",
-        "origins_sig",
-        "destinations_sig",
-    }
-
-
-def _validate_shape_only(ctx: PipelineContext, data: dict[str, np.ndarray]) -> None:
-    keys = set(data.keys())
-    missing = _required_keys() - keys
-    if missing:
-        raise ValueError(f"Missing keys in impedance artifact: {sorted(missing)}")
-
-    schema_version = int(np.array(data["schema_version"]).item())
-    if schema_version != ARTIFACT_SCHEMA_VERSION:
-        raise ValueError(
-            f"Incompatible impedance artifact schema_version={schema_version}, "
-            f"expected={ARTIFACT_SCHEMA_VERSION}"
-        )
-
-    node_ids = np.array(data["node_ids"]).astype(str)
-    expected_nodes = len(ctx.nodes_with_coords)
-    if node_ids.ndim != 1 or len(node_ids) != expected_nodes:
-        raise ValueError(
-            f"Invalid node_ids shape {node_ids.shape}; expected ({expected_nodes},)"
-        )
-
-    matrix = np.array(data["bus_impedance_matrix"], dtype=np.float32)
-    if matrix.ndim != 2 or matrix.shape[0] != expected_nodes:
-        raise ValueError(
-            f"Invalid bus_impedance_matrix shape {matrix.shape}; "
-            f"expected ({expected_nodes}, N)"
-        )
-
-    dest_coords = np.array(data["bus_dest_coords"], dtype=np.float64)
-    if dest_coords.ndim != 2 or dest_coords.shape[1] != 2:
-        raise ValueError(
-            f"Invalid bus_dest_coords shape {dest_coords.shape}; expected (N, 2)"
-        )
-    if matrix.shape[1] != dest_coords.shape[0]:
-        raise ValueError(
-            f"bus_impedance_matrix cols ({matrix.shape[1]}) do not match "
-            f"bus_dest_coords rows ({dest_coords.shape[0]})"
-        )
-
-    blobs = np.array(data["non_bus_blobs"], dtype=object)
-    if blobs.ndim != 1 or len(blobs) != expected_nodes:
-        raise ValueError(
-            f"Invalid non_bus_blobs shape {blobs.shape}; expected ({expected_nodes},)"
-        )
 
 
 def load_impedance_bundle(
@@ -78,17 +17,8 @@ def load_impedance_bundle(
     if not os.path.isfile(path):
         return None
 
-    try:
-        with np.load(path, allow_pickle=True) as z:
-            data = {k: z[k] for k in z.files}
-        _validate_shape_only(ctx, data)
-    except Exception as exc:
-        print(
-            "[Artifact] Existing impedance artifact is missing/invalid; "
-            f"recomputing impedances (this may take a while). Cause: {exc}",
-            flush=True,
-        )
-        return None
+    with np.load(path, allow_pickle=True) as z:
+        data = {k: z[k] for k in z.files}
 
     node_ids = np.array(data["node_ids"]).astype(str)
     bus_matrix = np.array(data["bus_impedance_matrix"], dtype=np.float32)
