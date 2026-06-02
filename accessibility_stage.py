@@ -598,6 +598,8 @@ def run_accessibility_stage(
 
     # Preload complete node rows from cache and compute only missing rows.
     pending: dict[Any, str] = {}
+    reused_cached_rows = 0
+    scheduled_rows = 0
     if mat is not None:
         required_cols = np.array(
             [poi_to_col[poi] for poi in _ordered_poi_types() if poi in poi_to_col],
@@ -609,12 +611,14 @@ def run_accessibility_stage(
                 result.node_results.append(
                     _build_node_result_from_matrix_row(node_id, data, row, mat, poi_to_col)
                 )
+                reused_cached_rows += 1
             else:
                 cache_path = non_bus.cache_paths.get(node_id)
                 if cache_path is None:
                     cache_path = non_bus.cache_paths.get(str(node_id))
                 if cache_path is not None:
                     pending[node_id] = cache_path
+                    scheduled_rows += 1
     else:
         pending = {}
         for node_id, _ in ctx.nodes_with_coords:
@@ -623,7 +627,8 @@ def run_accessibility_stage(
                 cache_path = non_bus.cache_paths.get(str(node_id))
             if cache_path is not None:
                 pending[node_id] = cache_path
-    
+                scheduled_rows += 1
+
     total_nodes = len(pending)
     pbar = tqdm(total=total_nodes, desc="Accessibility stage", mininterval=1) if ctx.config.enable_progress else None
     base_progress = [0.0]
@@ -725,6 +730,28 @@ def run_accessibility_stage(
 
     if mat is not None:
         mat.flush()
+
+    total_entries = 0
+    nonzero_entries = 0
+    nonzero_rows = 0
+    for node in result.node_results:
+        row_has_nonzero = False
+        for items in node.accessibility_by_service.values():
+            for item in items:
+                total_entries += 1
+                if float(item["accessibility"]) > 0.0:
+                    nonzero_entries += 1
+                    row_has_nonzero = True
+        if row_has_nonzero:
+            nonzero_rows += 1
+
+    print(
+        f"[Accessibility] Summary: rows={len(result.node_results)} "
+        f"nonzero_rows={nonzero_rows} "
+        f"nonzero_accessibility={nonzero_entries}/{total_entries} "
+        f"reused_cached_rows={reused_cached_rows} scheduled_rows={scheduled_rows}",
+        flush=True,
+    )
     return result
 
 
