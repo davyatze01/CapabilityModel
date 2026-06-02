@@ -24,6 +24,7 @@ _MODE_PATHS_CACHE = {}
 _WALK_EDGE_SCORES_CACHE: dict[str, dict[tuple[int, int, int], float]] = {}
 _WALK_GRAPH_SIG_BY_OBJID: dict[int, str] = {}
 _WALK_GRAPH_SIG_OVERRIDE: str | None = None
+_EMPTY_SOURCE_COORDS_LOGGED: set[str] = set()
 
 
 
@@ -308,6 +309,14 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
             source_coords.append((float(src_key[0]), float(src_key[1])))
 
     if not source_coords:
+        poi_key = str(poi_type)
+        if poi_key not in _EMPTY_SOURCE_COORDS_LOGGED:
+            _EMPTY_SOURCE_COORDS_LOGGED.add(poi_key)
+            print(
+                f"[Accessibility] No source_coords from snap cache for poi_type={poi_type} "
+                f"origin=({origine[0]:.6f},{origine[1]:.6f})",
+                flush=True,
+            )
         return {
             "source_coords": [],
             "imp_walk": [],
