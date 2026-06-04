@@ -5,6 +5,50 @@ import unicodedata
 import re
 
 
+def normalize_study_city(study_city: str) -> str:
+    """Normalize a study city identifier to a stable lookup key."""
+    return re.sub(r"[^a-z0-9]+", "_", study_city.strip().lower()).strip("_")
+
+
+CITY_PRESETS: dict[str, dict[str, object]] = {
+    "cagliari": {
+        "city_name": "Cagliari, Sardinia, Italy",
+        "use_shapefile": True,
+        "name_shapefile": "Cagliari Shapefile.shp",
+        "poi_from_shp": True,
+        "poi_shapefile_paths": [
+            "pois_shp/poi_points.shp",
+            "pois_shp/poi_lines.shp",
+            "pois_shp/poi_polygons.shp",
+        ],
+    },
+    "paris": {
+        "city_name": "Paris, France",
+        "use_shapefile": True,
+        "name_shapefile": "mgp_boundary.shp",
+        "poi_from_shp": True,
+        "poi_shapefile_paths": [
+            "Paris/POI_point.shp",
+            "Paris/POI_line.shp",
+            "Paris/POI_polygon.shp",
+        ],
+    },
+}
+
+
+def apply_study_city(cfg: "PipelineConfig", study_city: str) -> None:
+    """Apply city-specific defaults to a PipelineConfig instance."""
+    preset = CITY_PRESETS.get(normalize_study_city(study_city))
+    if preset is None:
+        return
+
+    cfg.city_name = str(preset["city_name"])
+    cfg.use_shapefile = bool(preset["use_shapefile"])
+    cfg.name_shapefile = str(preset["name_shapefile"])
+    cfg.poi_from_shp = bool(preset["poi_from_shp"])
+    cfg.poi_shapefile_paths = list(preset["poi_shapefile_paths"])
+
+
 def derive_city_slug(city_name: str) -> str:
     """Build a stable ASCII slug from a city label like 'Name, Region, Country'."""
     head = city_name.split(",", 1)[0].strip()
@@ -32,11 +76,12 @@ def derive_artifact_slug(city_slug: str, use_shapefile: bool, shapefile_name: st
 
 @dataclass
 class PipelineConfig:
-    city_name: str = field(default_factory=lambda: os.getenv("CAP_CITY_NAME", "Cagliari, Sardinia, Italy"))
+    study_city: str = field(default_factory=lambda: os.getenv("CAP_STUDY_CITY", "cagliari"))
+    city_name: str = field(default_factory=lambda: os.getenv("CAP_CITY_NAME", "Paris, France"))
     city_slug: str = field(init=False)
     artifact_slug: str = field(init=False)
     use_shapefile: bool = True
-    name_shapefile: str = "Cagliari Shapefile.shp"
+    name_shapefile: str = "mgp_boundary.shp"
     open_qgis_after_run: bool = True
     qgis_bin_path: str = ""
     qgis_project_path: str = ""
@@ -46,16 +91,16 @@ class PipelineConfig:
     qgis_autostyle_ramp: str = "Viridis"
     qgis_autostyle_basemap: bool = True
     qgis_grid_enabled: bool = True
-    qgis_grid_cell_size_m: float = 500.0
+    qgis_grid_cell_size_m: float = 100.0
     qgis_grid_capability_field: str = "capability_care"
     qgis_grid_opacity: float = 0.55
     qgis_grid_max_cells: int = 500000
     poi_from_shp: bool = True
     poi_shapefile_paths: list[str] = field(
         default_factory=lambda: [
-            "pois_shp/poi_points.shp",
-            "pois_shp/poi_lines.shp",
-            "pois_shp/poi_polygons.shp",
+            "Paris/POI_point.shp",
+            "Paris/POI_line.shp",
+            "Paris/POI_polygon.shp",
         ]
     )
     worker_count: int | None = 12
@@ -116,6 +161,7 @@ class PipelineConfig:
     walkability_cache_dir : str = ""
 
     def __post_init__(self) -> None:
+        apply_study_city(self, self.study_city)
         self.city_slug = derive_city_slug(self.city_name)
         self.artifact_slug = derive_artifact_slug(
             self.city_slug,

@@ -1,4 +1,5 @@
 import faulthandler
+import os
 import sys
 import traceback
 
@@ -6,10 +7,14 @@ from runtime_setup import run_runtime_setup
 
 faulthandler.enable(all_threads=True)
 
+# Change this to "paris" to switch the whole pipeline to Paris.
+study_city = "paris"
+
 
 def main():
     """Run the full capability pipeline end-to-end and print generated output paths."""
     run_runtime_setup()
+    os.environ["CAP_STUDY_CITY"] = study_city
 
     import shutup
     from config import PipelineConfig
@@ -27,7 +32,7 @@ def main():
 
     # Create a context with the configuration values specified in PipelineConfig.
     # All global values accessed by multiple stages are found here.
-    cfg = PipelineConfig()
+    cfg = PipelineConfig(study_city=study_city)
     ctx = build_context(cfg)
 
     loaded = load_impedance_bundle(ctx)

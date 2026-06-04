@@ -32,6 +32,7 @@ from pipeline_runner import generate_spatial_outputs
 from pipeline_runner import _resolve_qgis_executable, _resolve_qgis_python_launcher
 from utils import graphml
 from pipeline_types import BusRoutingStageResult, NonBusRoutingStageResult
+from main import study_city
 
 
 class ScenarioModifier:
@@ -557,23 +558,8 @@ app.exitQgis()
 
 def run_all_scenarios():
     """Run baseline and all scenarios, then compare."""
-    cfg = PipelineConfig()
-    
-    # Override config for Cagliari scenarios - always use Cagliari regardless of main config
-    cfg.city_name = "Cagliari, Sardinia, Italy"
-    cfg.use_shapefile = True
-    cfg.name_shapefile = "Cagliari_Shapefile.shp"
-    cfg.poi_from_shp = True
-    cfg.poi_shapefile_paths = [
-        "pois_shp/poi_points.shp",
-        "pois_shp/poi_lines.shp",
-        "pois_shp/poi_polygons.shp",
-    ]
-    # Recalculate derived configuration values
-    cfg.__post_init__()
-    
-    # Store Cagliari artifact slug for baseline lookup (both baseline and scenario use Cagliari)
-    cagliari_artifact_slug = cfg.artifact_slug
+    os.environ["CAP_STUDY_CITY"] = study_city
+    cfg = PipelineConfig(study_city=study_city)
     
     # Clear cached graphs from previous runs so new config is used
     graphml._GRAPH_CACHE = None
@@ -614,7 +600,7 @@ def run_all_scenarios():
     if os.path.isdir(experiments_dir):
         for cap_type in ["restorativeness", "nutrition", "care"]:
             # Look for the most recent file matching this capability type
-            pattern = f"capability_{cap_type}.csv"
+            pattern = f"{cfg.artifact_slug}_capability_{cap_type}.csv"
             for filename in sorted(os.listdir(experiments_dir), reverse=True):
                 if pattern in filename:
                     path = os.path.join(experiments_dir, filename)
@@ -667,8 +653,7 @@ def run_all_scenarios():
         print(f"\n[Output] Saved comparison: {comparison_path}", flush=True)
 
         # Build one QGIS project with baseline + scenario spatial layers.
-        # Use the Cagliari artifact_slug since both baseline and scenario are Cagliari
-        baseline_gpkg = Path("outputs") / "gpkg" / cagliari_artifact_slug / f"{cagliari_artifact_slug}.gpkg"
+        baseline_gpkg = Path("outputs") / "gpkg" / cfg.artifact_slug / f"{cfg.artifact_slug}.gpkg"
         
         print(f"\n[QGIS] Looking for baseline geopackage: {baseline_gpkg}", flush=True)
         print(f"[QGIS] Baseline exists: {baseline_gpkg.exists()}", flush=True)
