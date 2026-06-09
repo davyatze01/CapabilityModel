@@ -102,8 +102,8 @@ This module parses `config/poi_types.csv` and turns it into runtime structures:
 
 - `SERVICE_POI_QUERIES`: service -> ordered list of POI queries
 - `SERVICE_SINGLETON_M`: service -> singleton Choquet capacities
-- `POI_DECAY_CONSTANTS`
-- `SERVICE_CONTRIBUTION_CONSTANTS`
+- `POI_DECAY_COEFFICIENTS`
+- `SERVICE_CONTRIBUTION_COEFFICIENTS`
 - `SERVICE_KEYS`
 
 It also provides:
@@ -297,7 +297,7 @@ Goal: combine non-bus modal decays with bus impedances, compute POI-level access
 3. They load the bus matrix and index files once per worker.
 4. For each origin/destination lookup, they retrieve bus impedance from the dense matrix using source/destination indexes.
 5. For each POI type entry:
-   - compute the decay parameter `beta = log(2) / decay_constant`
+   - compute the decay parameter `beta = log(2) / decay_coefficient`
    - convert each bus impedance into a bus decay value
    - merge walk, bike, drive, and bus decays into an RRA value with `delta_g.build_rra()`
    - convert the RRA list into one accessibility score with `delta_g.accessibility_from_rra()`

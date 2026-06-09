@@ -240,13 +240,13 @@ def build_rra(decay_walk, decay_bike, decay_drive, decay_bus):
     return rra
 
 
-def accessibility_from_rra(RRA, poi_type=None, contribution_constant=None):
+def accessibility_from_rra(RRA, poi_type=None, contribution_coefficient=None):
     """Aggregate RRA values into one accessibility score for a POI type.
 
     Inputs:
     - RRA: list of RRA values.
-    - poi_type: optional POI type key (for configured contribution constant lookup).
-    - contribution_constant: optional explicit contribution constant.
+    - poi_type: optional POI type key (for configured contribution coefficient lookup).
+    - contribution_coefficient: optional explicit contribution coefficient.
 
     Outputs:
     - float accessibility score.
@@ -256,7 +256,7 @@ def accessibility_from_rra(RRA, poi_type=None, contribution_constant=None):
     def c_from_target(target: float) -> float:
         y_target = 0.9
         if target <= 0:
-            raise ValueError(f"contribution_constant must be > 0, got {target}")
+            raise ValueError(f"contribution_coefficient must be > 0, got {target}")
         return round(math.log(1.0 - y_target) / target, 2)
 
     def g(x: int, c: float) -> float:
@@ -265,12 +265,12 @@ def accessibility_from_rra(RRA, poi_type=None, contribution_constant=None):
     def deltag(x: int, x2: int, c: float) -> float:
         return g(x, c) - g(x2, c)
 
-    if contribution_constant is None:
+    if contribution_coefficient is None:
         if poi_type is not None:
-            contribution_constant = serv.get_contribution_constant(poi_type)
+            contribution_coefficient = serv.get_contribution_coefficient(poi_type)
         else:
-            contribution_constant = 2.0
-    c = c_from_target(target=float(contribution_constant))
+            contribution_coefficient = 2.0
+    c = c_from_target(target=float(contribution_coefficient))
 
     out = 0.0
     for i, element in enumerate(rra_desc):
@@ -450,18 +450,18 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
     }
 
 
-def merge_rra_and_accessibility(decay_walk, decay_bike, decay_drive, decay_bus, poi_type=None, contribution_constant=None):
+def merge_rra_and_accessibility(decay_walk, decay_bike, decay_drive, decay_bus, poi_type=None, contribution_coefficient=None):
     """Compute both RRA list and final accessibility from modal decays.
 
     Inputs:
     - decay_walk, decay_bike, decay_drive, decay_bus: modal decay arrays.
     - poi_type: optional POI type key.
-    - contribution_constant: optional explicit contribution constant.
+    - contribution_coefficient: optional explicit contribution coefficient.
 
     Outputs:
     - tuple `(rra_list, accessibility_value)`.
     """
     rra = build_rra(decay_walk, decay_bike, decay_drive, decay_bus)
-    return rra, accessibility_from_rra(rra, poi_type=poi_type, contribution_constant=contribution_constant)
+    return rra, accessibility_from_rra(rra, poi_type=poi_type, contribution_coefficient=contribution_coefficient)
 
 

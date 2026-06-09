@@ -146,8 +146,8 @@ def accessibility_non_bus(poi_type, origine, feature=None, radius_m=None, tags=N
         }
 
     poi_points = get_poi_points(poi_type, origine, feature=feature, radius_m=radius_m, tags=tags)
-    decay_constant = float(core.serv.get_decay_constant(poi_type))
-    beta = core.math.log(2) / decay_constant
+    decay_coefficient = float(core.serv.get_decay_coefficient(poi_type))
+    beta = core.math.log(2) / decay_coefficient
     if not poi_points:
         return {
             "cache_hit": False,

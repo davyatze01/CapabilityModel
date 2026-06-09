@@ -128,12 +128,15 @@ def _validate_required_columns(fieldnames: list[str] | None) -> None:
     Outputs:
     - None. Raises ValueError if required columns are missing.
     """
-    required = ["poi_type", "decay_constant", "tags", "services"]
+    required = ["poi_type", "decay_coefficient", "tags"]
+    legacy_required = ["poi_type", "decay_constant", "tags"]
     if fieldnames is None:
         raise _config_error(None, None, f"missing header row, expected columns {required}")
     missing = [c for c in required if c not in fieldnames]
     if missing:
-        raise _config_error(None, None, f"missing required columns {missing}; found {fieldnames}")
+        legacy_missing = [c for c in legacy_required if c not in fieldnames]
+        if legacy_missing:
+            raise _config_error(None, None, f"missing required columns {missing}; found {fieldnames}")
 
 
 def _load_rows() -> list[dict[str, Any]]:
@@ -164,9 +167,9 @@ def _load_rows() -> list[dict[str, Any]]:
             seen_poi_types.add(poi_type)
 
             try:
-                decay_constant = float((row.get("decay_constant") or "").strip())
+                decay_coefficient = float((row.get("decay_coefficient") or row.get("decay_constant") or "").strip())
             except Exception as exc:
-                raise _config_error(idx, "decay_constant", f"expected float, got {row.get('decay_constant')!r}") from exc
+                raise _config_error(idx, "decay_coefficient", f"expected float, got {row.get('decay_coefficient') or row.get('decay_constant')!r}") from exc
 
             tags_raw = _parse_json_cell(row.get("tags") or "", idx, "tags")
             tags = _normalize_tags_cell(tags_raw, idx)
@@ -184,18 +187,6 @@ def _load_rows() -> list[dict[str, Any]]:
             else:
                 normalized_labels = [poi_type]
 
-            services = _parse_json_cell(row.get("services") or "", idx, "services")
-            if not isinstance(services, list) or not services:
-                raise _config_error(idx, "services", "expected non-empty JSON array of strings")
-            if not all(isinstance(s, str) and s.strip() for s in services):
-                raise _config_error(idx, "services", "expected non-empty strings in array")
-            services = [s.strip() for s in services]
-            if len(set(services)) != len(services):
-                raise _config_error(idx, "services", f"duplicate service names in row: {services}")
-            for s in services:
-                if not s.isidentifier():
-                    raise _config_error(idx, "services", f"service name must be a valid identifier, got {s!r}")
-
             interactions_cell = (row.get("choquet_interactions") or "").strip()
             if interactions_cell:
                 interactions_normalized = re.sub(r"\bNone\b", "null", interactions_cell)
@@ -208,10 +199,10 @@ def _load_rows() -> list[dict[str, Any]]:
             parsed_rows.append(
                 {
                     "poi_type": poi_type,
-                    "decay_constant": decay_constant,
+                    "decay_coefficient": decay_coefficient,
+                    "decay_constant": decay_coefficient,
                     "tags": tags,
                     "labels": tuple(normalized_labels),
-                    "services": services,
                     "choquet_interactions": choquet_interactions,
                 }
             )
@@ -242,22 +233,25 @@ def _load_service_weights(
         raise ValueError(f"Invalid services config CSV (path={SERVICES_CSV_PATH}): file not found")
 
     service_singleton_m: "OrderedDict[str, dict[str, float]]" = OrderedDict()
-    contribution_constants: "OrderedDict[str, dict[str, float]]" = OrderedDict()
+    contribution_coefficients: "OrderedDict[str, dict[str, float]]" = OrderedDict()
     service_poi_order: "OrderedDict[str, list[str]]" = OrderedDict()
 
     with SERVICES_CSV_PATH.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         fieldnames = list(reader.fieldnames) if reader.fieldnames is not None else None
-        required = ["service", "poi_types", "choquet_capacity", "contribution_constant"]
+        required = ["service", "poi_types", "choquet_capacity", "contribution_coefficient"]
         if fieldnames is None:
             raise ValueError(
                 f"Invalid services config CSV (path={SERVICES_CSV_PATH}): missing header row, expected {required}"
             )
         missing = [c for c in required if c not in fieldnames]
         if missing:
-            raise ValueError(
-                f"Invalid services config CSV (path={SERVICES_CSV_PATH}): missing required columns {missing}; found {fieldnames}"
-            )
+            legacy_required = ["service", "poi_types", "choquet_capacity", "contribution_constant"]
+            legacy_missing = [c for c in legacy_required if c not in fieldnames]
+            if legacy_missing:
+                raise ValueError(
+                    f"Invalid services config CSV (path={SERVICES_CSV_PATH}): missing required columns {missing}; found {fieldnames}"
+                )
 
         for idx, row in enumerate(reader, start=2):
             service = (row.get("service") or "").strip()
@@ -267,16 +261,16 @@ def _load_service_weights(
                 )
             poi_types_raw = (row.get("poi_types") or "").strip()
             choquet_raw = (row.get("choquet_capacity") or "").strip()
-            contribution_raw = (row.get("contribution_constant") or "").strip()
+            contribution_raw = (row.get("contribution_coefficient") or row.get("contribution_constant") or "").strip()
             poi_types = _parse_python_list_cell(poi_types_raw, idx, "poi_types")
             choquet_values = _parse_python_list_cell(choquet_raw, idx, "choquet_capacity")
-            contribution_values = _parse_python_list_cell(contribution_raw, idx, "contribution_constant")
+            contribution_values = _parse_python_list_cell(contribution_raw, idx, "contribution_coefficient")
 
             if len(poi_types) != len(choquet_values) or len(poi_types) != len(contribution_values):
                 raise ValueError(
                     f"Invalid services config CSV (path={SERVICES_CSV_PATH} row={idx}): length mismatch "
                     f"poi_types={len(poi_types)} choquet_capacity={len(choquet_values)} "
-                    f"contribution_constant={len(contribution_values)}"
+                    f"contribution_coefficient={len(contribution_values)}"
                 )
             poi_types_clean = [str(p).strip() for p in poi_types]
             if not all(poi_types_clean):
@@ -296,12 +290,12 @@ def _load_service_weights(
 
             service_poi_order[service] = poi_types_clean
             service_singleton_m[service] = {}
-            contribution_constants[service] = {}
+            contribution_coefficients[service] = {}
             for poi, cap_v, contrib_v in zip(poi_types_clean, choquet_values, contribution_values):
                 service_singleton_m[service][poi] = float(cap_v)
-                contribution_constants[service][poi] = float(contrib_v)
+                contribution_coefficients[service][poi] = float(contrib_v)
 
-    return dict(service_singleton_m), dict(contribution_constants), dict(service_poi_order)
+    return dict(service_singleton_m), dict(contribution_coefficients), dict(service_poi_order)
 
 
 def _build_runtime_structures(rows: list[dict[str, Any]]):
@@ -311,19 +305,19 @@ def _build_runtime_structures(rows: list[dict[str, Any]]):
     - rows: validated row dictionaries from `_load_rows`.
 
     Outputs:
-    - tuple containing service queries, singleton measures, decay constants, and contribution constants.
+    - tuple containing service queries, singleton measures, decay constants, and contribution coefficients.
     """
     poi_by_type: dict[str, dict[str, Any]] = {r["poi_type"]: r for r in rows}
     valid_poi_types = set(poi_by_type.keys())
-    service_singleton_m, contribution_constants, service_poi_order = _load_service_weights(valid_poi_types)
+    service_singleton_m, contribution_coefficients, service_poi_order = _load_service_weights(valid_poi_types)
     service_poi_queries: "OrderedDict[str, list[PoiQuery]]" = OrderedDict()
-    decay_constants: dict[str, float] = {}
+    decay_coefficients: dict[str, float] = {}
     interaction_rows: "OrderedDict[str, dict[str, list[Any] | None]]" = OrderedDict()
     seen_pairs: set[tuple[str, str]] = set()
 
     for row in rows:
         poi_type = row["poi_type"]
-        decay_constants[poi_type] = float(row["decay_constant"])
+        decay_coefficients[poi_type] = float(row["decay_coefficient"])
     for service, ordered_poi_types in service_poi_order.items():
         for poi_type in ordered_poi_types:
             row = poi_by_type[poi_type]
@@ -335,12 +329,6 @@ def _build_runtime_structures(rows: list[dict[str, Any]]):
             else:
                 raise _config_error(None, "tags", f"unexpected normalized tags type: {type(tags_raw).__name__}")
             labels = tuple(row.get("labels", (poi_type,)))
-            if service not in row["services"]:
-                raise _config_error(
-                    None,
-                    "services",
-                    f"service {service!r} in services.csv is not listed for poi_type {poi_type!r} in poi_types.csv",
-                )
             interactions_row = row.get("choquet_interactions")
             pair = (service, poi_type)
             if pair in seen_pairs:
@@ -407,8 +395,8 @@ def _build_runtime_structures(rows: list[dict[str, Any]]):
     return (
         dict(service_poi_queries),
         dict(service_singleton_m),
-        decay_constants,
-        dict(contribution_constants),
+        decay_coefficients,
+        dict(contribution_coefficients),
         dict(service_pairwise_m),
     )
 
@@ -443,41 +431,41 @@ def _bootstrap_compatibility_checks() -> None:
                 raise _config_error(None, None, f"missing contribution weight for ({service}, {q.poi_type})")
 
 
-def get_decay_constant(poi_type: str) -> float:
-    """Return decay constant configured for a POI type.
+def get_decay_coefficient(poi_type: str) -> float:
+    """Return decay coefficient configured for a POI type.
 
     Inputs:
     - poi_type: POI type key.
 
     Outputs:
-    - float decay constant.
+    - float decay coefficient.
     """
-    return POI_DECAY_CONSTANTS[poi_type]
+    return POI_DECAY_COEFFICIENTS[poi_type]
 
 
-def get_contribution_constant(poi_type: str, service: str | None = None) -> float:
-    """Return contribution constant for a POI type, optionally scoped by service.
+def get_contribution_coefficient(poi_type: str, service: str | None = None) -> float:
+    """Return contribution coefficient for a POI type, optionally scoped by service.
 
     Inputs:
     - poi_type: POI type key.
     - service: optional service key to disambiguate per-service constants.
 
     Outputs:
-    - float contribution constant.
+    - float contribution coefficient.
     """
     if service is not None:
-        return SERVICE_CONTRIBUTION_CONSTANTS[service][poi_type]
+        return SERVICE_CONTRIBUTION_COEFFICIENTS[service][poi_type]
     matches = []
-    for svc, weights in SERVICE_CONTRIBUTION_CONSTANTS.items():
+    for svc, weights in SERVICE_CONTRIBUTION_COEFFICIENTS.items():
         if poi_type in weights:
             matches.append(float(weights[poi_type]))
     if not matches:
-        raise KeyError(f"No contribution_constant found for poi_type={poi_type!r}")
+        raise KeyError(f"No contribution_coefficient found for poi_type={poi_type!r}")
     first = matches[0]
     if any(abs(v - first) > 1e-12 for v in matches[1:]):
         raise ValueError(
-            f"Contribution constants differ across services for poi_type={poi_type!r}; "
-            "call get_contribution_constant(poi_type, service=...)"
+            f"Contribution coefficients differ across services for poi_type={poi_type!r}; "
+            "call get_contribution_coefficient(poi_type, service=...)"
         )
     return first
 
@@ -499,13 +487,19 @@ _ROWS = _load_rows()
 (
     SERVICE_POI_QUERIES,
     SERVICE_SINGLETON_M,
-    POI_DECAY_CONSTANTS,
-    SERVICE_CONTRIBUTION_CONSTANTS,
+    POI_DECAY_COEFFICIENTS,
+    SERVICE_CONTRIBUTION_COEFFICIENTS,
     SERVICE_PAIRWISE_M,
 ) = _build_runtime_structures(_ROWS)
 SERVICE_KEYS = list(SERVICE_POI_QUERIES.keys())
 _bootstrap_compatibility_checks()
 POI_CONFIG_SIGNATURE = _compute_config_signature()
+
+# Backward-compatible aliases for existing call sites.
+POI_DECAY_CONSTANTS = POI_DECAY_COEFFICIENTS
+SERVICE_CONTRIBUTION_CONSTANTS = SERVICE_CONTRIBUTION_COEFFICIENTS
+get_decay_constant = get_decay_coefficient
+get_contribution_constant = get_contribution_coefficient
 
 
 def get_service_queries(service: str) -> list[PoiQuery]:

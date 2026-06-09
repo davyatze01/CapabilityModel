@@ -20,7 +20,8 @@ for _, row in services_df.iterrows():
     service = str(row["service"])
     poi_types = ast.literal_eval(row["poi_types"])
     caps = ast.literal_eval(row["choquet_capacity"])
-    contribs = ast.literal_eval(row["contribution_constant"])
+    contribs_raw = row.get("contribution_coefficient") or row.get("contribution_constant")
+    contribs = ast.literal_eval(contribs_raw)
     if len(poi_types) != len(caps) or len(poi_types) != len(contribs):
         raise ValueError(f"Length mismatch in services.csv for service={service!r}")
     for poi_type in poi_types:

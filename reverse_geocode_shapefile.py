@@ -118,20 +118,20 @@ def _reverse_geocode(
 def _structured_address(address: dict[str, Any] | None) -> dict[str, str]:
     address = address or {}
     keys = [
-        "house_number",
         "road",
-        "neighbourhood",
+        "house_number",
+        "neighborhood",
         "suburb",
-        "city",
-        "town",
-        "village",
-        "municipality",
-        "county",
-        "state",
-        "postcode",
-        "country",
     ]
-    return {key: str(address.get(key, "")) for key in keys}
+    out = {
+        "road": str(address.get("road", "")),
+        "house_number": str(address.get("house_number", "")),
+        "neighborhood": str(
+            address.get("neighborhood", address.get("neighbourhood", ""))
+        ),
+        "suburb": str(address.get("suburb", "")),
+    }
+    return {key: out[key] for key in keys}
 
 
 def reverse_geocode_shapefile(
@@ -192,14 +192,6 @@ def reverse_geocode_shapefile(
             rows.append(
                 {
                     "node_id": node_id,
-                    "lon": "",
-                    "lat": "",
-                    "display_name": "",
-                    "osm_type": "",
-                    "osm_id": "",
-                    "category": "",
-                    "type": "",
-                    "error": str(exc),
                     **{key: "" for key in _structured_address({}).keys()},
                 }
             )
@@ -222,14 +214,6 @@ def reverse_geocode_shapefile(
             rows.append(
                 {
                     "node_id": node_id,
-                    "lon": lon,
-                    "lat": lat,
-                    "display_name": str(payload.get("display_name", "")),
-                    "osm_type": str(payload.get("osm_type", "")),
-                    "osm_id": str(payload.get("osm_id", "")),
-                    "category": str(payload.get("category", payload.get("class", ""))),
-                    "type": str(payload.get("type", "")),
-                    "error": "",
                     **address,
                 }
             )
@@ -240,14 +224,6 @@ def reverse_geocode_shapefile(
             rows.append(
                 {
                     "node_id": node_id,
-                    "lon": lon,
-                    "lat": lat,
-                    "display_name": "",
-                    "osm_type": "",
-                    "osm_id": "",
-                    "category": "",
-                    "type": "",
-                    "error": str(exc),
                     **{key: "" for key in _structured_address({}).keys()},
                 }
             )
@@ -255,7 +231,10 @@ def reverse_geocode_shapefile(
             progress.set_postfix_str(f"node_id={node_id} failed")
 
     progress.close()
-    output_frame = pd.DataFrame(rows)
+    output_frame = pd.DataFrame(
+        rows,
+        columns=["node_id", "road", "house_number", "neighborhood", "suburb"],
+    )
     output_frame.to_csv(output_csv, index=False, quoting=csv.QUOTE_MINIMAL)
     return output_csv
 

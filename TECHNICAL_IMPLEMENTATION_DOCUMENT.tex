@@ -1,0 +1,627 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{lmodern}
+\usepackage{longtable}
+\usepackage{array}
+
+\setlist[itemize]{leftmargin=1.5em}
+\setlist[enumerate]{leftmargin=1.5em}
+
+\title{Technical Implementation Document}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Purpose and Scope}
+
+This repository implements a geospatial capability model. Its purpose is to estimate how well different places in a study area can access opportunities that support everyday life and wellbeing.
+
+The final results are three capability scores:
+
+\begin{itemize}
+  \item \texttt{restorativeness}: access to places that support recovery, leisure, nature contact, quietness, and cultural experience.
+  \item \texttt{nutrition}: access to food-related opportunities.
+  \item \texttt{care}: access to health, emergency, medicine, and care-related opportunities.
+\end{itemize}
+
+The model works at the level of transport-network nodes, which are points in the street or path network, often road junctions or path intersections. For each node, the model asks: ``From this location, how accessible are the relevant opportunities?'' The pipeline answers that question by loading mode graphs and places of interest, computing travel costs across multiple modes, converting those costs into normalized access values through a decay function, and aggregating the results up through a hierarchy of services into final capability scores.
+
+The main entry point is \texttt{main.py}. Configuration is defined in \texttt{config.py}, which already contains presets for Cagliari and Paris. Switching between those study areas requires only selecting the corresponding preset key.
+
+This document describes the workflow currently implemented in the repository. Future features planned to implement are described in the ``Future Work'' section.
+
+\section{System Overview}
+
+At a high level, the system is a staged analysis pipeline:
+
+\begin{verbatim}
+Study area and domain configuration
+  -> mode graphs and POIs
+  -> multimodal travel cost
+  -> decay-based access values
+  -> POI accessibility
+  -> service scores
+  -> capability scores
+  -> CSV, plots, shapefiles, GeoPackage, optional QGIS project
+\end{verbatim}
+
+The pipeline is mainly written in Python, with the exception of public transport routing which is handled by an R script. Each step in the sequence above corresponds to a dedicated stage. The stages are orchestrated by \texttt{main.py}, which decides which stages to run and in what order, and by \texttt{pipeline\_runner.py}, which provides shared helpers for running those stages and assembling their outputs. All stages read from a common configuration object defined in \texttt{config.py}, which controls everything from which city to analyse to where outputs are saved. Before any stage runs, \texttt{context.py} uses that configuration to load the transport graph, resolve the study area boundary, and prepare the service groupings that the later aggregation steps depend on, therefore setting up the shared state that every stage will need. The data structures passed between stages, such as what an accessibility value looks like and what a service score contains, are defined in \texttt{pipeline\_types.py}, making the contract between stages explicit. Public transport travel times are computed outside Python entirely: \texttt{bus\_routing\_stage.py} prepares the inputs, calls \texttt{utils/r5\_routing.r}, and brings the results back into the pipeline as an impedance matrix.
+
+The model is explicitly multimodal. For each origin and destination, it considers walking, cycling, driving, and public transport where data are available. Each mode produces an impedance value (a travel cost) that is converted into a 0-to-1 decay value and then combined with the other modes to estimate accessibility.
+
+Once all impedances have been computed, they are saved together in a compressed artifact bundle. Any subsequent run that finds a valid bundle can skip the routing stages entirely and jump straight to the decay and aggregation steps. This is possible because impedances reflect the physical urban structure, such as the road network and transit timetables, which does not change between experiments. Parameters that researchers are more likely to adjust, such as decay coefficients, service weights, or capability definitions, sit entirely downstream of the routing stages and can therefore be modified and re-evaluated without ever recomputing travel costs.
+
+\section{Domain Model: POIs, Services, and Capabilities}
+
+The model contains not just routing logic but also a conceptual mapping from real-world places to human capabilities. Places of interest (POIs) are the raw inputs: sport facilities, food retail, healthcare services, natural areas, cultural venues, and so on. These are grouped first into services (meaningful categories of opportunity such as food access or emergency care) and then into the three final capabilities.
+
+This hierarchy matters because it keeps the model interpretable. A low care score can be traced back through the relevant services to the specific POI types behind them. Keeping the domain definitions in CSV files (\texttt{config/poi\_types.csv} and \texttt{config/services.csv}) means the conceptual assumptions are visible and editable without touching the analysis code. \texttt{utils/services.py} reads and validates these files, and \texttt{utils/capabilities.py} defines the grouping from services into the three final capabilities.
+
+\section{Domain Configuration Reference}
+
+The three CSV files below are the primary place to extend or adjust the model's domain assumptions.
+
+\subsection*{poi\_types.csv}
+
+Each row defines one conceptual type of place. The pipeline reads this file to know which OSM features to collect, how sensitive access to that type of place is to travel time, and how it interacts with other place types in the same service.
+
+\begin{itemize}
+  \item \texttt{poi\_type}: A unique name for the place type. This is the identifier used everywhere else in the pipeline to refer to this row.
+  \item \texttt{decay\_coefficient}: Controls how quickly accessibility to this type of place drops off with travel time. It is the travel time in minutes at which the decay value reaches 0.5, meaning the place is considered half as useful. A larger value makes the model more tolerant of longer journeys for that type.
+  \item \texttt{choquet\_interactions}: A JSON array of interaction coefficients between this POI type and every other POI type in the same service. The values appear in the same order as the \texttt{poi\_types} list in \texttt{config/services.csv}. The entry corresponding to this type itself is \texttt{None}. Positive values indicate synergy; negative values indicate substitution. These values feed the Choquet integral used during service aggregation.
+  \item \texttt{tags}: The OpenStreetMap key-value tags used to identify and query places of this type. When POIs are loaded from shapefiles rather than OSM, the \texttt{labels} column is used instead.
+  \item \texttt{labels}: Identifiers used when loading POIs from a shapefile source instead of OSM. These can be OSM-derived tag strings or codes specific to the shapefile dataset.
+\end{itemize}
+
+\subsection*{services.csv}
+
+Each row defines one service, which is a meaningful grouping of POI types. The pipeline aggregates POI-type accessibility values into service scores using a Choquet integral, where the weights and saturation behaviour are controlled by this file.
+
+\begin{itemize}
+  \item \texttt{service}: A unique name for the service. This name is referenced in \texttt{config/capability.csv}.
+  \item \texttt{poi\_types}: The ordered list of POI types that make up this service. The order must match the order used in \texttt{choquet\_capacity}, \texttt{contribution\_coefficient}, and the \texttt{choquet\_interactions} arrays in \texttt{config/poi\_types.csv}.
+  \item \texttt{choquet\_capacity}: The Choquet singleton capacity for each POI type, in the same order as \texttt{poi\_types}. These values represent the relative importance of each type within the service and are used as weights in the Choquet integral. They should sum to approximately 1.
+  \item \texttt{contribution\_coefficient}: Controls how quickly each POI type's accessibility saturates as more instances are reachable. A higher value means that even a single nearby instance of this type yields a strong contribution; a lower value means the contribution grows more gradually as more instances are accessible. The values are in the same order as \texttt{poi\_types}.
+\end{itemize}
+
+\subsection*{capability.csv}
+
+Each row defines one of the three final capability scores. This file is generated automatically from \texttt{utils/capabilities.py} when the module is imported, so manual edits may be overwritten. The weights and structure should be changed in \texttt{utils/capabilities.py} directly.
+
+\begin{itemize}
+  \item \texttt{capability}: The name of the capability score.
+  \item \texttt{services}: The list of services aggregated into this capability.
+  \item \texttt{electre\_weight}: The weight assigned to each service in the ELECTRE III aggregation, in the same order as \texttt{services}. Equal weights mean all services contribute equally to the final score.
+  \item \texttt{enabled}: Whether this capability is computed in the current run. Setting this to \texttt{False} skips the capability entirely.
+\end{itemize}
+
+\section{Study-Area Configuration}
+
+The same model can run for different cities without rewriting any analysis logic. \texttt{config.py} defines named presets that bundle city name, shapefile boundary, POI source paths, cache locations, output locations, routing settings, and QGIS options together. When switching cities, selecting the correct preset is the only required change. This also reduces the risk of accidentally mixing input files from different study areas.
+
+\texttt{context.py} consumes the configuration at startup to load the base transport graph, create output folders, identify valid graph nodes, and prepare the service groups that later stages depend on.
+
+\section{Mode Graph and POI Loading}
+
+Mode graphs define where movement is possible. The pipeline loads or builds three separate graphs for walking, cycling, and driving, stored as GraphML files under \texttt{graph}. Each graph is a street network extracted from OpenStreetMap and represents the traversable edges and nodes for that mode.
+
+There are two ways to download the graphs, controlled by the \texttt{use\_shapefile} setting in \texttt{config.py}. When a shapefile boundary is provided, the graph is extracted from OSM data clipped to the polygon defined by that shapefile. When no shapefile is used, the graph is downloaded by city name using OSMnx's \texttt{graph\_from\_place}, which queries the Nominatim geocoder to resolve the study area boundary. The shapefile approach gives more precise control over the study area extent; the city-name approach is simpler but depends on how Nominatim resolves the name.
+
+POIs define the destinations that contribute to services and capabilities. They can be loaded from shapefiles or queried directly from OpenStreetMap, again depending on configuration. When loading from shapefiles, the pipeline expects three separate files: one for point geometries, one for line geometries, and one for polygon geometries. Their paths are listed in \texttt{poi\_shapefile\_paths} in \texttt{config.py}. The pipeline reads all three and concatenates them, so every geometry type is covered regardless of how the original data was produced. Downloaded or extracted POI data are cached under \texttt{poi} so later runs can reuse them without repeating slow download steps.
+
+Relevant files: \texttt{utils/graphml.py}, \texttt{utils/load\_shapefile.py}, \texttt{config.py}.
+
+\section{Snapping POIs to the Network}
+
+Routing algorithms operate on network nodes, not arbitrary map coordinates. Before routing can begin, every POI must be assigned to nearby nodes on each city graph, a process called snapping. Point POIs are snapped directly. Line or polygon POIs such as large parks or complex facilities can produce multiple candidate access points, which is intentional: a single entrance point for a large area may be misleading, and keeping multiple candidates lets the model choose a more realistic access point for each origin.
+
+Walking, cycling, and driving graphs are snapped separately. Public transport reuses the walking snap points as its access locations. Snapping is implemented in \texttt{snapping\_stage.py}.
+
+\section{Public Transport Routing}
+
+Public transport routing is the most resource-intensive step in the pipeline. It depends on GTFS timetable data, OSM street data, R, Java, and the \texttt{r5r} package. The Python code in \texttt{bus\_routing\_stage.py} prepares origin and destination tables, then delegates the actual routing to the R script \texttt{utils/r5\_routing.r}. Results come back as a bus impedance matrix (a table where each row is an origin and each column is a destination), computed from waiting and travel time according to the configured formula.
+
+Because this computation is expensive, results are stored with metadata so the system can verify that a cached matrix matches the current run configuration before reusing it.
+
+\section{Walking, Cycling, and Driving Routing}
+
+Non-motorized and private-vehicle routing is handled by \texttt{non\_bus\_routing\_stage.py}, which computes route costs using NetworkX shortest-path calculations over the loaded transport graphs. Distances are converted into travel-time-like impedance values. Walking impedance can additionally be adjusted by a walkability score computed in \texttt{walkability.py}, which captures local street-environment quality rather than pure geometric distance.
+
+Results are cached per origin node in the artifact bundle so they do not need to be recomputed every run. This separation is deliberate: storing routing ingredients independently allows later stages to recompute accessibility under different assumptions without re-running shortest-path calculations.
+
+Relevant utilities: \texttt{utils/delta\_g.py}, \texttt{utils/get\_impedance.py}.
+
+\section{Decay and Multimodal Accessibility}
+
+Travel time alone is not a useful final output. A destination two minutes away and one twenty minutes away are qualitatively different, but the raw numbers do not express that difference in a way that aggregates cleanly. The accessibility stage in \texttt{accessibility\_stage.py} addresses this by converting each impedance value into a decay value between 0 and 1. A value close to 1 means the destination is easy to reach by that mode; a value close to 0 means it is difficult or effectively unreachable. The shape of the decay curve is controlled by a decay coefficient defined per POI type in \texttt{config/poi\_types.csv}, allowing different destination types to have different sensitivity to travel cost.
+
+Multimodality is central to the model's design. A location should not be treated as inaccessible simply because one mode is poor if another realistic mode provides access. The stage therefore combines the mode-specific decay values into one multimodal access value that reflects the best combined availability across walking, cycling, driving, and public transport.
+
+Relevant utilities: \texttt{utils/decay.py}, \texttt{utils/delta\_g.py}.
+
+\section{Service Aggregation}
+
+Once each POI type has an accessibility value, those values are grouped into services according to the mapping in \texttt{config/services.csv}. The service score is computed with a normalized Choquet integral, an aggregation method that can represent complementarity: some combinations of POI types are more valuable together than their individual contributions would suggest. This intermediate layer of service scores makes the model easier to interpret and audit before reaching the final capability level.
+
+Service scores are cached in a matrix for faster reuse across experiments. Relevant files: \texttt{service\_stage.py}, \texttt{utils/services.py}.
+
+\section{Capability Aggregation}
+
+Service scores are combined into the three final capability scores in \texttt{capability\_stage.py}. The current implementation uses an ELECTRE III based scoring function from \texttt{utils/capabilities.py}. ELECTRE III is a multi-criteria decision method that combines several service dimensions into one normalized capability score while preserving the ability to express qualitative thresholds and preference intensities between dimensions.
+
+The stage writes one CSV per capability, then moves those CSVs into \texttt{experiments} and appends average capability values to \texttt{experiments/capability\_experiments\_recap.csv}.
+
+\section{Artifact Bundles and Caching}
+
+Routing and geospatial processing are the slowest parts of the pipeline. The most expensive outputs, including snapping results, public transport matrices, and non-bus routing ingredients, are saved into a compressed artifact bundle under \texttt{artifacts/\{artifact\_slug\}} by \texttt{artifact\_bundle.py}. When a valid bundle exists, \texttt{main.py} skips those early stages entirely. All later stages (accessibility computation, service aggregation, capability scoring, and spatial output) can then run quickly from the saved artifacts.
+
+This design separates expensive route computation from faster scenario and post-processing runs, making repeated experiments practical without requiring a full rerun of the pipeline each time.
+
+\section{Scenario Analysis}
+
+Scenario analysis is built on top of the artifact bundle mechanism. Rather than recomputing routes from scratch, a scenario modifies one element of the model: for example, the public strike scenario in \texttt{scenarios.py} disables public transport by making bus impedance effectively unreachable, and then reruns only the downstream stages: accessibility, service aggregation, capability aggregation, and spatial output generation. The scenario pipeline then compares results against the stored baseline and writes comparison tables and plots.
+
+This makes ``what if'' questions cheap to answer, as long as suitable baseline artifacts already exist.
+
+\section{Batch City Runs}
+
+\texttt{run\_cities.py} enables running the pipeline across many municipalities. It iterates over a configured list of cities, calls \texttt{main.py} for each one, skips cities that already have the three expected capability CSVs, and applies a timeout to prevent one city from blocking the whole batch. This supports scaling the analysis beyond individual case studies.
+
+\section{Statistical Scenario Testing}
+
+\texttt{capability\_significance\_test.R} provides a post-processing check for whether differences between baseline and public-strike scenario capability scores are statistically meaningful. It selects between a paired t-test and a paired Wilcoxon test depending on a normality diagnostic, then writes statistical test results to a CSV file.
+
+\section{Spatial Outputs and QGIS Support}
+
+Beyond CSV tables, the pipeline exports results in formats suited for geographic inspection. \texttt{pipeline\_runner.py}, \texttt{plot\_shapefile.py}, and \texttt{generate\_experiment\_shapefiles.py} together produce capability plots, shapefiles, and a GeoPackage (a single-file GIS format that bundles multiple spatial layers in one file).
+
+The GeoPackage contains two layers. The first is a point layer where each point corresponds to one evaluated transport-network node and carries the computed capability scores as attributes. The second is a hexagonal grid layer that tessellates the study area into cells of configurable size. Each hexagonal cell is attributed with the average capability score of all node points that fall within it and is coloured accordingly using a graduated colour ramp, making spatial patterns in the scores easy to read at a glance.
+
+When QGIS is available, the pipeline resolves its executable automatically by searching common installation paths, or falls back to the path set in \texttt{qgis\_bin\_path}. It then runs a QGIS Python script that generates a styled project file with both layers loaded and symbolised. Once the project is ready, QGIS is launched and the project is opened automatically, so the results are immediately visible without any manual file-loading steps.
+
+\section{Architecture and Main Flows}
+
+\subsection*{Main Workflow}
+
+The main workflow is:
+
+\begin{verbatim}
+1. Select study area and configuration
+2. Load or build mode graphs
+3. Load POIs
+4. Snap POIs to the mode graphs
+5. Compute public transport impedance
+6. Compute walking, cycling, and driving impedance
+7. Convert impedances into 0-to-1 decay values
+8. Combine modes into multimodal POI accessibility
+9. Aggregate POI accessibility into service scores
+10. Aggregate service scores into capability scores
+11. Export CSV and spatial outputs
+\end{verbatim}
+
+The staged implementation is coordinated by \texttt{main.py}. Reusable workflow helpers are in \texttt{pipeline\_runner.py}.
+
+\subsection*{Multimodal Flow}
+
+For each origin and destination, the model considers four transport modes (walking, cycling, driving, and public transport), each following the same pattern:
+
+\begin{verbatim}
+route or travel-time estimate
+  -> impedance
+  -> 0-to-1 decay value
+\end{verbatim}
+
+The mode-specific decay values are then combined into one multimodal access value, ensuring that a location is not penalized for poor access by one mode if another realistic mode provides good access.
+
+\subsection*{Aggregation Flow}
+
+The model aggregates information in layers:
+
+\begin{verbatim}
+Individual POIs
+  -> POI-type accessibility
+  -> service scores
+  -> capability scores
+\end{verbatim}
+
+This layered structure keeps the final capability score interpretable. A low care score can be traced back to the relevant care services and then to the POI types behind those services.
+
+\subsection*{Cache and Reuse Flow}
+
+Caches are used throughout the pipeline to avoid repeating slow operations:
+
+\begin{itemize}
+  \item Graphs are stored under \texttt{graph}.
+  \item POIs are cached under \texttt{poi}.
+  \item Snapping and routing artifacts are stored under \texttt{artifacts}.
+  \item Final experiment CSVs are stored under \texttt{experiments}.
+  \item GIS outputs are stored under \texttt{outputs}.
+\end{itemize}
+
+The most important reuse mechanism is the impedance artifact bundle created by \texttt{artifact\_bundle.py}, which allows the model to skip expensive routing work when suitable routing artifacts already exist.
+
+\section{Config}
+
+The following settings can be changed in \texttt{config.py} to control how the pipeline runs. All of them are fields of the \texttt{PipelineConfig} dataclass.
+
+\begin{itemize}
+  \item Study city preset, used to select a named preset (\texttt{study\_city})
+  \item Full city name, used for graph downloads and labelling (\texttt{city\_name})
+  \item Whether to clip the analysis to a shapefile boundary (\texttt{use\_shapefile})
+  \item Name of the boundary shapefile (\texttt{name\_shapefile})
+  \item Whether POIs are loaded from shapefiles rather than queried from OpenStreetMap (\texttt{poi\_from\_shp})
+  \item Paths to the three shapefile POI sources, one per geometry type: points, lines, and polygons (\texttt{poi\_shapefile\_paths})
+  \item Number of parallel workers for routing (\texttt{worker\_count})
+  \item Maximum number of parallel workers for non-bus routing (\texttt{non\_bus\_max\_workers})
+  \item Whether to skip routing entirely and rely on cached artifacts (\texttt{skip\_routing})
+  \item Root directory where artifact bundles are stored (\texttt{artifacts\_root\_dir})
+  \item Departure date and time for public transport routing (\texttt{bus\_departure\_dt})
+  \item Weight applied to waiting time in the bus impedance formula (\texttt{bus\_gamma})
+  \item GTFS feed file paths for public transport (\texttt{gtfs\_feeds})
+  \item Whether the OSM PBF file for r5r is built automatically (\texttt{osm\_pbf\_autobuild})
+  \item Whether to open QGIS automatically after the run (\texttt{open\_qgis\_after\_run})
+  \item Path to the QGIS executable (\texttt{qgis\_bin\_path})
+  \item Path where the QGIS project file is written (\texttt{qgis\_project\_path})
+  \item Capability field used for auto-styling the QGIS layer (\texttt{qgis\_autostyle\_field})
+  \item Number of classification classes in the QGIS style (\texttt{qgis\_autostyle\_classes})
+  \item Colour ramp used for the QGIS style (\texttt{qgis\_autostyle\_ramp})
+  \item Whether to include a hexagonal grid layer in QGIS (\texttt{qgis\_grid\_enabled})
+  \item Cell size of the hexagonal grid in metres (\texttt{qgis\_grid\_cell\_size\_m})
+  \item Whether accessibility and service matrices are cached between runs (\texttt{accessibility\_matrix\_cache\_enabled}, \texttt{service\_matrix\_cache\_enabled})
+  \item Node and POI limits for debug or test runs (\texttt{debug\_max\_nodes}, \texttt{debug\_max\_pois})
+\end{itemize}
+
+\section{API, Data, and Component Contracts}
+
+\subsection*{Stage Outputs}
+
+The main conceptual stage outputs are:
+
+\begin{itemize}
+  \item Snapped POI locations from \texttt{snapping\_stage.py}.
+  \item Public transport impedance matrix from \texttt{bus\_routing\_stage.py}.
+  \item Walking, cycling, and driving routing ingredients from \texttt{non\_bus\_routing\_stage.py}.
+  \item POI accessibility values from \texttt{accessibility\_stage.py}.
+  \item Service scores from \texttt{service\_stage.py}.
+  \item Capability CSVs from \texttt{capability\_stage.py}.
+  \item GIS outputs from \texttt{generate\_experiment\_shapefiles.py}.
+\end{itemize}
+
+\subsection*{Final Output Files}
+
+\begin{itemize}
+  \item Capability CSV files in \texttt{experiments}.
+  \item Recap CSV at \texttt{experiments/capability\_experiments\_recap.csv}.
+  \item Plots under \texttt{plots}.
+  \item Shapefile outputs under \texttt{outputs/shapefiles}.
+  \item GeoPackage outputs under \texttt{outputs/gpkg}.
+  \item Optional QGIS project outputs under \texttt{outputs/qgis}.
+\end{itemize}
+
+\section{Dependencies}
+
+\subsection*{Python}
+
+Declared in \texttt{requirements.txt}:
+
+\begin{itemize}
+  \item \textbf{NumPy} (\texttt{numpy}): array and numerical operations used throughout routing and aggregation stages.
+  \item \textbf{Pandas} (\texttt{pandas}): tabular data handling for POI loading, matrix caches, and result export.
+  \item \textbf{NetworkX} (\texttt{networkx}): graph data structures and shortest-path algorithms for walking, cycling, and driving routing.
+  \item \textbf{OSMnx} (\texttt{osmnx}): downloading and building street-network graphs from OpenStreetMap, and querying OSM features as POIs.
+  \item \textbf{GeoPandas} (\texttt{geopandas}): spatial dataframes for POI loading, snapping, shapefile and GeoPackage export.
+  \item \textbf{Shapely} (\texttt{shapely}): geometric operations including buffering, polygon clipping, and point-in-polygon checks.
+  \item \textbf{tqdm} (\texttt{tqdm}): progress bars for long-running routing and aggregation loops.
+  \item \textbf{scikit-learn} (\texttt{scikit-learn}): used for preprocessing and normalization steps in the aggregation pipeline.
+  \item \textbf{Matplotlib} (\texttt{matplotlib}): generating capability score plots and maps.
+  \item \textbf{Seaborn} (\texttt{seaborn}): statistical plot styling used in scenario comparison outputs.
+  \item \textbf{pyDecision} (\texttt{pyDecision}): provides the ELECTRE III implementation used during capability aggregation.
+  \item \textbf{beautifulsoup4} (\texttt{beautifulsoup4}): HTML parsing used in utility scripts.
+  \item \textbf{shutup} (\texttt{shutup}): suppresses noisy third-party warnings during pipeline execution.
+\end{itemize}
+
+\subsection*{External}
+
+\begin{itemize}
+  \item \textbf{R} and \texttt{Rscript}: required to run the public transport routing script \texttt{utils/r5\_routing.r}.
+  \item \textbf{\texttt{r5r}} (R package): performs transit routing using GTFS timetables and an OSM street network.
+  \item \textbf{Java}: required by \texttt{r5r} at runtime.
+  \item \textbf{GTFS files}: public transport timetable feeds for the study area, used by \texttt{r5r}.
+  \item \textbf{OSM PBF file}: the OpenStreetMap extract for the study area, used by \texttt{r5r} to build the routable network. Can be generated automatically if \texttt{osm\_pbf\_autobuild} is enabled.
+  \item \textbf{QGIS}: used to generate styled project files and to open the GeoPackage output after the run. The pipeline resolves the QGIS executable automatically or falls back to the path set in \texttt{qgis\_bin\_path}.
+  \item \textbf{DHARMa} (R package): required by \texttt{capability\_significance\_test.R} for normality diagnostics. Not installed by the Python requirements file.
+\end{itemize}
+
+\section{Future Work}
+
+\begin{itemize}
+  \item Create an interface that can be used to inspect the provenance of the scores and understand which POIs contributed to those scores. In order to create that interface, some details of the current implementations should be updated:
+  \begin{enumerate}
+    \item The output should return for each node the service scores.
+    \item The POIs should be displayed in the map alongside the nodes.
+    \item For each \((\text{node}, \text{POI})\) pair the impedance score should be saved and multiplied with the relevant impedance parameter in the model.
+  \end{enumerate}
+  \item The reasoning of the model should be in hexagon grids, not for each individual node. For each hexagon, select the node closest to the centroid and compute POI impedance using that node.
+  \item Right now the study area and the boundary of POI extraction are the same. Instead, a threshold should be calculated establishing the furthest distance of POIs to consider from the current area.
+  \item The non-bus routing cache currently writes one pickle file per OSM node. A better approach would be to key the cache by H3 cell instead of by node ID, using the cell closest to the centroid as the canonical origin.
+  \item The impedance, decay, and contribution functions could have a different formulation that can be specified by the user.
+\end{itemize}
+
+\clearpage
+\appendix
+\section{Authority Document for the Capability Model}
+
+\subsection*{Purpose}
+
+This appendix is the normative reference for the repository's capability model. It defines the objects that exist in the model, the dynamics by which they interact, the implementation boundaries that realize those dynamics, and the authority rules that govern interpretation when documents or code disagree.
+
+The repository implements a geospatial capability model that estimates how well locations in a study area can access opportunities supporting everyday life and wellbeing. The model produces three final capability scores:
+
+\begin{itemize}
+  \item \texttt{restorativeness}
+  \item \texttt{nutrition}
+  \item \texttt{care}
+\end{itemize}
+
+This appendix does not merely describe the system. It states the canonical structure of the model and the rules that repository work must follow.
+
+\subsection*{Taxonomy Summary}
+
+The model shall be read through four taxonomies:
+
+\begin{enumerate}
+  \item Object content
+  \item Dynamics
+  \item Implementation
+  \item Authority
+\end{enumerate}
+
+These taxonomies are not interchangeable. Object content defines what the model contains. Dynamics defines how those contents interact over time and across stages. Implementation defines which files and modules realize the model. Authority defines which definitions are binding and how conflicts are resolved.
+
+\section{Object Content}
+
+\subsection*{Core Objects}
+
+The model shall use the following core objects as its conceptual vocabulary:
+
+\begin{itemize}
+  \item Study area
+  \item Transport-network node
+  \item Mode graph
+  \item Place of interest (\texttt{POI})
+  \item Service
+  \item Capability
+  \item Artifact bundle
+  \item Scenario
+  \item Configuration preset
+\end{itemize}
+
+\subsection*{Model Entities}
+
+\begin{itemize}
+  \item A \textbf{study area} is the spatial extent being analysed.
+  \item A \textbf{transport-network node} is the unit of evaluation for accessibility and capability scoring.
+  \item A \textbf{mode graph} is the network representation used for one travel mode.
+  \item A \textbf{POI} is a destination or opportunity relevant to a service.
+  \item A \textbf{service} groups POI types into a meaningful domain category.
+  \item A \textbf{capability} aggregates services into one of the final scores.
+  \item An \textbf{artifact bundle} stores expensive intermediate results for reuse.
+  \item A \textbf{scenario} modifies one or more assumptions for comparative analysis.
+  \item A \textbf{configuration preset} defines a named analysis setup for a specific study area.
+\end{itemize}
+
+\subsection*{Domain Hierarchy}
+
+The domain hierarchy shall be interpreted as:
+
+\begin{quote}
+\texttt{POI types -> services -> capabilities}
+\end{quote}
+
+This hierarchy is the canonical domain structure. All interpretation of scores shall respect this structure. Low capability values shall be traceable back to the contributing services and POI types.
+
+\subsection*{Canonical Input Files}
+
+The following files are authoritative for domain content:
+
+\begin{itemize}
+  \item \texttt{config/poi\_types.csv}
+  \item \texttt{config/services.csv}
+\end{itemize}
+
+The following file is a generated representation and shall be treated as derived from its source module:
+
+\begin{itemize}
+  \item \texttt{config/capability.csv}
+\end{itemize}
+
+The Python modules that load or generate these files are secondary to the stored CSVs only when the CSV is the intended editable source. Where a module is explicitly responsible for generation, the module is the authoritative source and the generated file is a reproducible artifact.
+
+\section{Dynamics}
+
+\subsection*{Pipeline Dynamics}
+
+The model shall execute as a staged pipeline with the following canonical flow:
+
+\begin{enumerate}
+  \item Select study area and configuration preset
+  \item Load or build mode graphs
+  \item Load POIs
+  \item Snap POIs to the graphs
+  \item Compute public transport impedance
+  \item Compute walking, cycling, and driving impedance
+  \item Convert impedance into decay-based accessibility
+  \item Aggregate accessibility into POI-level access
+  \item Aggregate POI-level access into service scores
+  \item Aggregate service scores into capability scores
+  \item Export tables and spatial outputs
+\end{enumerate}
+
+This ordering is normative unless a documented scenario or cached artifact permits safe skipping of an upstream stage.
+
+\subsection*{Multimodal Dynamics}
+
+Accessibility shall be evaluated across walking, cycling, driving, and public transport where data are available.
+
+For each origin-destination pair, each mode shall produce an impedance value. Impedance values shall then be transformed into decay values in the range 0 to 1. The model shall combine the mode-specific values into a multimodal access measure rather than treating a single poor mode as decisive when another realistic mode provides access.
+
+\subsection*{Service and Capability Dynamics}
+
+The aggregation dynamics shall be:
+
+\begin{quote}
+\texttt{impedance -> decay value -> POI accessibility -> service score -> capability score}
+\end{quote}
+
+Service aggregation shall preserve interpretability. Capability aggregation shall preserve the separation between services so that outputs can be audited against their contributing domain components.
+
+\subsection*{Caching and Reuse Dynamics}
+
+The pipeline shall treat routing and geospatial processing as expensive upstream operations. When a valid artifact bundle exists, the system may reuse it to skip recomputation of those stages.
+
+The following reuse rules apply:
+
+\begin{itemize}
+  \item Graph outputs shall be reused when compatible with the selected configuration.
+  \item POI caches shall be reused when source and study-area settings match.
+  \item Snapping and routing artifacts shall be reused when metadata match the current run.
+  \item Downstream scenario analysis shall reuse baseline artifacts when the scenario changes only downstream assumptions.
+\end{itemize}
+
+\subsection*{Scenario Dynamics}
+
+Scenarios shall modify the model by changing one or more controlled assumptions without redefining the entire pipeline. A scenario may disable a mode, alter a parameter, or adjust downstream aggregation, but it shall preserve comparability with the baseline unless explicitly stated otherwise.
+
+\section{Implementation}
+
+\subsection*{Canonical Entry Points}
+
+The following files shall be treated as the principal implementation entry points:
+
+\begin{itemize}
+  \item \texttt{main.py}
+  \item \texttt{pipeline\_runner.py}
+  \item \texttt{context.py}
+  \item \texttt{config.py}
+\end{itemize}
+
+These files define orchestration, execution context, configuration, and workflow coordination.
+
+\subsection*{Module Responsibilities}
+
+The implementation shall be interpreted using the following module responsibilities:
+
+\begin{itemize}
+  \item \texttt{bus\_routing\_stage.py} prepares public transport inputs and invokes the R routing script.
+  \item \texttt{utils/r5\_routing.r} performs the public transport routing computation.
+  \item \texttt{non\_bus\_routing\_stage.py} computes walking, cycling, and driving routing outputs.
+  \item \texttt{snapping\_stage.py} performs POI-to-network snapping.
+  \item \texttt{accessibility\_stage.py} converts impedance into decay-based accessibility values.
+  \item \texttt{service\_stage.py} aggregates POI accessibility into service scores.
+  \item \texttt{capability\_stage.py} aggregates service scores into capability scores.
+  \item \texttt{artifact\_bundle.py} manages cached intermediate artifacts.
+  \item \texttt{scenarios.py} defines scenario modifications.
+  \item \texttt{run\_cities.py} executes batch runs across multiple municipalities.
+  \item \texttt{plot\_shapefile.py} and \texttt{generate\_experiment\_shapefiles.py} generate spatial outputs.
+\end{itemize}
+
+\subsection*{Data Contract Modules}
+
+The following modules shall be treated as the canonical contract layer for shared data structures and helpers:
+
+\begin{itemize}
+  \item \texttt{pipeline\_types.py}
+  \item \texttt{utils/services.py}
+  \item \texttt{utils/capabilities.py}
+  \item \texttt{utils/decay.py}
+  \item \texttt{utils/get\_impedance.py}
+  \item \texttt{utils/delta\_g.py}
+\end{itemize}
+
+\subsection*{External Dependencies}
+
+The following implementation facts are part of the authoritative model description:
+
+\begin{itemize}
+  \item Public transport routing depends on R, Java, GTFS data, and the \texttt{r5r} package.
+  \item Walking, cycling, and driving routing use network-based shortest-path computation.
+  \item QGIS integration is optional and is used only for presentation and spatial inspection.
+\end{itemize}
+
+\section{Authority}
+
+\subsection*{Authority Hierarchy}
+
+When interpreting the repository, the following order of authority shall apply:
+
+\begin{enumerate}
+  \item The concrete data files that define model content
+  \item The Python and R code that implements those data files and pipeline stages
+  \item This authority document
+  \item Other descriptive documentation such as implementation notes, tutorials, and scenario notes
+\end{enumerate}
+
+If a lower-level document conflicts with a higher-level source, the higher-level source shall prevail.
+
+\subsection*{Source of Truth Rules}
+
+\begin{itemize}
+  \item Configuration values shall be sourced from \texttt{config.py} unless overridden by an explicitly selected preset.
+  \item Domain definitions shall be sourced from the CSV files in \texttt{config/}.
+  \item Generated outputs shall not be treated as authoritative inputs.
+  \item Cached artifacts shall be treated as reproducible intermediates, not as the source of model semantics.
+  \item Descriptive documentation shall never override executable code or canonical data definitions.
+\end{itemize}
+
+\subsection*{Normative Language}
+
+In this document:
+
+\begin{itemize}
+  \item \texttt{shall} indicates a binding requirement
+  \item \texttt{should} indicates a recommended practice
+  \item \texttt{may} indicates an allowed option
+  \item \texttt{must} is used only where a hard constraint is intended
+\end{itemize}
+
+\subsection*{Change Control}
+
+Changes to the authoritative model shall be made in the correct layer:
+
+\begin{itemize}
+  \item Change domain meaning in the configuration CSV files or the generating module that owns them.
+  \item Change pipeline behavior in the corresponding stage module.
+  \item Change shared contracts in the shared type or utility modules.
+  \item Change study-area setup in \texttt{config.py} and \texttt{context.py}.
+\end{itemize}
+
+Documentation updates alone shall not be considered sufficient when the underlying implementation has changed.
+
+\section*{Canonical Interpretation of the Model}
+
+The model shall be interpreted as a staged, multimodal, cached accessibility pipeline that maps network-based opportunity access into service scores and then into capability scores. The following statements are authoritative:
+
+\begin{itemize}
+  \item The model is node-based rather than area-based at the primary computation level.
+  \item The model is multimodal rather than single-mode.
+  \item The model is layered rather than flat.
+  \item The model is cache-aware rather than recomputing all expensive steps every run.
+  \item The model is configuration-driven rather than hard-coded for a single city.
+\end{itemize}
+
+\section*{Summary of Binding Structure}
+
+The repository shall be understood as:
+
+\begin{quote}
+\texttt{object content + dynamics + implementation + authority}
+\end{quote}
+
+These four taxonomies define the model completely enough for analysis, maintenance, and extension.
+
+\end{document}

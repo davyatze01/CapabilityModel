@@ -1,0 +1,286 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{lmodern}
+
+\setlist[itemize]{leftmargin=1.5em}
+\setlist[enumerate]{leftmargin=1.5em}
+
+\title{Authority Document for the Capability Model}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Purpose}
+
+This document is the normative reference for the repository's capability model. It defines the objects that exist in the model, the dynamics by which they interact, the implementation boundaries that realize those dynamics, and the authority rules that govern interpretation when documents or code disagree.
+
+The repository implements a geospatial capability model that estimates how well locations in a study area can access opportunities supporting everyday life and wellbeing. The model produces three final capability scores:
+
+\begin{itemize}
+  \item \texttt{restorativeness}
+  \item \texttt{nutrition}
+  \item \texttt{care}
+\end{itemize}
+
+This document does not merely describe the system. It states the canonical structure of the model and the rules that repository work must follow.
+
+\section*{Taxonomy Summary}
+
+The model shall be read through four taxonomies:
+
+\begin{enumerate}
+  \item Object content
+  \item Dynamics
+  \item Implementation
+  \item Authority
+\end{enumerate}
+
+These taxonomies are not interchangeable. Object content defines what the model contains. Dynamics defines how those contents interact over time and across stages. Implementation defines which files and modules realize the model. Authority defines which definitions are binding and how conflicts are resolved.
+
+\section{Object Content}
+
+\subsection*{Core Objects}
+
+The model shall use the following core objects as its conceptual vocabulary:
+
+\begin{itemize}
+  \item Study area
+  \item Transport-network node
+  \item Mode graph
+  \item Place of interest (\texttt{POI})
+  \item Service
+  \item Capability
+  \item Artifact bundle
+  \item Scenario
+  \item Configuration preset
+\end{itemize}
+
+\subsection*{Model Entities}
+
+\begin{itemize}
+  \item A \textbf{study area} is the spatial extent being analysed.
+  \item A \textbf{transport-network node} is the unit of evaluation for accessibility and capability scoring.
+  \item A \textbf{mode graph} is the network representation used for one travel mode.
+  \item A \textbf{POI} is a destination or opportunity relevant to a service.
+  \item A \textbf{service} groups POI types into a meaningful domain category.
+  \item A \textbf{capability} aggregates services into one of the final scores.
+  \item An \textbf{artifact bundle} stores expensive intermediate results for reuse.
+  \item A \textbf{scenario} modifies one or more assumptions for comparative analysis.
+  \item A \textbf{configuration preset} defines a named analysis setup for a specific study area.
+\end{itemize}
+
+\subsection*{Domain Hierarchy}
+
+The domain hierarchy shall be interpreted as:
+
+\begin{quote}
+\texttt{POI types -> services -> capabilities}
+\end{quote}
+
+This hierarchy is the canonical domain structure. All interpretation of scores shall respect this structure. Low capability values shall be traceable back to the contributing services and POI types.
+
+\subsection*{Canonical Input Files}
+
+The following files are authoritative for domain content:
+
+\begin{itemize}
+  \item \texttt{config/poi\_types.csv}
+  \item \texttt{config/services.csv}
+\end{itemize}
+
+The following file is a generated representation and shall be treated as derived from its source module:
+
+\begin{itemize}
+  \item \texttt{config/capability.csv}
+\end{itemize}
+
+The Python modules that load or generate these files are secondary to the stored CSVs only when the CSV is the intended editable source. Where a module is explicitly responsible for generation, the module is the authoritative source and the generated file is a reproducible artifact.
+
+\section{Dynamics}
+
+\subsection*{Pipeline Dynamics}
+
+The model shall execute as a staged pipeline with the following canonical flow:
+
+\begin{enumerate}
+  \item Select study area and configuration preset
+  \item Load or build mode graphs
+  \item Load POIs
+  \item Snap POIs to the graphs
+  \item Compute public transport impedance
+  \item Compute walking, cycling, and driving impedance
+  \item Convert impedance into decay-based accessibility
+  \item Aggregate accessibility into POI-level access
+  \item Aggregate POI-level access into service scores
+  \item Aggregate service scores into capability scores
+  \item Export tables and spatial outputs
+\end{enumerate}
+
+This ordering is normative unless a documented scenario or cached artifact permits safe skipping of an upstream stage.
+
+\subsection*{Multimodal Dynamics}
+
+Accessibility shall be evaluated across walking, cycling, driving, and public transport where data are available.
+
+For each origin-destination pair, each mode shall produce an impedance value. Impedance values shall then be transformed into decay values in the range 0 to 1. The model shall combine the mode-specific values into a multimodal access measure rather than treating a single poor mode as decisive when another realistic mode provides access.
+
+\subsection*{Service and Capability Dynamics}
+
+The aggregation dynamics shall be:
+
+\begin{quote}
+\texttt{impedance -> decay value -> POI accessibility -> service score -> capability score}
+\end{quote}
+
+Service aggregation shall preserve interpretability. Capability aggregation shall preserve the separation between services so that outputs can be audited against their contributing domain components.
+
+\subsection*{Caching and Reuse Dynamics}
+
+The pipeline shall treat routing and geospatial processing as expensive upstream operations. When a valid artifact bundle exists, the system may reuse it to skip recomputation of those stages.
+
+The following reuse rules apply:
+
+\begin{itemize}
+  \item Graph outputs shall be reused when compatible with the selected configuration.
+  \item POI caches shall be reused when source and study-area settings match.
+  \item Snapping and routing artifacts shall be reused when metadata match the current run.
+  \item Downstream scenario analysis shall reuse baseline artifacts when the scenario changes only downstream assumptions.
+\end{itemize}
+
+\subsection*{Scenario Dynamics}
+
+Scenarios shall modify the model by changing one or more controlled assumptions without redefining the entire pipeline. A scenario may disable a mode, alter a parameter, or adjust downstream aggregation, but it shall preserve comparability with the baseline unless explicitly stated otherwise.
+
+\section{Implementation}
+
+\subsection*{Canonical Entry Points}
+
+The following files shall be treated as the principal implementation entry points:
+
+\begin{itemize}
+  \item \texttt{main.py}
+  \item \texttt{pipeline\_runner.py}
+  \item \texttt{context.py}
+  \item \texttt{config.py}
+\end{itemize}
+
+These files define orchestration, execution context, configuration, and workflow coordination.
+
+\subsection*{Module Responsibilities}
+
+The implementation shall be interpreted using the following module responsibilities:
+
+\begin{itemize}
+  \item \texttt{bus\_routing\_stage.py} prepares public transport inputs and invokes the R routing script.
+  \item \texttt{utils/r5\_routing.r} performs the public transport routing computation.
+  \item \texttt{non\_bus\_routing\_stage.py} computes walking, cycling, and driving routing outputs.
+  \item \texttt{snapping\_stage.py} performs POI-to-network snapping.
+  \item \texttt{accessibility\_stage.py} converts impedance into decay-based accessibility values.
+  \item \texttt{service\_stage.py} aggregates POI accessibility into service scores.
+  \item \texttt{capability\_stage.py} aggregates service scores into capability scores.
+  \item \texttt{artifact\_bundle.py} manages cached intermediate artifacts.
+  \item \texttt{scenarios.py} defines scenario modifications.
+  \item \texttt{run\_cities.py} executes batch runs across multiple municipalities.
+  \item \texttt{plot\_shapefile.py} and \texttt{generate\_experiment\_shapefiles.py} generate spatial outputs.
+\end{itemize}
+
+\subsection*{Data Contract Modules}
+
+The following modules shall be treated as the canonical contract layer for shared data structures and helpers:
+
+\begin{itemize}
+  \item \texttt{pipeline\_types.py}
+  \item \texttt{utils/services.py}
+  \item \texttt{utils/capabilities.py}
+  \item \texttt{utils/decay.py}
+  \item \texttt{utils/get\_impedance.py}
+  \item \texttt{utils/delta\_g.py}
+\end{itemize}
+
+\subsection*{External Dependencies}
+
+The following implementation facts are part of the authoritative model description:
+
+\begin{itemize}
+  \item Public transport routing depends on R, Java, GTFS data, and the \texttt{r5r} package.
+  \item Walking, cycling, and driving routing use network-based shortest-path computation.
+  \item QGIS integration is optional and is used only for presentation and spatial inspection.
+\end{itemize}
+
+\section{Authority}
+
+\subsection*{Authority Hierarchy}
+
+When interpreting the repository, the following order of authority shall apply:
+
+\begin{enumerate}
+  \item The concrete data files that define model content
+  \item The Python and R code that implements those data files and pipeline stages
+  \item This authority document
+  \item Other descriptive documentation such as implementation notes, tutorials, and scenario notes
+\end{enumerate}
+
+If a lower-level document conflicts with a higher-level source, the higher-level source shall prevail.
+
+\subsection*{Source of Truth Rules}
+
+\begin{itemize}
+  \item Configuration values shall be sourced from \texttt{config.py} unless overridden by an explicitly selected preset.
+  \item Domain definitions shall be sourced from the CSV files in \texttt{config/}.
+  \item Generated outputs shall not be treated as authoritative inputs.
+  \item Cached artifacts shall be treated as reproducible intermediates, not as the source of model semantics.
+  \item Descriptive documentation shall never override executable code or canonical data definitions.
+\end{itemize}
+
+\subsection*{Normative Language}
+
+In this document:
+
+\begin{itemize}
+  \item \texttt{shall} indicates a binding requirement
+  \item \texttt{should} indicates a recommended practice
+  \item \texttt{may} indicates an allowed option
+  \item \texttt{must} is used only where a hard constraint is intended
+\end{itemize}
+
+\subsection*{Change Control}
+
+Changes to the authoritative model shall be made in the correct layer:
+
+\begin{itemize}
+  \item Change domain meaning in the configuration CSV files or the generating module that owns them.
+  \item Change pipeline behavior in the corresponding stage module.
+  \item Change shared contracts in the shared type or utility modules.
+  \item Change study-area setup in \texttt{config.py} and \texttt{context.py}.
+\end{itemize}
+
+Documentation updates alone shall not be considered sufficient when the underlying implementation has changed.
+
+\section*{Canonical Interpretation of the Model}
+
+The model shall be interpreted as a staged, multimodal, cached accessibility pipeline that maps network-based opportunity access into service scores and then into capability scores. The following statements are authoritative:
+
+\begin{itemize}
+  \item The model is node-based rather than area-based at the primary computation level.
+  \item The model is multimodal rather than single-mode.
+  \item The model is layered rather than flat.
+  \item The model is cache-aware rather than recomputing all expensive steps every run.
+  \item The model is configuration-driven rather than hard-coded for a single city.
+\end{itemize}
+
+\section*{Summary of Binding Structure}
+
+The repository shall be understood as:
+
+\begin{quote}
+\texttt{object content + dynamics + implementation + authority}
+\end{quote}
+
+These four taxonomies define the model completely enough for analysis, maintenance, and extension.
+
+\end{document}

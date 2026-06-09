@@ -492,7 +492,7 @@ def _compute_node_accessibility(item):
             poi_type = entry["poi_type"]
             beta = poi_beta_cache.get(poi_type)
             if beta is None:
-                beta = math.log(2) / float(serv.get_decay_constant(poi_type))
+                beta = math.log(2) / float(serv.get_decay_coefficient(poi_type))
                 poi_beta_cache[poi_type] = beta
 
             decay_bus = []
