@@ -10,9 +10,26 @@ faulthandler.enable(all_threads=True)
 # Change this to "paris" to switch the whole pipeline to Paris.
 study_city = "cagliari"
 
+# ── Execution knobs (edit here instead of setting environment variables) ──────────────
+# SAFE_MODE: gentle execution to avoid pinning the machine at full load — caps native math
+#   library threads to 1 per process, halves the worker count to ~physical_cores//2, and runs
+#   workers at below-normal priority. Results are identical; only scheduling changes.
+SAFE_MODE = True
+# WORKER_COUNT: force the number of pool workers. None = automatic (memory/CPU derived, then
+#   the safe-mode cap if SAFE_MODE). Set to 1 for a single-process "survival" run.
+WORKER_COUNT = 1
+
 
 def main():
     """Run the full capability pipeline end-to-end and print generated output paths."""
+    # Translate the script knobs into the env vars the runtime/stages read. Must happen
+    # before run_runtime_setup() so the math-thread caps take effect before numpy is imported
+    # (and propagate to spawned workers via inherited environment).
+    if SAFE_MODE:
+        os.environ["CAP_SAFE_MODE"] = "1"
+    if WORKER_COUNT is not None:
+        os.environ["CAP_WORKERS"] = str(int(WORKER_COUNT))
+
     run_runtime_setup()
     os.environ["CAP_STUDY_CITY"] = study_city
 

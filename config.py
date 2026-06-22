@@ -112,6 +112,12 @@ class PipelineConfig:
         ]
     )
     worker_count: int | None = None
+    # Opt-in gentle execution. Set by CAP_SAFE_MODE in __post_init__ (kept consistent with
+    # runtime_setup, which also caps native math threads before numpy import). When on: the
+    # worker count is capped to ~physical_cores//2 and worker processes run below-normal
+    # priority. Pools already recycle workers (maxtasksperchild). Reduces sustained CPU/power
+    # load without changing results.
+    safe_mode: bool = field(init=False)
     skip_routing: bool = True
     accessibility_chunksize: int = 100
     accessibility_deduplicate_entries: bool = True
@@ -211,6 +217,7 @@ class PipelineConfig:
     walkability_cache_dir : str = ""
 
     def __post_init__(self) -> None:
+        self.safe_mode = str(os.environ.get("CAP_SAFE_MODE", "")).strip().lower() in ("1", "true", "yes", "on")
         apply_study_city(self, self.study_city)
         self.city_slug = derive_city_slug(self.city_name)
         self.artifact_slug = derive_artifact_slug(

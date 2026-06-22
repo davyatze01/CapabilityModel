@@ -191,7 +191,12 @@ def build_context(config: PipelineConfig) -> PipelineContext:
         "capabilities": os.path.join("outputs", "capability.csv"),
     }
 
-    if config.worker_count is None:
+    env_workers = os.environ.get("CAP_WORKERS")
+    if env_workers and env_workers.strip().isdigit():
+        # Explicit override wins (e.g. CAP_WORKERS=1 for a single-process survival run).
+        workers = max(1, int(env_workers))
+        print(f"[Context] workers={workers} (CAP_WORKERS override)", flush=True)
+    elif config.worker_count is None:
         cpu = mp.cpu_count()
         # Per-origin cache growth is now bounded (delta_g.reset_origin_caches), so the
         # dominant per-worker cost is the resident mode graphs (~mem_per_worker_gb each,
@@ -213,6 +218,24 @@ def build_context(config: PipelineConfig) -> PipelineContext:
         )
     else:
         workers = max(1, int(config.worker_count))
+
+    # Safe mode: cap to ~half the physical cores so the CPU never runs fully saturated, which
+    # (with single-threaded BLAS) keeps sustained power/heat well below the level that exposes
+    # unstable hardware. An explicit CAP_WORKERS override above is left untouched.
+    if getattr(config, "safe_mode", False) and not (env_workers and env_workers.strip().isdigit()):
+        try:
+            import psutil
+            physical = psutil.cpu_count(logical=False) or mp.cpu_count()
+        except Exception:
+            physical = mp.cpu_count()
+        safe_cap = max(1, physical // 2)
+        if workers > safe_cap:
+            print(
+                f"[Context] Safe mode: capping workers {workers} -> {safe_cap} "
+                f"(physical_cores={physical}).",
+                flush=True,
+            )
+            workers = safe_cap
 
     return PipelineContext(
         config=config,

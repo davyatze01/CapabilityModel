@@ -451,6 +451,9 @@ def _init_accessibility_worker(
         matrix_path, dtype=np.float32, mode="r",
         shape=(len(_BUS_SOURCE_ID_TO_ROW), len(dest_id_to_col))
     )
+    # Yield CPU under safe mode so accessibility workers don't pin the machine at full load.
+    from runtime_setup import lower_process_priority_if_safe
+    lower_process_priority_if_safe()
 
 def _validate_bus_matrix_meta(meta_path, expected_departure_iso, expected_origins_sig, expected_destinations_sig):
     """Validate bus matrix metadata before accessibility computation starts.

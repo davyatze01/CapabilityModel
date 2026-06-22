@@ -248,6 +248,9 @@ def _init_worker(
     # overridden above, so edge geometry is never read again — drop it on load to
     # cut each worker's graph footprint dramatically.
     delta_g._STRIP_GRAPH_GEOMETRY = True
+    # Yield CPU under safe mode so routing workers don't pin the machine at full load.
+    from runtime_setup import lower_process_priority_if_safe
+    lower_process_priority_if_safe()
 
 
 def _process_node(node_item):
