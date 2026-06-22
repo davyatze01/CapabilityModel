@@ -4,27 +4,30 @@ This module defines the mapping from services to capabilities and exposes two
 aggregation strategies:
 
 - a Choquet integral helper used by the service layer
-- an ELECTRE III wrapper used by the capability layer
+- an ELECTRE TRI wrapper used by the capability layer
 
-The current pipeline uses `electre_iii_integration()` inside
+The current pipeline uses `electre_tri_integration()` inside
 `capability_stage.py` to collapse a vector of service scores into a single
 capability score per node.
 
 Important implementation note:
-- the ELECTRE III call is used here as a compact scoring mechanism, not as a
-  full ranking workflow over a large set of alternatives
+- ELECTRE TRI compares each alternative against a boundary profile (the ideal
+  all-ones vector) and returns the credibility σ(x, b_ideal) ∈ [0, 1]
 - the module also writes `config/capability.csv` at import time so the CSV stays
   aligned with the hardcoded capability-service mapping below
 """
 
+import bisect
 import os
 from collections import Counter, OrderedDict
 from pathlib import Path
 
 import geopandas as gpd
-import pandas as pd
 import numpy as np
-from pyDecision.algorithm.e_iii import electre_iii
+import pandas as pd
+
+
+from config import ELECTRE_Q_FACTOR, ELECTRE_P_FACTOR
 
 
 # Ordered service lists for each capability.
@@ -127,18 +130,29 @@ def choquet_integral(x, capability):
         prev = x_sorted[j]
     return total
 
-def electre_iii_integration(x, capability):
-    """Aggregate service scores into one capability score via ELECTRE III.
+_BOUNDARIES  = [0.2, 0.4, 0.6, 0.8]
+_CATEGORIES  = ["Very Low", "Low", "Medium", "High", "Very High"]
+_CAT_SCORE   = {cat: (lo + hi) / 2
+                for cat, lo, hi in zip(
+                    _CATEGORIES,
+                    [0.0] + _BOUNDARIES,
+                    _BOUNDARIES + [1.0],
+                )}
 
-    This is a compact scoring wrapper around `pyDecision.algorithm.e_iii.electre_iii`.
-    It creates three reference alternatives:
+_DEFAULT_V = float("inf")
 
-    - all zeros: worst profile
-    - the observed service-score vector: current node
-    - all ones: ideal profile
 
-    The returned value is the global concordance of the observed node against
-    the ideal profile, clipped to [0, 1].
+def electre_tri_integration(x, capability):
+    """Aggregate service scores into one capability score via ELECTRE TRI.
+
+    Assigns the alternative to one of five ordered categories defined by the
+    boundary profiles [0.2, 0.4, 0.6, 0.8] and returns the midpoint of the
+    assigned category as a continuous score in (0, 1).
+
+    Thresholds (uniform across all services):
+    - q = std(x) * ELECTRE_Q_FACTOR  (indifference; factors from config.py)
+    - p = std(x) * ELECTRE_P_FACTOR  (preference)
+    - v = read from config/capability.csv column veto_threshold
     """
     services = CAPABILITY_SERVICES[capability]
     if not services:
@@ -148,26 +162,52 @@ def electre_iii_integration(x, capability):
             f"Expected {len(services)} service scores for capability={capability!r}, got {len(x)}."
         )
 
-    x_arr = np.asarray([max(0.0, min(1.0, float(v))) for v in x], dtype=float)
-    n_criteria = len(services)
-    weights = np.asarray([CAP_ELECTRE_W[capability][service] for service in services], dtype=float)
-    # Threshold choice:
-    # - q = 0: no indifference region
-    # - p = 1: full preference only at the top end of the score range
-    # - v = 1: veto only for a total failure on the criterion
-    #
-    # This makes the wrapper behave like a smooth normalized outranking score
-    # for inputs already clamped to [0, 1].
-    q = np.zeros(n_criteria, dtype=float)
-    p = np.ones(n_criteria, dtype=float)
-    v = np.ones(n_criteria, dtype=float)
-    dataset = np.vstack(
-        [np.zeros(n_criteria, dtype=float), x_arr, np.ones(n_criteria, dtype=float)]
-    )
+    x_arr = [float(xi) for xi in x]
+    std = float(np.std(x_arr))
 
-    global_concordance, _, *_ = electre_iii(dataset, p, q, v, weights, graph=False)
-    score = float(global_concordance[1, 2])  # node outranking best-profile degree
-    return max(0.0, min(1.0, score))
+    # When all scores are equal the thresholds collapse to zero → bisect directly.
+    if std < 1e-9:
+        idx = bisect.bisect_right(_BOUNDARIES, x_arr[0])
+        return _CAT_SCORE[_CATEGORIES[min(idx, len(_CATEGORIES) - 1)]]
+
+    q = std * ELECTRE_Q_FACTOR
+    p = std * ELECTRE_P_FACTOR
+    v = _ELECTRE_PARAMS[capability]["v"]
+    w = 1.0 / len(x_arr)          # uniform weights (equal for all criteria)
+    inf_veto = v == float("inf")
+    pq_range = p - q               # always > 0 since p > q
+
+    # ELECTRE TRI-B pessimistic rule: find the highest boundary that the
+    # alternative outranks (credibility ≥ λ=0.65) and assign to the next category.
+    assigned_idx = 0               # default: Very Low
+    for k, b in enumerate(_BOUNDARIES):
+        # --- concordance (per-criterion partial agreement) ---
+        C = 0.0
+        for xj in x_arr:
+            d = xj - b
+            if d >= -q:
+                C += 1.0
+            elif d > -p:
+                C += (d + p) / pq_range
+        C *= w
+
+        # --- credibility (concordance attenuated by discordance) ---
+        cred = C
+        if not inf_veto and C < 1.0:
+            for xj in x_arr:
+                gap = b - xj       # how much the boundary dominates this criterion
+                if gap > v:        # full veto
+                    cred = 0.0
+                    break
+                if gap > p:
+                    dj = (gap - p) / (v - p)
+                    if dj > C:
+                        cred *= (1.0 - dj) / (1.0 - C)
+
+        if cred >= 0.65:
+            assigned_idx = k + 1
+
+    return _CAT_SCORE[_CATEGORIES[assigned_idx]]
 
 
 # Stable service order for each capability.
@@ -184,26 +224,35 @@ CAP_ELECTRE_W = {
 }
 
 
+output_path = Path(__file__).resolve().parents[1] / "config" / "capability.csv"
+
+# Read existing veto values so user edits in the CSV are preserved.
+_saved_v: dict[str, float] = {}
+if output_path.exists():
+    try:
+        _existing = pd.read_csv(output_path)
+        for _, row in _existing.iterrows():
+            _saved_v[row["capability"]] = float(row.get("veto_threshold", _DEFAULT_V))
+    except Exception:
+        pass
+
 rows = []
-
-# Regenerate the CSV view of the capability mapping so the config file mirrors
-# the current hardcoded mapping and ELECTRE weights.
 for capability, services in CAPABILITY_SERVICES.items():
-    electre_values = [
-        CAP_ELECTRE_W[capability][service]
-        for service in services
-    ]
-
-
     rows.append({
-        "capability": capability,
-        "services": services,
-        "electre_weight": electre_values,
-        "enabled": True
+        "capability":    capability,
+        "services":      services,
+        "electre_weight": [CAP_ELECTRE_W[capability][s] for s in services],
+        "veto_threshold": _saved_v.get(capability, _DEFAULT_V),
+        "enabled":        True,
     })
 
-
 df = pd.DataFrame(rows)
-
-output_path = Path(__file__).resolve().parents[1] / "config" / "capability.csv"
 df.to_csv(output_path, index=False)
+
+# Runtime lookup consumed by electre_tri_integration().
+_ELECTRE_PARAMS = {
+    row["capability"]: {
+        "v": float(row["veto_threshold"]),
+    }
+    for _, row in df.iterrows()
+}

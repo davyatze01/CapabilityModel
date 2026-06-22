@@ -1,5 +1,6 @@
 import osmnx as ox
 import os
+import math
 import geopandas as gpd
 import pandas as pd
 import hashlib
@@ -10,6 +11,7 @@ from utils.load_shapefile import poi_from_shp
 
 from config import PipelineConfig
 from utils.load_shapefile import graph_from_shapefile, feature_from_shapefile
+from utils.poi_identity import build_poi_source_key
 
 TagValue: TypeAlias = bool | str | list[str]
 TagClause: TypeAlias = dict[str, TagValue]
@@ -65,12 +67,218 @@ def get_graph():
     return graph
 
 
-def get_mode_graph(network_type, cfg: PipelineConfig | None = None):
+def _resolve_mode_graph_path(network_type, cfg: PipelineConfig) -> str:
+    """Return the on-disk path of the full (unsimplified) mode graph cache file."""
+    if cfg.use_shapefile:
+        return f"graph/{cfg.artifact_slug}_{network_type}.graphml"
+
+    city_slug = cfg.city_slug
+    from utils.services import get_global_radius_m
+    buffer_m = get_global_radius_m(cfg) or 0.0
+    simplify_tag = "s" if cfg.osm_autobuild_simplify else "ns"
+    retain_tag = "ra" if cfg.osm_autobuild_retain_all else ""
+    graph_tag = f"_{simplify_tag}{retain_tag}" if retain_tag else f"_{simplify_tag}"
+    if buffer_m > 0:
+        return f"graph/{city_slug}_{network_type}_buf{buffer_m:.0f}m{graph_tag}.graphml"
+    return f"graph/{city_slug}_{network_type}{graph_tag}.graphml"
+
+
+def _get_simplified_mode_graph(network_type, cfg: PipelineConfig):
+    """Load (or build once) a topology-simplified routing graph for a mode.
+
+    Routing only needs correct network distances, which `ox.simplify_graph`
+    preserves (it sums `length` over merged degree-2 chains). Collapsing those
+    interstitial nodes cuts node count ~5x, so workers loading this instead of the
+    full graph use a fraction of the RAM. Origins and POIs are still enumerated and
+    snapped on the full graph upstream; their coordinates re-snap onto these nodes.
+
+    Built once and cached to `<full>_simplified.graphml`; subsequent loads (e.g. in
+    every worker) read that file directly without ever materializing the full graph.
+    """
+    cache_key = (network_type, "simplified")
+    cached = _MODE_GRAPH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    full_path = _resolve_mode_graph_path(network_type, cfg)
+    simp_path = full_path[: -len(".graphml")] + "_simplified.graphml"
+
+    if os.path.isfile(simp_path):
+        graph = ox.io.load_graphml(simp_path)
+    else:
+        # Build from the full graph (loaded only here, normally in the parent).
+        full_graph = get_mode_graph(network_type, cfg)
+        if full_graph.graph.get("simplified"):
+            graph = full_graph
+        else:
+            graph = ox.simplify_graph(full_graph.copy())
+        tmp_path = simp_path + ".tmp"
+        ox.io.save_graphml(graph, filepath=tmp_path)
+        os.replace(tmp_path, simp_path)
+        print(
+            f"[Graph] Built simplified routing graph for '{network_type}': "
+            f"{simp_path} nodes={graph.number_of_nodes()} edges={graph.number_of_edges()}",
+            flush=True,
+        )
+
+    _MODE_GRAPH_CACHE[cache_key] = graph
+    return graph
+
+
+# In-memory cache of compact CSR routing bundles, one per mode.
+_MODE_CSR_CACHE: dict[str, object] = {}
+
+
+def get_mode_csr(network_type, cfg: PipelineConfig | None = None):
+    """Compact CSR routing bundle for a mode's FULL (unsimplified) graph.
+
+    Routing on the full graph is exact; storing it as a scipy CSR adjacency
+    (indptr/indices/length arrays, ~10-15 MB) instead of a NetworkX object (>1 GB)
+    lets every worker hold the whole network for a fraction of the RAM. Built once
+    per mode in the parent and cached to `<full>_csr.npz`; workers load that file.
+
+    Returns a dict with:
+    - `mat`: scipy.sparse.csr_matrix (directed, value = min `length` per (u, v)).
+    - `indptr`, `indices`, `length`: the raw CSR arrays (for fast path walkability).
+    - `node_ids`: int64 array, row/col index -> OSM node id.
+    - `id_to_idx`: dict OSM node id -> index.
+    - `tree`, `scale`: cKDTree over node coords (m) + `(m_per_deg_lon, m_per_deg_lat)`.
+    - `wscore`: float array aligned to `length` (walk only; else None) holding the
+      walkability score of the min-length parallel edge for each (u, v).
+    """
+    import numpy as np
+    from scipy.sparse import csr_matrix
+    from scipy.spatial import cKDTree
+
+    if cfg is None:
+        cfg = PipelineConfig()
+
+    cached = _MODE_CSR_CACHE.get(network_type)
+    if cached is not None:
+        return cached
+
+    full_path = _resolve_mode_graph_path(network_type, cfg)
+    csr_path = full_path[: -len(".graphml")] + "_csr.npz"
+
+    if os.path.isfile(csr_path):
+        data = np.load(csr_path, allow_pickle=False)
+        indptr = data["indptr"]
+        indices = data["indices"]
+        length = data["length"]
+        node_ids = data["node_ids"]
+        node_x = data["node_x"]
+        node_y = data["node_y"]
+        m_per_deg_lon = float(data["m_per_deg_lon"])
+        m_per_deg_lat = float(data["m_per_deg_lat"])
+        wscore = data["wscore"] if "wscore" in data.files else None
+    else:
+        G = get_mode_graph(network_type, cfg, simplified=False)
+        nodes = list(G.nodes())
+        n = len(nodes)
+        idx = {nid: i for i, nid in enumerate(nodes)}
+
+        # Collapse parallel edges to the shortest representative, remembering which
+        # original key won (needed to fetch its walkability score for walk mode).
+        emin: dict = {}
+        for u, v, k, d in G.edges(keys=True, data=True):
+            w = float(d.get("length", 0.0) or 0.0)
+            ek = (idx[u], idx[v])
+            cur = emin.get(ek)
+            if cur is None or w < cur[0]:
+                emin[ek] = (w, u, v, k)
+
+        m = len(emin)
+        rows = np.empty(m, dtype=np.int64)
+        cols = np.empty(m, dtype=np.int64)
+        length_vals = np.empty(m, dtype=float)
+
+        need_scores = network_type == "walk"
+        if need_scores:
+            import walkability
+            cache_obj = walkability.get_or_build_edge_walkability_index(
+                cfg=cfg, G=G, force_rebuild=False, schema_version=1
+            )
+            escores = cache_obj.edge_scores
+            score_vals = np.empty(m, dtype=float)
+
+        for j, (ek, val) in enumerate(emin.items()):
+            rows[j] = ek[0]
+            cols[j] = ek[1]
+            length_vals[j] = val[0]
+            if need_scores:
+                score_vals[j] = float(escores.get((val[1], val[2], val[3]), 5.0))
+
+        mat = csr_matrix((length_vals, (rows, cols)), shape=(n, n))
+        mat.sort_indices()
+        indptr = mat.indptr.astype(np.int64)
+        indices = mat.indices.astype(np.int64)
+        length = mat.data.astype(float)
+        if need_scores:
+            # Identical sparsity to `mat` (same rows/cols, no duplicates) so after
+            # sort_indices the data arrays align position-for-position.
+            smat = csr_matrix((score_vals, (rows, cols)), shape=(n, n))
+            smat.sort_indices()
+            wscore = smat.data.astype(float)
+        else:
+            wscore = None
+
+        node_ids = np.asarray([int(nid) for nid in nodes], dtype=np.int64)
+        node_x = np.asarray([float(G.nodes[nid]["x"]) for nid in nodes], dtype=float)
+        node_y = np.asarray([float(G.nodes[nid]["y"]) for nid in nodes], dtype=float)
+        mean_lat_rad = math.radians(float(node_y.mean())) if node_y.size else 0.0
+        m_per_deg_lat = 111320.0
+        m_per_deg_lon = 111320.0 * math.cos(mean_lat_rad)
+
+        save_dict = dict(
+            indptr=indptr,
+            indices=indices,
+            length=length,
+            node_ids=node_ids,
+            node_x=node_x,
+            node_y=node_y,
+            m_per_deg_lon=np.float64(m_per_deg_lon),
+            m_per_deg_lat=np.float64(m_per_deg_lat),
+        )
+        if wscore is not None:
+            save_dict["wscore"] = wscore
+        tmp_path = csr_path + ".tmp.npz"
+        np.savez(tmp_path, **save_dict)
+        os.replace(tmp_path, csr_path)
+        print(
+            f"[Graph] Built CSR routing matrix for '{network_type}': "
+            f"{csr_path} nodes={n} edges={m}",
+            flush=True,
+        )
+
+    n_nodes = len(node_ids)
+    mat = csr_matrix((length, indices, indptr), shape=(n_nodes, n_nodes))
+    node_xy = np.column_stack([node_x * m_per_deg_lon, node_y * m_per_deg_lat])
+    tree = cKDTree(node_xy)
+    id_to_idx = {int(nid): i for i, nid in enumerate(node_ids)}
+    bundle = {
+        "mat": mat,
+        "indptr": indptr,
+        "indices": indices,
+        "length": length,
+        "node_ids": node_ids,
+        "id_to_idx": id_to_idx,
+        "tree": tree,
+        "scale": (m_per_deg_lon, m_per_deg_lat),
+        "wscore": wscore,
+    }
+    _MODE_CSR_CACHE[network_type] = bundle
+    return bundle
+
+
+
+def get_mode_graph(network_type, cfg: PipelineConfig | None = None, simplified: bool = False):
     """Load or download graph for a specific travel mode.
 
     Inputs:
     - network_type: mode string (for example walk, bike, drive).
     - cfg: optional PipelineConfig. If not provided, creates a new one.
+    - simplified: when True, return the topology-simplified routing graph (smaller,
+      same network distances) instead of the full enumeration graph.
 
     Outputs:
     - graph object for that mode, cached in memory.
@@ -78,13 +286,16 @@ def get_mode_graph(network_type, cfg: PipelineConfig | None = None):
     if cfg is None:
         cfg = PipelineConfig()
 
+    if simplified:
+        return _get_simplified_mode_graph(network_type, cfg)
+
     if network_type in _MODE_GRAPH_CACHE:
             return _MODE_GRAPH_CACHE[network_type]
-    
+
     graph = None
 
     if cfg.use_shapefile:
-        graph_path = f"graph/{cfg.artifact_slug}_{network_type}.graphml"
+        graph_path = _resolve_mode_graph_path(network_type, cfg)
         try:
             print(
                 f"[Graph] Loading {network_type} graph from shapefile cache: "
@@ -110,21 +321,43 @@ def get_mode_graph(network_type, cfg: PipelineConfig | None = None):
             )
     else:
         # Cache per-mode graphs on disk to avoid repeated Overpass downloads.
-        place_name, city_slug = _get_city_settings()
-        name_file = f"graph/{city_slug}_{network_type}.graphml"
+        place_name = cfg.city_name
+        name_file = _resolve_mode_graph_path(network_type, cfg)
+        from utils.services import get_global_radius_m
+        buffer_m = get_global_radius_m(cfg) or 0.0
 
         try:
             graph = ox.io.load_graphml(name_file)
         except Exception:
             print(f"[Graph] Cached graph not found for mode '{network_type}'. Downloading from OSM...", flush=True)
-            graph = ox.graph_from_place(place_name, network_type=network_type)
+            if buffer_m > 0:
+                place_gdf = ox.geocode_to_gdf(place_name)
+                utm_crs = place_gdf.estimate_utm_crs()
+                gdf_metric = place_gdf.to_crs(utm_crs)
+                gdf_buffered = gdf_metric.copy()
+                gdf_buffered["geometry"] = gdf_metric.geometry.buffer(buffer_m)
+                polygon = gdf_buffered.to_crs("EPSG:4326").geometry.iloc[0]
+                print(f"[Graph] Expanding graph area by {buffer_m/1000:.1f} km buffer", flush=True)
+                graph = ox.graph_from_polygon(
+                    polygon,
+                    network_type=network_type,
+                    simplify=cfg.osm_autobuild_simplify,
+                    retain_all=cfg.osm_autobuild_retain_all,
+                )
+            else:
+                graph = ox.graph_from_place(
+                    place_name,
+                    network_type=network_type,
+                    simplify=cfg.osm_autobuild_simplify,
+                    retain_all=cfg.osm_autobuild_retain_all,
+                )
             ox.io.save_graphml(graph, filepath=name_file)
             print(f"[Graph] Graph downloaded and saved: {name_file}", flush=True)
 
     _MODE_GRAPH_CACHE[network_type] = graph
     return graph
 
-def _tags_file_name(tags):
+def _tags_file_name(tags, buffer_m: float = 0.0) -> str:
     """Build stable geojson filename for a tags-based POI query.
 
     Inputs:
@@ -134,10 +367,12 @@ def _tags_file_name(tags):
     - str: deterministic filename for cache reuse.
     """
     tags_json = json.dumps(tags, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if buffer_m > 0:
+        tags_json += f"|buffer={buffer_m:.1f}"
     key_hash = hashlib.sha1(tags_json.encode("utf-8")).hexdigest()
     return f"tags_{key_hash}.geojson"
 
-def _feature_value_file_name(feature: str, value: TagValue) -> str:
+def _feature_value_file_name(feature: str, value: TagValue, buffer_m: float = 0.0) -> str:
     """Build stable geojson filename for a feature/value POI query."""
     payload = json.dumps(
         {"feature": feature, "value": value},
@@ -145,6 +380,8 @@ def _feature_value_file_name(feature: str, value: TagValue) -> str:
         separators=(",", ":"),
         ensure_ascii=True,
     )
+    if buffer_m > 0:
+        payload += f"|buffer={buffer_m:.1f}"
     key_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()
     return f"fv_{key_hash}.geojson"
 
@@ -152,8 +389,10 @@ def _city_poi_cache_dir(cache_slug: str) -> str:
     """Return scenario-scoped directory path for POI cache files."""
     return os.path.join("poi", cache_slug)
 
-def _all_tags_file_name(query_tags: TagClause) -> str:
+def _all_tags_file_name(query_tags: TagClause, buffer_m: float = 0.0) -> str:
     payload = json.dumps(query_tags, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if buffer_m > 0:
+        payload += f"|buffer={buffer_m:.1f}"
     key_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()
     return f"all_tags_{key_hash}.geojson"
 
@@ -196,7 +435,7 @@ def _build_city_universe_tags() -> TagClause:
             out[key] = [str(v) for v in values]
     return out
 
-def _download_city_poi_universe(place_name: str, query_tags: TagClause) -> gpd.GeoDataFrame:
+def _download_city_poi_universe(place_name: str, query_tags: TagClause, buffer_m: float = 0.0) -> gpd.GeoDataFrame:
     """Download one city-wide POI dataset that covers all configured tags."""
     cfg = PipelineConfig()
 
@@ -206,7 +445,7 @@ def _download_city_poi_universe(place_name: str, query_tags: TagClause) -> gpd.G
         return poi_from_shp(query_tags=query_tags)
     else:
         print(f"[POI] OSMnx city-universe download: keys={len(query_tags)}")
-        return _download_poi_for_place(place_name, query_tags)
+        return _download_poi_for_place(place_name, query_tags, buffer_m=buffer_m)
 
 def _values_match(series: pd.Series, value: TagValue) -> pd.Series:
     if value is True:
@@ -249,17 +488,18 @@ def _filter_by_tags(gdf: gpd.GeoDataFrame, tags: TagQuery) -> gpd.GeoDataFrame:
         out = out[out["geometry"].notna()].copy()
     return out
 
-def _get_city_poi_universe(place_name: str, cache_slug: str, city_poi_dir: str) -> gpd.GeoDataFrame:
-    cached = _CITY_POI_UNIVERSE_CACHE.get(cache_slug)
+def _get_city_poi_universe(place_name: str, cache_slug: str, city_poi_dir: str, buffer_m: float = 0.0) -> gpd.GeoDataFrame:
+    cache_key = f"{cache_slug}|buffer={buffer_m:.1f}"
+    cached = _CITY_POI_UNIVERSE_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
     universe_tags = _build_city_universe_tags()
-    path = os.path.join(city_poi_dir, _all_tags_file_name(universe_tags))
+    path = os.path.join(city_poi_dir, _all_tags_file_name(universe_tags, buffer_m))
     gdf = _load_cached_poi_if_nonempty(path)
     if gdf is None:
         try:
-            gdf = _download_city_poi_universe(place_name, universe_tags)
+            gdf = _download_city_poi_universe(place_name, universe_tags, buffer_m=buffer_m)
         except Exception as exc:
             print(f"[POI] City-universe download failed: {exc}")
             gdf = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
@@ -270,11 +510,23 @@ def _get_city_poi_universe(place_name: str, cache_slug: str, city_poi_dir: str) 
                 print(f"[POI] Failed to persist city-universe cache {path}: {exc}")
     if gdf is None:
         gdf = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-    _CITY_POI_UNIVERSE_CACHE[cache_slug] = gdf
+    _CITY_POI_UNIVERSE_CACHE[cache_key] = gdf
     return gdf
 
-def _download_poi_for_place(place_name: str, query_tags: TagClause):
-    """Download POIs for one place with polygon fallback when place lookup fails."""
+def _download_poi_for_place(place_name: str, query_tags: TagClause, buffer_m: float = 0.0):
+    """Download POIs for one place, optionally expanding the query area by buffer_m metres."""
+    if buffer_m > 0:
+        place_gdf = ox.geocode_to_gdf(place_name)
+        if place_gdf.empty:
+            raise RuntimeError(f"geocode_to_gdf returned no geometry for '{place_name}'")
+        utm_crs = place_gdf.estimate_utm_crs()
+        gdf_metric = place_gdf.to_crs(utm_crs)
+        gdf_buffered = gdf_metric.copy()
+        gdf_buffered["geometry"] = gdf_metric.geometry.buffer(buffer_m)
+        polygon = gdf_buffered.to_crs("EPSG:4326").geometry.iloc[0]
+        print(f"[POI] Query area expanded by {buffer_m/1000:.1f} km buffer", flush=True)
+        return ox.features_from_polygon(polygon, query_tags)
+
     try:
         return ox.features_from_place(place_name, query_tags)
     except Exception as place_exc:
@@ -326,6 +578,9 @@ def get_poi(
     city_slug = cfg.city_slug
     poi_cache_slug = cfg.artifact_slug if cfg.use_shapefile else city_slug
 
+    from utils.services import get_global_radius_m
+    buffer_m: float = get_global_radius_m(cfg) or 0.0
+
     os.makedirs("poi", exist_ok=True)
     city_poi_dir = _city_poi_cache_dir(poi_cache_slug)
     os.makedirs(city_poi_dir, exist_ok=True)
@@ -356,18 +611,18 @@ def get_poi(
         value = True
 
     if tags:
-        NAME_FILE = os.path.join(city_poi_dir, _tags_file_name(tags))
+        NAME_FILE = os.path.join(city_poi_dir, _tags_file_name(tags, buffer_m))
     else:
         feature_key = feature if feature is not None else "amenity"
         value_key: TagValue = value if value is not None else True
-        NAME_FILE = os.path.join(city_poi_dir, _feature_value_file_name(feature_key, value_key))
+        NAME_FILE = os.path.join(city_poi_dir, _feature_value_file_name(feature_key, value_key, buffer_m))
 
     # Provo a caricare i POI gia salvati.
     poi = _load_cached_poi_if_nonempty(NAME_FILE)
     if poi is None:
         if tags and not cfg.poi_from_shp:
             try:
-                universe = _get_city_poi_universe(place_name, poi_cache_slug, city_poi_dir)
+                universe = _get_city_poi_universe(place_name, poi_cache_slug, city_poi_dir, buffer_m=buffer_m)
                 if universe is not None and not universe.empty:
                     poi = _filter_by_tags(universe, tags)
                     if poi is not None and not poi.empty:
@@ -410,7 +665,7 @@ def get_poi(
                     f"[POI] Downloading poi_type={poi_type} from OSM for '{place_name}'...",
                     flush=True,
                 )
-                poi = _download_poi_for_place(place_name, query_tags)
+                poi = _download_poi_for_place(place_name, query_tags, buffer_m=buffer_m)
         except Exception as e:
             print(
                 f"[POI] No POIs found for city={place_name}, poi_type={poi_type}, feature={feature}, value={value}, tags={tags}: {e}",
@@ -503,13 +758,13 @@ def get_poi_geom(poi):
     ]
 
 def get_poi_geometries(poi):
-    """Extract geometry objects with optional names from POI table.
+    """Extract geometry objects, optional names, and stable source keys from POI table.
 
     Inputs:
     - poi: POI GeoDataFrame.
 
     Outputs:
-    - list[tuple[geometry, name]]: geometry/name pairs for downstream snapping.
+    - list[tuple[geometry, name, source_key]]: geometry/name/key triples for downstream snapping.
     """
     out = []
     if "geometry" not in poi.columns:
@@ -522,7 +777,9 @@ def get_poi_geometries(poi):
                 name = names.loc[idx]
             except Exception:
                 name = None
-        out.append((geometry, name))
+        row = poi.loc[idx]
+        source_key = build_poi_source_key(row, geometry)
+        out.append((geometry, name, source_key))
     return out
 
 def get_poi_amenity_types(poi):

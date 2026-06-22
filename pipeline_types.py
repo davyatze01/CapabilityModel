@@ -43,7 +43,11 @@ class AccessibilityNodeResult:
     node_id: Any
     lat: float
     lon: float
+    # Per-POI-type aggregated accessibility (used by service/capability stages).
     accessibility_by_service: dict[str, list[dict[str, Any]]]
+    # Per-individual-POI accessibility keyed by source_key (used by poi_exports).
+    # Maps source_key → accessibility_value.
+    accessibility_by_poi: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass

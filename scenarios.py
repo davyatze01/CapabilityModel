@@ -458,7 +458,6 @@ class ScenarioRunner:
         output_literal = repr(str(output_project))
         field_literal = repr(str(self.cfg.qgis_autostyle_field))
         ramp_literal = repr(str(self.cfg.qgis_autostyle_ramp))
-        classes_count = int(self.cfg.qgis_autostyle_classes)
         basemap_flag = "True" if self.cfg.qgis_autostyle_basemap else "False"
 
         script = f"""
@@ -469,7 +468,9 @@ from qgis.core import (
     QgsGraduatedSymbolRenderer,
     QgsProject,
     QgsRasterLayer,
+    QgsRendererRange,
     QgsStyle,
+    QgsSymbol,
     QgsVectorLayer,
 )
 from qgis.PyQt.QtGui import QColor
@@ -499,14 +500,20 @@ def style_layer(layer):
     field_name = next((name for name in preferred_fields if name in available_fields), None)
     if not field_name:
         return
-    renderer = QgsGraduatedSymbolRenderer()
-    renderer.setClassAttribute(field_name)
-    renderer.setMode(QgsGraduatedSymbolRenderer.EqualInterval)
-    renderer.updateClasses(layer, int({classes_count}))
+    electre_bounds = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    electre_labels = ["Very Low (0.0–0.2)", "Low (0.2–0.4)", "Medium (0.4–0.6)", "High (0.6–0.8)", "Very High (0.8–1.0)"]
+    n_cls = len(electre_labels)
     ramp = QgsStyle.defaultStyle().colorRamp({ramp_literal})
     if ramp is None:
         ramp = QgsGradientColorRamp(QColor("#440154"), QColor("#FDE725"))
-    renderer.updateColorRamp(ramp)
+    ranges = []
+    for i, lbl in enumerate(electre_labels):
+        sym = QgsSymbol.defaultSymbol(layer.geometryType())
+        if sym is None:
+            continue
+        sym.setColor(ramp.color(float(i) / max(1, n_cls - 1)))
+        ranges.append(QgsRendererRange(electre_bounds[i], electre_bounds[i + 1], sym, lbl))
+    renderer = QgsGraduatedSymbolRenderer(field_name, ranges) if ranges else QgsGraduatedSymbolRenderer()
     layer.setRenderer(renderer)
 
 baseline_layer = load_layer({baseline_literal}, "Scenario 1 - Baseline")

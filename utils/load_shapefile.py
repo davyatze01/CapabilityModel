@@ -126,6 +126,7 @@ def poi_from_shp(poi_type: str | None = None):
     )
 
     missing_poi_types = shp_poi_types - configured_labels
+    missing_poi_types.discard("therapeutic_wellness")
     if missing_poi_types:
         missing_key = (str(cfg.name_shapefile), tuple(sorted(missing_poi_types)))
         if missing_key not in _UNUSED_POI_TYPES_WARNED:
@@ -141,10 +142,11 @@ def poi_from_shp(poi_type: str | None = None):
 
     query_poi_types = labels_by_poi_type.get(str(poi_type), set())
     if not query_poi_types:
-        print(
-            f"[POI] No shapefile labels configured for poi_type='{poi_type}'. Returning empty result.",
-            flush=True,
-        )
+        if str(poi_type) != "therapeutic_wellness":
+            print(
+                f"[POI] No shapefile labels configured for poi_type='{poi_type}'. Returning empty result.",
+                flush=True,
+            )
         return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
 
     mask = pois["poi_type"].astype(str).isin(query_poi_types)

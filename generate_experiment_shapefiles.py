@@ -155,7 +155,11 @@ def _prepare_combined_geodataframe(csv_paths: list[Path], graph: nx.Graph) -> gp
         if combined is not None and metric_name in combined.columns:
             metric_name = f"{value_column}_{current_csv.stem}"
 
-        slim = gdf[["join_key", "node_id", "lon", "lat", "geometry", value_column]].copy()
+        # Include all capability_* columns so a single CSV carrying all capabilities
+        # is passed through intact rather than reduced to one column.
+        cap_cols = [col for col in gdf.columns if str(col).startswith("capability_") and col != value_column]
+        keep = ["join_key", "node_id", "lon", "lat", "geometry", value_column] + cap_cols
+        slim = gdf[[col for col in keep if col in gdf.columns]].copy()
         slim = slim.rename(columns={value_column: metric_name})
 
         if combined is None:
@@ -370,6 +374,16 @@ def generate_combined_experiment_gpkg(
                 if sidecar_grid.exists():
                     sidecar_grid.unlink()
                 _write_gpkg_layer(grid_layer, sidecar_grid, layer_name="capability_grid", mode="w")
+
+            # Write a flat CSV indexed by hex_id so QGIS attributes and the
+            # tabular output share the same primary key.
+            if "hex_id" in grid_layer.columns:
+                hex_csv_path = output_path.with_name(f"{output_path.stem}_hex.csv")
+                csv_cols = ["hex_id"] + (
+                    ["node_id"] if "node_id" in grid_layer.columns else []
+                ) + [c for c in grid_layer.columns if c.startswith("grid_mean_")]
+                grid_layer[csv_cols].to_csv(hex_csv_path, index=False)
+
     return output_path
 
 
@@ -379,98 +393,163 @@ def _build_capability_grid(
     cell_size_m: float,
     max_cells: int,
 ) -> gpd.GeoDataFrame | None:
-    """Build full bbox hex grid and aggregate point capability means per cell."""
+    """Build a regular hex grid in the same coordinate system as the sampling grid.
+
+    Uses the identical approximate-Cartesian projection as _hex_grid_sample_nodes
+    (xs = lon × m_per_deg_lon, ys = lat × 111320) so that the display grid and the
+    sampling grid share the same scaling and column-offset pattern.  For each display
+    cell the nearest computed node within hex_radius_m is assigned; cells with no node
+    that close are left uncolored (genuine gaps in the network).
+    """
+    from scipy.spatial import cKDTree
+
     capability_columns = [column for column in points_gdf.columns if str(column).startswith("capability_")]
     if not capability_columns:
         return None
     if capability_field not in capability_columns:
         capability_field = capability_columns[0]
 
-    work = points_gdf[["geometry"] + capability_columns].copy()
+    _id_col = "node_id" if "node_id" in points_gdf.columns else None
+    _extra = [_id_col] if _id_col else []
+    work = points_gdf[["geometry"] + _extra + capability_columns].copy()
     for column in capability_columns:
         work[column] = pd.to_numeric(work[column], errors="coerce")
     work = work.dropna(subset=["geometry"])
     if work.empty:
         return None
 
-    work = gpd.GeoDataFrame(work, geometry="geometry", crs=points_gdf.crs).to_crs("EPSG:3857")
-    x_vals = work.geometry.x.to_numpy(dtype=float)
-    y_vals = work.geometry.y.to_numpy(dtype=float)
-    finite_mask = np.isfinite(x_vals) & np.isfinite(y_vals)
-    work = work.loc[finite_mask].copy()
+    # ── Same approximate-Cartesian projection as _hex_grid_sample_nodes ──────
+    M_LAT = 111320.0
+    lats = work.geometry.y.to_numpy(dtype=float)
+    lons = work.geometry.x.to_numpy(dtype=float)
+    finite_mask = np.isfinite(lats) & np.isfinite(lons)
+    if not finite_mask.any():
+        return None
+
+    # Try to reuse the exact grid parameters written by _hex_grid_sample_nodes
+    # so both grids share an identical tiling (same bbox, same m_per_deg_lon).
+    import json as _json
+    _params_path = Path("outputs") / "grid_params.json"
+    _loaded_params: dict | None = None
+    try:
+        with open(_params_path, encoding="utf-8") as _f:
+            _p = _json.load(_f)
+        if abs(float(_p["cell_size_m"]) - float(cell_size_m)) < 0.01:
+            _loaded_params = _p
+    except (FileNotFoundError, KeyError, ValueError):
+        pass
+
+    if _loaded_params is not None:
+        m_per_deg_lon = float(_loaded_params["m_per_deg_lon"])
+        min_x = float(_loaded_params["min_x"])
+        max_x = float(_loaded_params["max_x"])
+        min_y = float(_loaded_params["min_y"])
+        max_y = float(_loaded_params["max_y"])
+    else:
+        mean_lat_rad = math.radians(float(np.mean(lats[finite_mask])))
+        m_per_deg_lon = M_LAT * math.cos(mean_lat_rad)
+        _xs_all = lons[finite_mask] * m_per_deg_lon
+        _ys_all = lats[finite_mask] * M_LAT
+        min_x, max_x = float(_xs_all.min()), float(_xs_all.max())
+        min_y, max_y = float(_ys_all.min()), float(_ys_all.max())
+
+    xs = lons * m_per_deg_lon
+    ys = lats * M_LAT
+    finite_mask &= np.isfinite(xs) & np.isfinite(ys)
+    work = work.loc[finite_mask].copy().reset_index(drop=True)
+    xs = xs[finite_mask]
+    ys = ys[finite_mask]
     if work.empty:
         return None
 
-    min_x, min_y, max_x, max_y = work.total_bounds
+    cap_arr = work[capability_columns].to_numpy(dtype=float)
+    node_ids = work[_id_col].to_numpy() if _id_col else None
+
+    # ── Hex geometry parameters ───────────────────────────────────────────────
+    hex_radius_m = float(cell_size_m) / math.cos(math.pi / 6.0)
+    hex_width_m  = 2.0 * hex_radius_m
+    hex_height_m = math.sqrt(3.0) * hex_radius_m
+    x_step = 1.5 * hex_radius_m
+    y_step = hex_height_m
+
     if not np.isfinite([min_x, min_y, max_x, max_y]).all():
         return None
-    if min_x == max_x or min_y == max_y:
-        return None
 
-    # Interpret the configured size as the radius of the inscribed circle of
-    # each regular hexagon. Convert it to the circumradius used for geometry.
-    circle_radius_m = float(cell_size_m)
-    hex_radius_m = circle_radius_m / math.cos(math.pi / 6.0)
-    hex_width_m = 2.0 * hex_radius_m
-    hex_height_m = math.sqrt(3.0) * hex_radius_m
-    x_step_m = 1.5 * hex_radius_m
-    y_step_m = hex_height_m
-
-    all_cells: list[dict[str, object]] = []
+    # ── Build grid centroids (identical loop to _hex_grid_sample_nodes) ───────
+    # Store (cx, cy, col_idx, row_idx) so each cell gets a stable unique hex_id.
+    centroids: list[tuple[float, float, int, int]] = []
     col_idx = 0
-    x = min_x - hex_radius_m
-    while x <= max_x + hex_radius_m:
-        y_offset = 0.0 if col_idx % 2 == 0 else hex_height_m / 2.0
-        y = min_y - hex_height_m
+    cx = min_x - hex_radius_m
+    while cx <= max_x + hex_radius_m:
+        y_offset = 0.0 if col_idx % 2 == 0 else y_step / 2.0
+        cy = min_y - y_step + y_offset
         row_idx = 0
-        while y <= max_y + hex_height_m:
-            center_y = y + y_offset
-            all_cells.append(
-                {
-                    "ix": col_idx,
-                    "iy": row_idx,
-                    "geometry": _regular_hexagon(x, center_y, hex_radius_m),
-                }
-            )
-            if len(all_cells) > max_cells:
+        while cy <= max_y + y_step:
+            centroids.append((cx, cy, col_idx, row_idx))
+            if len(centroids) > max_cells:
                 raise ValueError(
-                    f"Grid would create more than {max_cells:,} hex cells. "
+                    f"Grid would exceed {max_cells:,} cells. "
                     "Increase qgis_grid_cell_size_m or clean coordinate outliers."
                 )
-            y += y_step_m
+            cy += y_step
             row_idx += 1
-        x += x_step_m
+        cx += x_step
         col_idx += 1
 
-    if not all_cells:
+    if not centroids:
         return None
 
-    grid_gdf = gpd.GeoDataFrame(all_cells, geometry="geometry", crs="EPSG:3857")
+    # ── KDTree: assign each display cell its nearest computed node ────────────
+    node_xy = np.column_stack([xs, ys])
+    tree = cKDTree(node_xy)
+    centroid_xy = np.array([(cx, cy) for cx, cy, _, _ in centroids], dtype=float)
+    dists, idxs = tree.query(centroid_xy)
 
-    points = work.copy().reset_index(drop=True)
-    points["point_id"] = np.arange(len(points), dtype=int)
-    joined = gpd.sjoin(
-        points[["point_id", "geometry"] + capability_columns],
-        grid_gdf[["ix", "iy", "geometry"]],
-        how="left",
-        predicate="within",
-    )
-    grouped_values = joined.groupby(["ix", "iy"], dropna=False)[capability_columns].mean().reset_index()
-    rename_map = {column: f"grid_mean_{column.replace('capability_', '')}" for column in capability_columns}
-    grouped_values = grouped_values.rename(columns=rename_map)
-    grid_gdf = grid_gdf.merge(grouped_values, on=["ix", "iy"], how="left")
+    # ── Build hex geometries in lon/lat by inverting the projection ───────────
+    # Each vertex (vx, vy) in approx-Cartesian maps back to
+    #   lon = vx / m_per_deg_lon,  lat = vy / M_LAT
+    # hex_id = "H{col:04d}_{row:04d}" — unique per cell, stable across rebuilds
+    # as long as grid_params.json (bbox + cell_size) does not change.
+    rename_map = {col: f"grid_mean_{col.replace('capability_', '')}" for col in capability_columns}
+    cells: list[dict[str, object]] = []
+    for (cx, cy, c_i, r_i), dist, node_idx in zip(centroids, dists, idxs):
+        if dist > hex_radius_m:
+            continue
+        hex_id = f"H{c_i:04d}_{r_i:04d}"
+        verts = []
+        for k in range(6):
+            # Flat-top hexagon (vertices at 0,60,...,300 deg) to match the
+            # flat-top centroid lattice (x_step=1.5R, columns offset by y_step/2).
+            # Drawing pointy-top here made cells wider than the column spacing and
+            # they overlapped.
+            angle = k * math.pi / 3.0
+            vx = cx + hex_radius_m * math.cos(angle)
+            vy = cy + hex_radius_m * math.sin(angle)
+            verts.append((vx / m_per_deg_lon, vy / M_LAT))
+        cell: dict[str, object] = {"hex_id": hex_id, "geometry": Polygon(verts)}
+        if node_ids is not None:
+            cell["node_id"] = str(node_ids[node_idx])
+        for j, col in enumerate(capability_columns):
+            v = cap_arr[node_idx, j]
+            cell[rename_map[col]] = float(v) if np.isfinite(v) else None
+        cells.append(cell)
+
+    if not cells:
+        return None
+
+    grid_gdf = gpd.GeoDataFrame(cells, geometry="geometry", crs="EPSG:4326")
     selected_col = f"grid_mean_{capability_field.replace('capability_', '')}"
-    if selected_col in grid_gdf.columns:
-        grid_gdf["grid_mean"] = grid_gdf[selected_col]
-    else:
-        grid_gdf["grid_mean"] = np.nan
-    grid_gdf["has_data"] = grid_gdf["grid_mean"].notna().astype(int)
-    grid_gdf["capability_field"] = capability_field
-    grid_gdf["cell_size_m"] = float(cell_size_m)
-    grid_gdf["hex_radius_m"] = float(hex_radius_m)
-    grid_gdf["hex_width_m"] = float(hex_width_m)
-    grid_gdf["hex_height_m"] = float(hex_height_m)
-    return grid_gdf.to_crs("EPSG:4326")
+    has_data_col = (
+        grid_gdf[selected_col]
+        if selected_col in grid_gdf.columns
+        else grid_gdf[list(rename_map.values())[0]]
+    )
+    grid_gdf["has_data"]      = has_data_col.notna().astype(int)
+    grid_gdf["cell_size_m"]   = float(cell_size_m)
+    grid_gdf["hex_radius_m"]  = float(hex_radius_m)
+    grid_gdf["hex_width_m"]   = float(hex_width_m)
+    grid_gdf["hex_height_m"]  = float(hex_height_m)
+    return grid_gdf
 
 
 def generate_shapefile_by_csv(

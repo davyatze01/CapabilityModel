@@ -10,17 +10,22 @@ def normalize_study_city(study_city: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", study_city.strip().lower()).strip("_")
 
 
+# ELECTRE TRI threshold factors — multiplied by std(service scores) at runtime.
+ELECTRE_Q_FACTOR: float = 0.25   # indifference threshold  q = std(x) * Q_FACTOR
+ELECTRE_P_FACTOR: float = 0.75   # preference threshold    p = std(x) * P_FACTOR
+
 CITY_PRESETS: dict[str, dict[str, object]] = {
     "cagliari": {
         "city_name": "Cagliari, Sardinia, Italy",
-        "use_shapefile": True,
+        "use_shapefile": False,
         "name_shapefile": "Cagliari Shapefile.shp",
-        "poi_from_shp": True,
+        "poi_from_shp": False,
         "poi_shapefile_paths": [
             "pois_shp/poi_points.shp",
             "pois_shp/poi_lines.shp",
             "pois_shp/poi_polygons.shp",
         ],
+        "bus_ticket_price": 1.3,
     },
     "paris": {
         "city_name": "Paris, France",
@@ -32,6 +37,7 @@ CITY_PRESETS: dict[str, dict[str, object]] = {
             "Paris/POI_line.shp",
             "Paris/POI_polygon.shp",
         ],
+        "bus_ticket_price": 2.05,
     },
 }
 
@@ -47,6 +53,8 @@ def apply_study_city(cfg: "PipelineConfig", study_city: str) -> None:
     cfg.name_shapefile = str(preset["name_shapefile"])
     cfg.poi_from_shp = bool(preset["poi_from_shp"])
     cfg.poi_shapefile_paths = list(preset["poi_shapefile_paths"])
+    if "bus_ticket_price" in preset:
+        cfg.bus_ticket_price = float(preset["bus_ticket_price"])  # type: ignore[arg-type]
 
 
 def derive_city_slug(city_name: str) -> str:
@@ -103,8 +111,8 @@ class PipelineConfig:
             "Paris/POI_polygon.shp",
         ]
     )
-    worker_count: int | None = 12
-    skip_routing: bool = False
+    worker_count: int | None = None
+    skip_routing: bool = True
     accessibility_chunksize: int = 100
     accessibility_deduplicate_entries: bool = True
     artifacts_root_dir: str = "artifacts"
@@ -116,6 +124,7 @@ class PipelineConfig:
     accessibility_meta_path: str = ""
     accessibility_node_to_row_path: str = ""
     accessibility_poi_to_col_path: str = ""
+    accessibility_poi_by_node_path: str = ""
     accessibility_matrix_schema_version: int = 1
 
     # Service matrix cache
@@ -126,17 +135,36 @@ class PipelineConfig:
     service_to_col_path: str = ""
     service_matrix_schema_version: int = 1
 
+    # POI exports
+    poi_export_dir: str = ""
+    poi_export_shapefile_path: str = ""
+    poi_export_geopackage_path: str = ""
+    hexagon_service_pois_path: str = ""
+
     debug_max_nodes: int | None = None
     debug_max_pois: int | None = None
     seed: int = 42
     enable_progress: bool = True
 
     non_bus_cache_dir: str = ""
-    non_bus_cache_schema_version: int = 6
+    non_bus_cache_schema_version: int = 8
     poi_snap_cache_dir: str = ""
 
+    # POI radius filtering — applies to bus and non-bus routing
+    poi_radius_enabled: bool = True
+    poi_radius_decay_threshold: float = 0.5    # used when poi_radius_m is None
+    poi_radius_max_speed_kmh: float = 20.0     # used when poi_radius_m is None
+    poi_radius_m: float | None = None          # if set, use this fixed radius and skip the decay computation
+
+    # Network-distance cutoff for non-bus Dijkstra = poi_radius * factor. A factor > typical urban
+    # street-network detour ratio guarantees no in-radius POI is dropped (bit-exact vs full Dijkstra)
+    # while pruning exploration far beyond the radius.
+    non_bus_dijkstra_detour_factor: float = 1.6
+
+    origin_hex_enabled: bool = True
+
     bus_departure_dt: dt.datetime = dt.datetime(2025, 10, 15, 12, 0, 0)
-    bus_gamma: float = 1.0
+    time_indifference_bus: float = 60.0
     routing_data_dir: str = "gtfs"
     osm_pbf_autobuild: bool = True
     osm_autobuild_network_type: str = "all"
@@ -156,7 +184,29 @@ class PipelineConfig:
     bus_impedance_meta_path: str = ""
     pool_max_retries: int = 4
     pool_retry_delay_s: float = 2.0
-    non_bus_max_workers: int = 16
+    non_bus_max_workers: int = 24
+    # Route non-bus Dijkstra on a topology-simplified copy of each mode graph.
+    # Origins/POIs are still enumerated and snapped on the full graph; only the
+    # shortest-path graph is simplified, which preserves network distances while
+    # cutting node count (and per-worker RAM) ~5x. Disable to route on full graphs.
+    route_on_simplified_graph: bool = True
+    # Estimated resident RAM per worker (mostly the mode graphs it loads). Used to
+    # derive a memory-safe worker count in context.build_context. Tune per dataset.
+    # Simplified routing graphs are far smaller, so this can be low when the flag
+    # above is on; raise it if you route on full graphs (Cagliari full ~= 3 GB).
+    mem_per_worker_gb: float = 1.2
+    worker_mem_reserve_gb: float = 10.0
+    bus_ticket_price : float = 1.3
+    metro_ticket_price : float = 2.55
+    train_ticket_price : float = 2.55
+    vot : float = 0.2
+    cost_per_liter : float = 1.8
+    distance_for_liter : float = 15.0
+
+    speed_walk_kmh: float = 5.0
+    speed_bike_kmh: float = 15.0
+    speed_drive_kmh: float = 30.0
+    drive_access_time_min: float = 10.0
 
     walkability_cache_dir : str = ""
 
@@ -187,8 +237,14 @@ class PipelineConfig:
         self.accessibility_meta_path = os.path.join(city_artifacts, "accessibility", "accessibility_meta.json")
         self.accessibility_node_to_row_path = os.path.join(city_artifacts, "accessibility", "access_node_to_row.json")
         self.accessibility_poi_to_col_path = os.path.join(city_artifacts, "accessibility", "access_poi_to_col.json")
+        self.accessibility_poi_by_node_path = os.path.join(city_artifacts, "accessibility", "access_poi_by_node.json")
 
         self.service_matrix_path = os.path.join(city_artifacts, "service", "service_matrix.dat")
         self.service_meta_path = os.path.join(city_artifacts, "service", "service_meta.json")
         self.service_node_to_row_path = os.path.join(city_artifacts, "service", "service_node_to_row.json")
         self.service_to_col_path = os.path.join(city_artifacts, "service", "service_to_col.json")
+
+        self.poi_export_dir = os.path.join("outputs", "poi_exports", self.artifact_slug)
+        self.poi_export_geopackage_path = os.path.join(self.poi_export_dir, "pois_used.gpkg")
+        self.poi_export_shapefile_path = self.poi_export_geopackage_path
+        self.hexagon_service_pois_path = os.path.join(self.poi_export_dir, "hexagon_service_pois.json")

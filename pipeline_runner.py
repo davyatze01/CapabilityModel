@@ -8,12 +8,13 @@ from pathlib import Path
 from config import PipelineConfig
 from context import build_context
 from snapping_stage import run_snapping_stage
-from bus_routing_stage import run_bus_routing_stage
+from public_transport_routing_stage import run_public_transport_routing_stage
 from non_bus_routing_stage import run_non_bus_routing_stage
 from accessibility_stage import run_accessibility_stage
 from service_stage import run_service_stage
 from capability_stage import run_capability_stage
 from artifact_bundle import load_impedance_bundle, write_impedance_bundle
+from poi_exports import generate_poi_exports
 from plot_shapefile import plot_all_experiments
 from generate_experiment_shapefiles import (
     generate_combined_experiment_gpkg,
@@ -119,15 +120,15 @@ def _build_qgis_project(cfg: PipelineConfig, gpkg_path: Path, qgis_exe: str) -> 
         # Still return the path if it exists
         return output_path if output_path.exists() else None
 
-    gpkg_literal = repr(str(gpkg_path))
+    gpkg_literal = repr(str(gpkg_path.resolve()))
     grid_sidecar_path = gpkg_path.with_name(f"{gpkg_path.stem}_grid{gpkg_path.suffix}")
-    grid_sidecar_literal = repr(str(grid_sidecar_path))
-    output_literal = repr(str(output_path))
+    grid_sidecar_literal = repr(str(grid_sidecar_path.resolve()))
+    output_literal = repr(str(output_path.resolve()))
     field_literal = repr(str(cfg.qgis_autostyle_field))
     grid_field_literal = repr(str(cfg.qgis_autostyle_field))
     ramp_literal = repr(str(cfg.qgis_autostyle_ramp))
     basemap_flag = "True" if cfg.qgis_autostyle_basemap else "False"
-    classes_count = int(cfg.qgis_autostyle_classes)
+
 
     script = f"""
 from qgis.core import (
@@ -182,16 +183,23 @@ if not layer_extent.isEmpty():
 available_fields = [field.name() for field in layer.fields()]
 preferred_fields = [{field_literal}, "capability_care", "capability_restorativeness", "capability_nutrition", "value"]
 field_name = next((name for name in preferred_fields if name in available_fields), None)
-if field_name:
-    renderer = QgsGraduatedSymbolRenderer()
-    renderer.setClassAttribute(field_name)
-    renderer.setMode(QgsGraduatedSymbolRenderer.EqualInterval)
-    renderer.updateClasses(layer, int({classes_count}))
 
+electre_bounds = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+electre_labels = ["Very Low (0.0–0.2)", "Low (0.2–0.4)", "Medium (0.4–0.6)", "High (0.6–0.8)", "Very High (0.8–1.0)"]
+n_cls = len(electre_labels)
+
+if field_name:
     ramp = QgsStyle.defaultStyle().colorRamp({ramp_literal})
     if ramp is None:
         ramp = QgsGradientColorRamp(QColor("#440154"), QColor("#FDE725"))
-    renderer.updateColorRamp(ramp)
+    ranges_pt = []
+    for i, lbl in enumerate(electre_labels):
+        sym = QgsSymbol.defaultSymbol(layer.geometryType())
+        if sym is None:
+            continue
+        sym.setColor(ramp.color(float(i) / max(1, n_cls - 1)))
+        ranges_pt.append(QgsRendererRange(electre_bounds[i], electre_bounds[i + 1], sym, lbl))
+    renderer = QgsGraduatedSymbolRenderer(field_name, ranges_pt)
     layer.setRenderer(renderer)
 
 grid_layer = QgsVectorLayer({gpkg_literal} + "|layername=capability_grid", "Capability grid", "ogr")
@@ -207,38 +215,29 @@ if grid_layer.isValid():
         "grid_mean_care",
         "grid_mean_restorativeness",
         "grid_mean_nutrition",
-        "grid_mean",
     ]
-    grid_field_name = next((name for name in preferred_grid_fields if name in grid_available_fields), "grid_mean")
+    grid_field_name = next((name for name in preferred_grid_fields if name in grid_available_fields), None)
+    if grid_field_name is None:
+        grid_field_name = next((f for f in grid_available_fields if f.startswith("grid_mean_")), None)
+    if grid_field_name is None:
+        grid_field_name = grid_available_fields[0] if grid_available_fields else "grid_mean"
     grid_ramp = QgsStyle.defaultStyle().colorRamp({ramp_literal})
     if grid_ramp is None:
         grid_ramp = QgsGradientColorRamp(QColor("#440154"), QColor("#FDE725"))
-    grid_renderer = QgsGraduatedSymbolRenderer()
-    grid_renderer.setClassAttribute(grid_field_name)
-
-    # Keep grid classification aligned with the point-layer value scale.
-    ranges = []
-    if field_name:
-        idx = layer.fields().indexFromName(field_name)
-        vmin = layer.minimumValue(idx)
-        vmax = layer.maximumValue(idx)
-        if vmin is not None and vmax is not None and float(vmax) > float(vmin):
-            step = (float(vmax) - float(vmin)) / float(int({classes_count}))
-            for i in range(int({classes_count})):
-                lower = float(vmin) + i * step
-                upper = float(vmin) + (i + 1) * step if i < int({classes_count}) - 1 else float(vmax)
-                symbol = QgsSymbol.defaultSymbol(grid_layer.geometryType())
-                if symbol is None:
-                    continue
-                color = grid_ramp.color(float(i) / max(1, int({classes_count}) - 1))
-                symbol.setColor(color)
-                ranges.append(QgsRendererRange(lower, upper, symbol, f"{{lower:.4f}} - {{upper:.4f}}"))
-
-    if ranges:
-        grid_renderer = QgsGraduatedSymbolRenderer(grid_field_name, ranges)
+    ranges_grid = []
+    for i, lbl in enumerate(electre_labels):
+        sym = QgsSymbol.defaultSymbol(grid_layer.geometryType())
+        if sym is None:
+            continue
+        sym.setColor(grid_ramp.color(float(i) / max(1, n_cls - 1)))
+        ranges_grid.append(QgsRendererRange(electre_bounds[i], electre_bounds[i + 1], sym, lbl))
+    if ranges_grid:
+        grid_renderer = QgsGraduatedSymbolRenderer(grid_field_name, ranges_grid)
     else:
+        grid_renderer = QgsGraduatedSymbolRenderer()
+        grid_renderer.setClassAttribute(grid_field_name)
         grid_renderer.setMode(QgsGraduatedSymbolRenderer.EqualInterval)
-        grid_renderer.updateClasses(grid_layer, int({classes_count}))
+        grid_renderer.updateClasses(grid_layer, n_cls)
         grid_renderer.updateColorRamp(grid_ramp)
 
     grid_layer.setRenderer(grid_renderer)
@@ -260,6 +259,19 @@ if grid_layer.isValid():
         grid_outline_layer.setRenderer(QgsSingleSymbolRenderer(outline_symbol))
         project.addMapLayer(grid_outline_layer)
 
+# Embed styles into the GeoPackage layer_styles table so the file is
+# self-describing: a colleague opening the .gpkg directly gets the same
+# graduated renderer without needing this project file.
+for styled_layer in [layer, grid_layer]:
+    if styled_layer.isValid():
+        styled_layer.saveStyleToDatabase(
+            "default", "", True, ""
+        )
+
+try:
+    project.setFilePathStorage(QgsProject.Relative)
+except Exception:
+    pass
 project.write({output_literal})
 app.exitQgis()
 """
@@ -346,8 +358,16 @@ def get_or_compute_impedances(ctx, cfg):
     print("[Stage] Snapping", flush=True)
     snap = run_snapping_stage(ctx)
 
+    print("[Stage] POI Export (pre-routing)", flush=True)
+    pre_route_poi_exports = generate_poi_exports(ctx, snap=snap)
+    print(
+        "[Output] Pre-routing POI geopackage: "
+        + ", ".join(str(path) for path in pre_route_poi_exports.values()),
+        flush=True,
+    )
+
     print("[Stage] Bus Routing", flush=True)
-    bus = run_bus_routing_stage(ctx, snap)
+    bus = run_public_transport_routing_stage(ctx, snap, transport_type="bus")
 
     print("[Stage] Non-Bus Routing", flush=True)
     non_bus = run_non_bus_routing_stage(ctx, snap)
@@ -371,6 +391,9 @@ def compute_capabilities_from_impedances(ctx, cfg, bus, non_bus):
     print("[Stage] Accessibility", flush=True)
     acc = run_accessibility_stage(ctx, non_bus, bus)
 
+    print("[Stage] POI Export (post-routing)", flush=True)
+    poi_exports = generate_poi_exports(ctx, non_bus=non_bus, acc=acc)
+
     print("[Stage] Service Aggregation", flush=True)
     svc = run_service_stage(ctx, acc)
 
@@ -380,6 +403,11 @@ def compute_capabilities_from_impedances(ctx, cfg, bus, non_bus):
     print(
         "[Output] Capability CSV files: "
         + ", ".join(str(path) for path in cap.output_paths.values()),
+        flush=True,
+    )
+    print(
+        "[Output] POI export files: "
+        + ", ".join(str(path) for path in poi_exports.values()),
         flush=True,
     )
 

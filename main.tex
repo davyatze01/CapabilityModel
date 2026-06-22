@@ -1,0 +1,711 @@
+\documentclass{article}
+\usepackage{graphicx} % Required for inserting images
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{lmodern}
+\usepackage{amsmath}
+\usepackage{comment}
+\usepackage{xcolor}
+\usepackage{float}
+
+\setlist[itemize]{leftmargin=1.5em}
+\setlist[enumerate]{leftmargin=1.5em}
+
+\newcommand{\mm}[1]{\textcolor{blue}{#1}}
+\title{Authority Document \\Urban Capability Model}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+
+\begin{enumerate}
+    \item What is the document?
+    \item What does the model do? (system overview)
+    \item What is the purpose of this document?
+    \item How is the document structured?
+\end{enumerate}
+
+\section{Object content}
+The object model is organised around a three-level domain hierarchy: \textbf{POI types} are aggregated into \textbf{services}, and services are aggregated into \textbf{capabilities}. The following section denotes the structure of each object in the system : what it represents and what different fields make up the state of that object. In the document, we distinguish objects from fields based on the style of the font. For example, this is an \emph{object} and this is a \texttt{field}.
+\subsection{Input objects}
+\subsubsection*{Boundary of extraction}
+    The \emph{boundary} defines the study area for capability calculation. It contains a \texttt{multipolygon\_geometry} and its \texttt{coordinate\_reference\_system} (e.g.: WGS84).The \texttt{multipolygon\_geometry} is dissolved into a single study-area geometry, which determines the area used for graph extraction and the set of origins considered by the analysis. In alternative, the user can specify a \texttt{city\_name} in the \emph{general configuration} that defines the study area and the boundary and graph extraction is automated based on OpenStreetMap data.
+\subsubsection*{POIs shapefile collection}
+    The \emph{POI input} is a collection of point, line, and polygon feature sets that
+    share one logical POI schema. Each POI record is expected to have:
+    \begin{itemize}
+        \item \texttt{poi\_id}, which uniquely identifies the \emph{POI} record.
+        \item \texttt{geometry}, the source geometry of the \emph{POI}.
+        \item \texttt{coordinate\_reference\_system}, the spatial reference system
+        of the source geometry.
+        \item the classification attribute identified by
+        \texttt{label\_field} in the \emph{general configuration}, whose value is
+        used to associate the record with one or more configured
+        \emph{POI types}.
+    \end{itemize}
+    Point geometries represent one candidate location. Line and polygon geometries represent spatially extended POIs and therefore admit multiple candidate access locations corresponding to their vertices and to the vertices of their boundaries.
+    In alternative, the POI data can be downloaded automatically from OpenStreetMap data based on the provided \texttt{city\_name} in the \emph{general configuration}.
+    
+\subsubsection*{General Transit Feed Specification (GTFS)}
+\emph{GTFS} is a general transit feed specification which defines a common data format for public transportation schedules and associated geographic information. Its principal entities and relations are:
+\begin{itemize}
+    \item \texttt{agency}: describes the public transport operators included in the \emph{GTFS} feed.
+    \item \texttt{stops}: describes the stops and stations where passengers can access the transport service.
+    \item \texttt{routes}: describes the public transport lines operated within the network.
+    \item \texttt{trips}: describes the individual journeys performed along each route.
+    \item \texttt{stop\_times}: describes the sequence and timing of stops for each trip.
+    \item \texttt{calendar}: describes when each transport service is active.
+    \item \texttt{shapes}: describes the geographic path followed by a trip.
+\end{itemize}
+The model supports multiple \emph{GTFS feeds}, which may describe different
+public-transport operators, networks, or transport modes.
+
+\subsection{Configuration objects}
+\subsubsection*{General configuration}
+The \emph{general configuration} identifies one analysis run and binds its internal parameters. Its fields are grouped as follows:
+\begin{itemize}
+    \item \emph{study-area identity}: 
+    \begin{itemize}
+        \item \texttt{city\_name}, the name of the city used to derive the study area when no boundary polygon is provided.
+        \item \texttt{boundary\_selection}, a Boolean flag. If \emph{True}, the study area is limited to the provided \emph{boundary} polygon; otherwise, the boundary is derived from OSM data using \texttt{city\_name}.
+        \item \texttt{boundary\_path}, the path of the \emph{boundary} polygon object, used when \texttt{boundary\_selection} is enabled.
+    \end{itemize}
+
+    \item \emph{POI source selection}:
+    \begin{itemize}
+        \item \texttt{poi\_selection}, a Boolean flag. When enabled, the POI
+        information is read from external files; otherwise, it is downloaded from
+        OpenStreetMap using \texttt{city\_name}.
+        \item \texttt{point\_poi\_path}, \texttt{line\_poi\_path}, and
+        \texttt{polygon\_poi\_path}, the paths to the point, line, and polygon POI
+        collections, used when \texttt{poi\_selection} is enabled.
+        \item \texttt{label\_field}, the name of the attribute in the input POI
+        collections whose values are used to associate records with configured
+        \emph{POI types}.
+    \end{itemize}
+
+    \item \emph{impedance parameters}:
+    \begin{itemize}
+        \item \texttt{driving\_access\_time}, the fixed access overhead, in minutes,
+        added to every driving connection. Its default value is \(10\).
+        \item \texttt{public\_transport\_cost}, the monetary cost assigned to a
+        public-transport journey.
+        \item \texttt{driving\_cost}, the monetary cost assigned to a driving
+        journey.
+        \item \texttt{cost\_to\_time\_coefficient}, the coefficient used to
+        convert a monetary travel cost into an equivalent impedance value in
+        minutes.
+    \end{itemize}
+
+
+    \item \emph{transport scope}: 
+    \begin{itemize}
+        \item \texttt{gtfs\_paths}, the ordered list of paths to the \emph{GTFS feeds}
+        used for public-transport routing.
+        \item \texttt{routing\_datetime}, the date and time used for public-transport
+        routing.
+        \item \texttt{in\_vehicle\_time\_coefficient}, the coefficient applied to the non-waiting component
+        of public-transport impedance.
+    \end{itemize}
+
+    \item \emph{capability aggregation}:
+    \begin{itemize}
+    \item \texttt{electre\_q\_factor}, the global factor used to derive the
+    ELECTRE TRI indifference threshold from the standard deviation of the
+    service-score vector of the current origin node and \emph{capability}.
+    Its value is \(0.25\).
+    \item \texttt{electre\_p\_factor}, the global factor used to derive the
+    ELECTRE TRI preference threshold from the standard deviation of the
+    service-score vector of the current origin node and \emph{capability}.
+    Its value is \(0.75\).
+    \end{itemize}
+
+    \item \emph{visualisation specification}: 
+    \begin{itemize}
+        \item \texttt{default\_capability}, the selected \emph{capability} field used for the default visualization.
+        \item \texttt{colour\_ramp}, the colour ramp used for the visualization.
+        \item \texttt{hexagon\_radius}, the inradius of each regular \emph{hexagon},
+        that is, the distance from its centroid to the midpoint of one of its sides.
+        \begin{figure}[H]
+            \centering
+            \includegraphics[width=0.3\linewidth]{hex.png}
+        \end{figure}
+    \end{itemize}
+
+    \item \emph{radius filtering}:
+    \begin{itemize}
+        \item \texttt{poi\_radius\_enabled}, a Boolean flag. When enabled, the
+        model pre-filters candidate POI access locations to those that lie
+        within the \emph{global extraction radius} of at least one origin node,
+        reducing the routing problem before any impedance computation is performed.
+        \item \texttt{poi\_radius\_decay\_threshold}, the minimum meaningful decay
+        value used to derive the \emph{global extraction radius} from the configured
+        decay coefficients when no fixed radius is provided.
+        \item \texttt{poi\_radius\_max\_speed\_kmh}, the reference travel speed, in
+        kilometres per hour, used to convert the threshold travel time to a distance
+        when deriving the \emph{global extraction radius}.
+        \item \texttt{poi\_radius\_m}, an optional fixed \emph{global extraction
+        radius} in metres. When set, the model uses this value directly and skips
+        the decay-based derivation.
+    \end{itemize}
+
+
+\end{itemize}
+
+\subsubsection*{POI types configuration}
+Each \emph{POI type configuration} record defines one conceptual class of destination. Its fields are:
+\begin{itemize}
+    \item \texttt{poi\_type}, the unique \emph{POI type} identifier.
+    \item \texttt{decay\_coefficient}, the impedance value, in minutes, at which access to the \emph{POI type} has a decay value of \(0.5\).
+    \item \texttt{choquet\_interactions}, the ordered interaction coefficients between this \emph{POI type} and the other \emph{POI types} belonging to the same \emph{service}; the self-interaction position is null. The interaction-vector order is defined by the ordered \emph{POI type} list of the associated \emph{service}.
+    \item \texttt{tags}, the OSM tags required to retrieve that \emph{POI type}. This field is used only when \texttt{poi\_selection} is disabled and POIs are downloaded from OSM.
+    \item \texttt{labels}, a list of strings corresponding to accepted values of the attribute identified by \texttt{label\_field} in the \emph{general configuration}. Records matching any of these values are associated with the configured \emph{POI type}. This makes it possible to define a \emph{POI type} as an aggregation of multiple source categories.
+\end{itemize}
+
+\subsubsection*{Service configuration}
+Each service configuration record defines an ordered aggregation of POI types. Its fields are:
+    \begin{itemize}
+        \item \texttt{service}, unique service identifier.
+        \item \texttt{poi\_types}, the ordered list of \emph{POI type} identifiers that contribute to that \emph{service}.
+        \item \texttt{choquet\_capacity}, a list of ordered capacity values, each referring to one of the POI types that make up the aggregation.
+        \item \texttt{contribution\_coefficient}, a list of ordered coefficients indicating, for each POI type, the number of accessible POIs required for the accessibility value to reach 0.9.
+    \end{itemize}
+The three ordered lists have equal cardinality. A \emph{service configuration} record is valid only when every referenced \emph{POI type} exists in the \emph{POI type configuration}.
+\subsubsection*{Capability configuration}
+    Each capability configuration record defines an ordered aggregation of
+    services. Its fields are:
+    \begin{itemize}
+        \item \texttt{capability}, unique capability identifier.
+        \item \texttt{services}, ordered list of services that contribute to that capability.
+        \item \texttt{electre\_weight}, ordered service-weight vector aligned
+        with the service list.
+        \item \texttt{enabled}, Boolean indicating whether the capability is
+        included in the result set.
+    \end{itemize}
+    The configured capability set comprises restorativeness, nutrition, and
+    care. Every referenced service must exist in the service configuration.
+
+
+
+\subsection{Intermediate objects}
+\subsubsection*{Impedance matrix}
+    The impedance object relates origin transport-network nodes to candidate POI
+    access locations. Its origin dimension carries the origin node identifier and
+    coordinates; its destination dimension carries a destination access identifier,
+    the snapped access coordinates, and the associated POI type. For each
+    origin--destination pair the object may hold walking, cycling, driving, and
+    public-transport impedance values, each expressed in minutes or marked as an
+    explicit unreachable value. The walking, cycling, and driving values are
+    aligned vectors, so that the same position in every modal vector refers to the
+    same candidate access location, and the walking value is paired with the
+    walkability score of the chosen walking path. The public-transport impedance is
+    held as an origin-by-destination matrix together with origin and destination
+    index mappings. The object also records the departure instant and stable
+    signatures of the ordered origin and destination sets, so that the routing
+    problem it represents is unambiguous and reusable across runs.
+
+\subsubsection*{Global extraction radius}
+    The \emph{global extraction radius} $r_{\text{global}}$ is a scalar distance
+    in metres used to pre-filter candidate POI access locations before any routing
+    computation is performed. When \texttt{poi\_radius\_m} is set, $r_{\text{global}}$
+    takes that fixed value directly. Otherwise it is derived from the configured
+    \emph{POI type} decay coefficients: the model selects the largest
+    \texttt{decay\_coefficient} across all configured \emph{POI types}, computes
+    the travel time at which the corresponding decay function falls to
+    \texttt{poi\_radius\_decay\_threshold}, and converts that time to a distance
+    using \texttt{poi\_radius\_max\_speed\_kmh}.
+
+\subsubsection*{Bus routing result}
+    A bus routing result represents the selected public-transport connection
+    between one origin node and one destination access location for a given
+    departure instant. Each connection record carries the origin identifier, the
+    destination identifier, the departure time, and a decomposition of the journey
+    into access time, waiting time, in-vehicle time, transfer time, and egress
+    time, together with the ordered sequence of public-transport lines used, the
+    number of rides, and the total journey time. From each connection the object derives an impedance record holding the non-waiting journey time, computed as the total journey time net of waiting, the waiting time, the resulting weighted impedance, and the same line sequence. The weighted impedance combines the waiting time, the non-waiting journey time scaled by a coefficient that expresses its relative perceived burden, and a monetary fare term converted into an equivalent time cost.  Connections that are unavailable, or that resolve to a walk-only path,
+    yield no impedance and are treated as unreachable. The result set is stored as
+    an origin-by-destination structure with origin and destination index mappings,
+    and carries the departure instant and the ordered origin and destination
+    signatures.
+
+\subsubsection*{Walking, cycling, and driving routing results}
+    A non-public-transport routing result is defined for one origin node and one
+    POI type. It contains the origin coordinates, an ordered list of the POI access coordinates selected for that origin, together with their source POI identities, and three equally
+    aligned impedance vectors for walking, cycling, and driving, each value
+    expressed in minutes. An entry is null when the corresponding candidate is
+    unreachable by that mode. The object additionally carries the path-level
+    walkability score aligned with each walking impedance. Results are grouped by
+    service while retaining the POI type identifier of every entry, so that the
+    same physical candidate may appear under more than one service.
+
+\subsubsection*{Walkability scores for edges}
+    The edge walkability object is a relation from a directed network-edge
+    identifier to a walkability score on a scale from one to five. It is qualified
+    by a graph identity that records the network snapshot to which the scores
+    apply, so that scores are only reused while that snapshot is unchanged. The
+    walkability of a path is obtained as a length-weighted aggregation of the
+    scores of the edges that compose it. Each edge score is conceptually grounded
+    in observations taken at the start, the midpoint, and the end of the edge.
+
+\subsubsection*{Accessibility results}
+    An accessibility result is defined for one origin node. Its fields are the node
+    identifier, latitude, longitude, and a mapping from each service to an ordered
+    collection of POI-type accessibility records, where each record contains a POI
+    type identifier and an accessibility value in $[0,1]$. For each candidate POI
+    access location, the four modal impedance values are transformed into modal
+    decay values through a decay function parameterised per POI type, so that the
+    POI type's configured reference impedance corresponds to a decay of $0.5$. The
+    modal decays of a candidate are combined into a single multimodal
+    route-resource-availability value, and the ordered collection of candidate
+    values for a POI type is then reduced to the POI-type accessibility value. The
+    result preserves service membership without yet aggregating the POI types into
+    a service score.
+
+\subsubsection*{Service results}
+    A service result is defined for one origin node. Its fields are the node
+    identifier, latitude, longitude, and a mapping from every configured service
+    identifier to one normalised service score in $[0,1]$. Each score aggregates
+    the accessibility values of the ordered POI types declared by that service,
+    weighting each POI type by its singleton capacity and accounting for the
+    pairwise interactions between the POI types of the service.
+
+
+\subsection{Output objects}
+The model produces two main output objects: the \emph{capability results} and the \emph{visualization map}. The \emph{capability results} store the computed capability ratings and the intermediate service ratings in a tabular file, where each record corresponds to a point. The \emph{visualization map} associates each record with its relevant point geometry and generates a hexagonal grid to support map-based visualization. These outputs are then explored through the \emph{provenance interface}, which enriches the \emph{visualization map} with custom interactive behaviour and allows users to inspect the provenance of each capability or service rating, including the POIs used in the analysis and their respective contributions.
+\subsubsection*{Capability results}
+The capability results are stored in a single CSV file. Each row corresponds to a \emph{node} in the road graph and is defined by:
+\begin{itemize}
+    \item \texttt{node\_id}, which uniquely identifies the \emph{node}.
+    \item \texttt{lat} and \texttt{lon}, the geographic coordinates of the \emph{node}.
+    \item one \texttt{capability\_\textnormal{\emph{name}}} field for each computed \emph{capability}, storing the rating of the represented \emph{node}.
+    \item one \texttt{service\_\textnormal{\emph{name}}} field for each \emph{service} contributing to any \emph{capability}, storing the individual \emph{service} rating for the \emph{node}.
+\end{itemize}
+The \texttt{node\_id} links each record to the corresponding service-level ratings in the \emph{capability results} and to its POI-level information in the associated provenance data structures.
+\subsubsection*{\mm{Visualization map}}
+\mm{The \emph{visualization map} is made of \emph{coloured hexagons} and their associated \emph{representative points}.}
+\mm{Each \emph{representative point} is defined by:}
+\mm{
+    \begin{itemize}
+        \item \texttt{node\_id}, which uniquely identifies the \emph{node} represented by the point.
+        \item \texttt{node\_coordinates}, the geographic coordinates of the represented \emph{node}, expressed in angular form.
+        \item \texttt{node\_address}, the address of the represented \emph{node}, expressed in terms of street, neighbourhood, and CAP.
+        \item one \texttt{capability\_\textnormal{\emph{name}}} field for each computed \emph{capability}, storing the rating of the represented \emph{node}.
+    \end{itemize}
+}
+\mm{
+Each \emph{coloured hexagon} is defined by
+\begin{itemize}
+    \item \texttt{size}, which is determined by the \texttt{hexagon\_radius} in the \emph{general configuration}
+    \item \texttt{centroid}, the geometric center of the \emph{hexagon}
+    \item \texttt{representative\_point}, the \emph{node} in the road graph closest to the hexagon's \texttt{centroid}, used to represent all points that fall within that \emph{hexagon}.
+    \item \texttt{colour}, which is determined by the rating associated with the \texttt{representative\_point}.
+\end{itemize}}
+\mm{The only points shown in the map are the \emph{representative points} associated with each \emph{hexagon}.}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\linewidth]{capability_viz.png}
+    \caption{An example of a visualization map}
+    \label{fig:vizmap}
+\end{figure}
+
+\subsubsection*{\mm{Provenance interface}}
+\mm{
+The \emph{provenance interface} allows interactive exploration of the \emph{visualization map}. Its behaviour is controlled by the following interface state fields:
+\begin{itemize}
+    \item \texttt{current\_mode}, which indicates whether the interface is in capability overview mode, hexagon detail mode, or \emph{service detail mode}.
+    \item \texttt{mode\_description}, a textual description of the current mode, explaining what is shown and how the current visualization should be interpreted.
+    \item \texttt{current\_capability}, the selected \emph{capability} whose ratings are shown in the \emph{visualization map}.
+    \item \texttt{scale}, the conversion between real distance and distance in the visualization.
+    \item \texttt{zoom\_level}, the current zoom level of the visualization.
+    \item \texttt{heatmap\_legend}, based on the interval division of the capability ratings.
+    \item \texttt{available\_services}, the \emph{services} that are connected to the \texttt{current\_capability} and are represented as selectable interface controls.
+    \item \texttt{current\_service}, the selected \emph{service} whose ratings and POI contributions are shown when the interface is in \emph{service detail mode}.
+    \item \texttt{hovered\_service}, the \emph{service} currently hovered by the user in \emph{hexagon detail mode} or \emph{service detail mode}. When this field is not null, the interface highlights the POIs that contribute to the hovered \emph{service}.
+    \item \texttt{show\_colours}, whether or not the current colour visualization is active.
+\end{itemize}
+}
+\mm{
+When the interface is in \emph{hexagon detail mode} or \emph{service detail mode}, it also shows POI information related to the selected \emph{hexagon} and \emph{capability}. In \emph{service detail mode}, this information is filtered according to the selected \emph{service}. Each \emph{POI} is defined by:
+\begin{itemize}
+    \item \texttt{poi\_id}, the unique identifier used to refer to the \emph{POI}.
+    \item \texttt{poi\_coordinates}, the geographic coordinates of the \emph{POI}, expressed in angular form.
+    \item \texttt{poi\_address}, the address of the \emph{POI}, expressed in terms of street, neighbourhood, and CAP.
+    \item \texttt{type\_services}, the key-value pairs describing the conceptual POI types and services to which the \emph{POI} contributes. Each \emph{POI} can be associated with multiple conceptual POI types, which may contribute to different \emph{services}.
+    \item \texttt{service\_power}, for each \emph{service} the \emph{POI} contributes to, the service power is computed as the accessibility value of the \emph{POI} multiplied by the capacity of the corresponding conceptual POI type.
+    \item \texttt{capability\_power}, for each \emph{capability} to which the
+    \emph{POI} contributes, an explanatory value derived from the POI's
+    contributions to the relevant \emph{services} and from the service weights
+    used in the ELECTRE TRI aggregation.
+   \item \texttt{is\_selected}, which indicates whether the \emph{POI} contributes to the \texttt{current\_service} when the interface is in \emph{service detail mode}, or to the \texttt{hovered\_service} when a service is hovered in \emph{hexagon detail mode}. If selected, the point is highlighted with a colour; otherwise, it is shown with transparency.
+    \item \texttt{point\_size}, the size assigned to the visual representation of the \emph{POI}. In \emph{hexagon detail mode}, it is based on \texttt{capability\_power}; in service detail mode, it is based on \texttt{service\_power}. A larger point represents a higher power value.
+    \item \texttt{point\_colour}, which is assigned to the \emph{POI} when \texttt{show\_colours} is active. In \emph{service detail mode}, the colour is assigned according to the selected \emph{service}. In \emph{hexagon detail mode}, where no single service is selected, the colour represents the main service contribution of the \emph{POI}.
+\end{itemize}
+}
+
+
+\section{Dynamics}
+\subsection{Input processing}
+When a \emph{boundary} is provided, the model validates it, normalises it to the spatial reference system used by the analysis, and derives a single study-area geometry from it. This geometry defines the spatial extent for graph extraction and for all subsequent origin-destination computations. When no explicit \emph{boundary} is provided, the model derives the study area from the configured \texttt{city\_name}. The model loads the available public-transport feeds and identifies the services that are active for the configured routing date and time. When multiple feeds are provided, they are considered together so that public-transport impedance can account for the available transport modes.
+
+\subsection{Network preparation}
+A separate routable network is prepared for each travel mode considered by the model. Each network is spatially limited to the selected study area and preserves the nodes and edges needed to compute origin--destination impedance. The resulting mode-specific networks provide the routing substrate for the subsequent impedance calculation. The walking network defines the origin layer for capability computation. When a hexagonal-grid sampling resolution is specified, the model reduces the full origin set by assigning nodes to regular hexagonal cells and retaining one representative node for each occupied cell. The representative node is the node closest to the cell centroid, producing a spatially uniform origin sample whose density is controlled by the configured \texttt{hexagon\_radius}.
+
+\subsection{POI preparation}
+When POIs are provided through external files, the model loads the available point, line, and polygon records and associates each record with one or more configured \emph{POI types} using the record label. Records that cannot be associated with any configured \emph{POI type} are excluded from the analysis. When POIs are downloaded from OpenStreetMap, the model retrieves the POIs required by the configured \emph{POI types} within the study area and assigns them to the corresponding conceptual classes.
+\subsection{POI snapping}
+Each POI geometry is converted into one or more candidate access locations. Point geometries define a single access location, while line and polygon geometries define multiple possible access locations along their spatial extent. Each candidate access location is associated with the nearest node of the relevant travel-mode network. The resulting snapped nodes represent the network entry points used during routing. When a \emph{POI} has multiple candidate access locations, the model selects one candidate separately for each source node. The selected candidate is the one with the smallest Haversine distance from the source. This allows a spatially extended \emph{POI} to be represented by different access locations depending on the source from which it is evaluated.
+\subsection{Extraction radius}
+When \texttt{poi\_radius\_enabled} is set, the model derives a single
+\emph{global extraction radius} $r_{\text{global}}$ before any routing is
+performed. The radius is computed from the \emph{POI type} with the largest
+configured \texttt{decay\_coefficient}, which gives the most permissive bound
+and conservatively covers every type. Given that decay coefficient $c$ and the
+configured \texttt{poi\_radius\_decay\_threshold} $\tau$, the maximum travel
+time $t_{\max}$ beyond which decay falls below $\tau$ is
+
+\begin{equation}
+    t_{\max} = \frac{-\ln \tau}{\beta}, \qquad \beta = \frac{\ln 2}{c}
+\end{equation}
+
+\noindent and the corresponding straight-line distance is
+
+\begin{equation}
+    r_{\text{global}} = t_{\max} \cdot \frac{v_{\max}}{60} \cdot 1000
+\end{equation}
+
+\noindent where $v_{\max}$ is \texttt{poi\_radius\_max\_speed\_kmh}.
+When \texttt{poi\_radius\_m} is provided, the derivation is skipped and
+$r_{\text{global}}$ takes that fixed value.
+When \texttt{poi\_radius\_enabled} is enabled, the \emph{global extraction
+radius} is used to pre-filter candidate POI access locations during
+\emph{POI snapping}, \emph{public-transport routing}, and
+\emph{walking, cycling and driving routing}. When radius filtering is
+disabled, no distance-based pre-filter is applied.
+\subsection{Routing}
+
+\subsubsection*{Public-transport routing}
+When \texttt{poi\_radius\_enabled} is enabled, the full destination set is
+reduced before routing to the access locations that fall within the
+\emph{global extraction radius} of at least one origin node. When radius
+filtering is disabled, the full set of candidate access locations is retained. The model then resolves the best available public-transport connection departing at the configured date
+and time. The routing result is a dense set of connection records, each
+describing the time breakdown of one origin-destination trip. The result is
+cached and reused in subsequent runs unless the origin set, the destination
+set, or the departure time has changed.
+
+\subsubsection*{Walking, cycling and driving routing}
+For each origin node, the model determines independently for each travel mode
+the shortest path to the candidate access location selected for each
+\emph{POI} with respect to the current origin node. When
+\texttt{poi\_radius\_enabled} is enabled, only candidates whose straight-line
+distance from the origin does not exceed the \emph{global extraction radius}
+are considered. When radius filtering is disabled, all relevant candidate
+access locations are considered. Each mode uses a dedicated routable network so that modal constraints such as permitted roads and design speeds are respected. Access locations that are not
+reachable from the origin in a given modal network receive no routing result
+for that mode. Results are stored per origin node and reused in subsequent
+runs.
+
+\subsection{Impedance}
+The model derives a scalar impedance value from each routing result, expressing
+the cost of reaching a destination as a single quantity in minutes that is
+comparable across modes and usable in the decay function. The impedance of a
+modal connection is structured around three additive components: a quality
+factor, a time factor, and an economic cost.
+
+The \textbf{quality factor} is defined only for the walking mode. For a path
+whose walkability score is \(w \in [1,5]\), the quality factor is a
+multiplicative coefficient
+\begin{equation}
+    \varphi(w) = 1 + \lambda\,\frac{5 - w}{4},
+    \qquad \lambda = 0.15,
+\end{equation}
+so that the walking impedance is \(Z_{\text{walk}} = \varphi(w)\cdot
+t_{\text{walk}}\), where \(t_{\text{walk}}\) is the shortest-path travel time
+on the walking network. The coefficient equals \(1\) when walkability is
+maximal (\(w = 5\)), applying no overhead, and \(1 + \lambda = 1.15\) when
+walkability is minimal (\(w = 1\)), adding a \(15\%\) overhead. When the
+walkability score is unavailable for a path, \(\varphi\) defaults to \(1\).
+
+The \textbf{time factor} decomposes into an access time and an effective time.
+The access time accounts for the overhead incurred before the main travel
+segment begins: for public-transport connections it equals the waiting time at
+the stop; for driving it is defined by \texttt{driving\_access\_time} to account for vehicle access
+overhead; for cycling and walking no access time applies. The effective time
+represents the duration of the main travel segment. For public-transport connections, the non-waiting journey time is multiplied by the configurable coefficient \(\gamma\)
+(\texttt{in\_vehicle\_time\_coefficient}), which expresses the
+additional perceived burden of passive travel relative to active travel. For all
+other modes the effective time equals the shortest-path travel time on the
+corresponding modal network.
+
+The \textbf{economic cost} converts the monetary expense of a trip into an
+equivalent time value. For walking and cycling the economic cost is zero. For
+driving and public transport it corresponds to the ticket fare expressed as a
+time equivalent.
+
+Connections for which no transit service exists, or for which only a walk-only
+path was found, receive no impedance and do not contribute to accessibility.
+Access locations that are disconnected from the origin in a given modal graph
+also receive no impedance for that mode.
+
+\subsection{Decay}
+The model converts each impedance value into a decay value through an
+exponential function. For a \emph{POI type} with decay coefficient \(c\), the
+decay rate is \(\beta = \ln 2 / c\), so that the decay reaches \(0.5\) at the
+configured reference impedance. Given an impedance \(z\), the corresponding
+decay is
+\begin{equation}
+    d(z) = e^{-\beta z}.
+\end{equation}
+
+When a routing result is unavailable, the corresponding decay is treated as
+zero. Modal decay values are then combined into a single route-resource-
+availability value, so that a destination is not penalised simply because one
+mode is weak if another realistic mode provides access. The decay stage
+therefore turns raw travel cost into a bounded accessibility signal that can be
+used consistently across all later aggregation steps.
+
+\subsection{Accessibility}
+Accessibility is computed for each origin node and each configured
+\emph{POI type}. The model considers the access location selected for each \emph{POI}
+associated with that \emph{POI type} and the current origin node, retrieves the corresponding impedance values for walking, cycling, driving, and public transport, and converts those impedances
+into modal decays with the \emph{decay} function. The modal decays of one
+candidate access location are merged into a single value, and the candidate
+values are then reduced to one accessibility value in the interval \([0,1]\).
+The reduction is controlled by the \texttt{contribution\_coefficient}
+associated with the \emph{POI type}. A larger coefficient means that more accessible POIs are required for the accessibility value to approach saturation, causing the score to grow more
+gradually. Conversely, a smaller coefficient causes the accessibility value
+to approach saturation with fewer accessible POIs. The resulting accessibility value therefore reflects both the
+quality of the routes and the multiplicity of accessible destinations.
+
+\subsection{Service aggregation}
+The accessibility values of the \emph{POI types} belonging to the same
+\emph{service} are aggregated with a Choquet integral. The input vector is first
+aligned to the ordered \emph{POI type} list declared by the service
+configuration, and the values are then accumulated from the smallest to the
+largest accessibility. The aggregation uses the singleton capacities and the
+pairwise interactions defined for that service, so that complementary
+\emph{POI types} can reinforce one another while redundant combinations can
+contribute less than a simple sum would suggest.
+The service score is normalised by the measure of the full set of
+\emph{POI types}, so every service score remains in \([0,1]\). This keeps the
+service layer directly comparable across services and ensures that the
+capability layer receives inputs on a common scale.
+
+\subsection{Capability aggregation}
+The service scores of each \emph{capability} are aggregated with the
+ELECTRE TRI method. The ordered service-score vector is compared against the
+boundary profiles \(0.2\), \(0.4\), \(0.6\), and \(0.8\), using the service
+weights declared in the \emph{capability configuration}. For each origin node
+and \emph{capability}, the indifference threshold \(q\) and preference
+threshold \(p\) are dynamically derived from the standard deviation of the
+current service-score vector \(x\):
+
+\begin{equation}
+    q = \operatorname{std}(x) \cdot \texttt{electre\_q\_factor},
+    \qquad
+    p = \operatorname{std}(x) \cdot \texttt{electre\_p\_factor},
+\end{equation}
+
+\noindent The resulting \(q\) and \(p\) values are applied uniformly to all
+\emph{services} belonging to the current \emph{capability}.
+
+The result of the ELECTRE TRI procedure is a category assignment, which is
+then converted into a continuous score by taking the midpoint of the assigned
+category interval. This produces a final capability score in \((0,1)\) while
+preserving the ordinal meaning of the underlying outranking step.
+
+\subsection{Capability results visualization}
+The final capability scores are written to a single CSV file and transformed into a
+spatial \emph{visualization map}. Each retained representative node becomes a \emph{representative point}
+carrying the capability and service scores computed for that node. The points are then used to build a regular hexagonal grid in projected coordinates, and each hexagon is coloured according to the
+selected capability score of its representative point.
+This representation provides both a node-level and an area-level view of
+the results. The node points preserve the exact network-based measurement
+locations, while the hexagonal aggregation makes the spatial distribution of
+the scores easier to inspect. The generated outputs are also used by the
+\emph{provenance interface}, which allows the user to switch between
+capabilities and inspect the POIs that contributed to each score.
+\subsection{Provenance interface dynamics}
+\mm{The \emph{provenance interface} supports the following general interaction actions:
+\begin{itemize}
+    \item The selected \emph{capability} can be changed through a drop-down menu, which updates the scores and colours shown in the \emph{visualization map}.
+    \item A heatmap legend explains how to interpret the colours of the current visualization and is updated when the selected \emph{capability} requires a different interval division.
+    \item The user can zoom in and out using the buttons located in the top left or by scrolling with the mouse.
+    \item The interface allows the user to zoom out until all displayed points are visible and to zoom in until the shown area is contained within a single \emph{hexagon}.
+    \item When zooming, the interface updates the scale visualizer in the bottom right.
+    \item The mode description in the bottom left explains the current interaction mode and how the displayed information should be interpreted.
+    \item On the right, a toggle allows the user to turn the colour visualization on or off, so the base map underneath can be seen.
+\end{itemize}
+The \emph{provenance interface} is organized into three interaction modes:
+\begin{enumerate}
+    \item \emph{Capability overview mode}. Initially, the interface is set to \emph{capability overview mode}. In this mode, the \emph{hexagons} are coloured based on the scores of the \texttt{current\_capability}. The map provides an overview of how the selected \emph{capability} varies across the study area. Selecting a \emph{hexagon} brings the interface to \emph{hexagon detail mode}.
+    \item \emph{Hexagon detail mode}. In \emph{hexagon detail mode}, the interface zooms into the selected \emph{hexagon}. The POIs used to compute the capability score of the selected \emph{hexagon} are shown on the map. Each \emph{POI} is coloured according to its main service contribution for the selected \emph{capability}. The user also sees all the \emph{services} associated with the \texttt{current\_capability}, each represented as a button on the right side of the interface. Hovering the mouse over one of these buttons highlights the POIs that contribute to the corresponding \emph{service}. Clicking a \emph{POI} shows its angular geographic coordinates, street, neighbourhood, CAP, and the \emph{POI types} and \emph{services} to which it contributes. When a \emph{service} is hovered, the displayed information is filtered according to the \texttt{hovered\_service}. In both \emph{hexagon detail mode} and \emph{service detail mode}, a back button allows the user to return to \emph{capability overview mode}. Clicking a \emph{service} brings the interface to \emph{service detail mode}. The service buttons remain available in \emph{service detail mode}, allowing the user to change the selected \emph{service}.
+    \item \emph{Service detail mode}. In \emph{service detail mode}, only the POIs that contribute to the selected \emph{service} remain coloured, while the others are shown with reduced opacity. The \texttt{point\_size} changes to represent the \texttt{service\_power} of the selected \emph{service} rather than the \texttt{capability\_power}. Clicking a \emph{POI} shows the coordinates, street, neighbourhood, CAP, and the POI type associated with the selected \emph{service}.
+\end{enumerate}
+}
+
+\section{Implementation}
+\subsection{Input processing}
+The boundary file is read from the configured path and its CRS is inspected. If the CRS differs from WGS84 (EPSG:4326), the geometry is reprojected. Multiple polygon features are dissolved into a single geometry by applying a spatial union. Invalid geometries, such as rings with self-intersections, are repaired using a zero-distance buffer operation. When no boundary file is provided, the configured \texttt{city\_name} is resolved through the OpenStreetMap geocoder.
+GTFS feeds are loaded from the configured data directory as one or more feed archives. Each archive is parsed according to the GTFS schema, including \texttt{agency}, \texttt{routes}, \texttt{trips}, \texttt{stop\_times}, \texttt{stops}, \texttt{calendar}, and \texttt{shapes}. The configured \texttt{routing\_datetime} is used to filter the service patterns active during routing.
+
+\subsection{Network preparation}
+The mode-specific graphs are extracted with OSMnx from OpenStreetMap data. When a boundary is provided, the dissolved study-area polygon is used as the extraction geometry; otherwise, the geocoded city boundary is used. Graph simplification is disabled so that all network nodes are retained. Each graph is serialized to disk in GraphML format after its first construction and loaded from cache on subsequent runs.
+
+\subsection{POI preparation}
+When the POI input is a shapefile collection, all point, line, and polygon feature files are read and concatenated into a single feature set. Each file's CRS is checked and reprojected to WGS84 when necessary. For each configured \emph{POI type}, the dataset is filtered by comparing the values of the attribute identified by \texttt{label\_field} with the values listed in \texttt{labels}. Unmatched records are logged and excluded. When the POI source is OpenStreetMap, a single batched query is issued for the study area. The resulting dataset is cached as a GeoJSON file and filtered in memory by applying the tag clauses defined in the model configuration. Individual POI type results are also cached to avoid repeated filtering.
+
+\subsection{POI snapping}
+Line geometries are decomposed into their vertices. Polygon geometries are decomposed into the vertices of their exterior ring and any interior rings. Multi-part geometries are processed one constituent geometry at a time. Candidate coordinates are snapped to the nearest graph nodes through a vectorised batch operation, which also returns the straight-line distance between the original coordinate and the snapped node. Snap results are persisted in a per-type binary cache identified by a hash of the POI type key and travel mode. Empty snap payloads are treated as stale and trigger re-extraction. For transit routing, the bus stage reuses the walk-mode snap results rather than computing a separate snap pass, because pedestrian access to transit stops is assumed to follow the walking network.For each source node and each non-point \emph{POI}, the Haversine distance between the source node and every snapped candidate access location is
+computed, and the candidate with the smallest distance is selected.
+
+\subsection{Extraction radius}
+When \texttt{poi\_radius\_enabled} is \emph{True}, the model calls
+\texttt{get\_global\_radius\_m} once before the routing stages begin. If
+\texttt{poi\_radius\_m} is set, that value is returned directly. Otherwise,
+the function identifies the maximum \texttt{decay\_coefficient} across all
+configured \emph{POI types} and calls \texttt{threshold\_radius\_m}, which
+computes $\beta = \ln 2 / c$, derives $t_{\max} = -\ln\tau / \beta$, and
+returns $r_{\text{global}} = t_{\max} \cdot v_{\max} \cdot 1000 / 60$. The
+resulting radius is logged once alongside the \emph{POI type} that produced the
+maximum coefficient. This single scalar is then passed to the \emph{POI
+snapping} filter and reused unchanged by both the bus and non-bus routing
+stages.
+
+\subsection{Public-transport routing}
+Public-transport routing is delegated to r5r, a Java-based library
+for realistic transit routing. The model invokes r5r through an
+external R script launched as a subprocess via Rscript. The routing
+data bundle required by r5r consists of one OpenStreetMap PBF extract
+and one or more GTFS feeds placed in a common directory. When no PBF file is
+present, the model auto-builds one by downloading the unsimplified road network
+for \texttt{city\_name} with osmnx and converting the resulting OSM
+XML to PBF using osmium.
+
+Origins and destinations are serialised as CSV files with columns
+\texttt{id}, \texttt{lon}, and \texttt{lat}. Before writing these files the
+model applies a destination pre-filter: a candidate snapped coordinate is
+retained only if its haversine distance to at least one origin node does not
+exceed \(r_{\text{global}}\). The R script resolves the expanded travel time
+matrix and writes one CSV row per origin-destination connection, containing
+\texttt{from\_id}, \texttt{to\_id}, \texttt{departure\_time},
+\texttt{access\_time}, \texttt{wait\_time}, \texttt{ride\_time},
+\texttt{transfer\_time}, \texttt{egress\_time}, \texttt{routes},
+\texttt{n\_rides}, and \texttt{total\_time}. Connections whose route sequence
+indicates a walk-only trip are treated as absent. For each valid row the bus
+impedance is computed as
+
+\begin{equation}
+    Z_{\text{bus}} = t_{\text{wait}} + \gamma \, t_{\text{travel}} + c_{\text{fare}},
+    \qquad t_{\text{travel}} = t_{\text{total}} - t_{\text{wait}}
+\end{equation}
+
+\noindent where \(\gamma\) is \texttt{in\_vehicle\_time\_coefficient} and
+\(c_{\text{fare}}\) is the ticket fare expressed as an equivalent time cost.
+The resulting values are written into a memory-mapped matrix of shape
+\(N_{\text{origins}} \times N_{\text{destinations}}\) indexed by integer row
+and column identifiers derived from the input CSVs.
+
+\subsection{Walking, cycling and driving routing}
+Non-public-transport routing is computed independently for each origin node
+using NetworkX Dijkstra shortest-path search on the mode-specific graphs
+loaded by \texttt{osmnx}. Worker processes are initialised once per pool
+with shared references to the walk, bike, and drive graphs, eliminating
+redundant graph copies. For each origin node, when \texttt{poi\_radius\_enabled} is enabled, the model
+first applies the Haversine pre-filter to limit candidate POI access locations
+to those within \(r_{\text{global}}\) straight-line distance. When radius
+filtering is disabled, this pre-filter is skipped. The shortest-path search then
+determines travel time from the origin to every reachable candidate.
+Travel time on each edge is computed from the edge length and the speed
+assigned to the corresponding travel mode. For the driving mode, a fixed ten-minute access time is added to the
+shortest-path travel time to account for vehicle-access overhead, and a
+driving-cost term expressed as an equivalent time value is added to represent
+the economic cost of the trip. For cycling
+and walking, neither an access time nor an economic cost is added. Access
+locations that are disconnected from the origin in a given modal graph receive
+no impedance value for that mode.
+
+For the walking mode the model additionally queries a per-edge walkability
+index that assigns a score in \([1,5]\) to each directed edge. The walkability
+score of a path is the length-weighted mean of the scores of its constituent
+edges. The index is built once in the parent process before the worker pool
+is launched, so that concurrent workers can read it without redundant
+computation.
+
+Results for each origin node are persisted to a dedicated pickle file
+identified by the node identifier. A cache entry is considered valid when its
+\texttt{schema\_version} field matches the configured
+\texttt{non\_bus\_cache\_schema\_version} and its POI configuration signature
+matches the current service configuration. Valid entries are not recomputed
+across runs.
+
+\subsection{Accessibility}
+The accessibility stage reconstructs one node-level accessibility result for
+each origin node by combining the cached non-bus routing payload with the bus
+impedance matrix. The stage first opens a dense memory-mapped accessibility
+matrix when a compatible cache already exists; otherwise it creates a fresh
+matrix initialised with \texttt{NaN} and stores the expected row and column
+mappings alongside it. Only rows that are still incomplete are scheduled for
+recomputation.
+
+Each worker loads the cached non-bus payload for one origin node and retrieves
+the relevant bus impedance values using the origin and destination index maps.
+The worker then computes the \emph{decay} of every available modal impedance,
+merges the modal decays into route-resource availability, and reduces the
+result to one accessibility value per \emph{POI type}. When the same
+\emph{POI type} appears in several services, the stage can deduplicate the
+computation and reuse the same accessibility value in all affected services.
+
+The stage writes the computed accessibility values back into the dense matrix
+so that later runs can reuse completed rows without repeating the routing
+logic. This makes the accessibility stage resumable and avoids recomputing
+origin rows that are already present in cache.
+
+\subsection{Service aggregation}
+The service stage loads the accessibility payload for each origin node and
+groups the \emph{POI type} accessibility values by service. When a compatible
+service matrix cache exists, the stage reconstructs the node-level service
+results directly from the memory-mapped matrix; otherwise it computes the
+service scores from scratch and writes a new cache.
+
+For each service, the ordered accessibility vector is passed to the Choquet
+aggregation helper. The detailed breakdown used by the implementation exposes
+the sorted values, the tail capacities, and the final normalised score, which
+makes the behaviour of the aggregation auditable during development. The
+resulting service scores are stored per node together with the node's
+coordinates, and a summary of zero-score and empty-input cases is logged for
+diagnostics.
+
+\subsection{Capability aggregation}
+The capability stage reads the service scores and writes a single CSV file
+containing the results of all enabled \emph{capabilities}. Each row corresponds
+to one origin node and contains the node identifier, the node coordinates, one
+capability-score field for each enabled \emph{capability}, and the service-score
+fields required by those capabilities. The stage computes the capability scores
+from their respective ordered service vectors, using the service ordering and
+weights declared in the \emph{capability configuration}.
+
+After the CSV file is written, it is moved into the \texttt{experiments}
+folder with a name derived from the current artifact slug. The stage also
+appends the average capability values to a recap CSV so that multiple runs can
+be compared without re-reading the complete capability-results file.
+
+\subsection{Capability results visualization}
+The visualization step consumes the capability-results CSV file and turns it
+into geospatial outputs. The pipeline first generates interpolated plots for
+quick inspection and then builds a shapefile and a GeoPackage from the CSV
+records. The GeoPackage contains a point layer for the evaluated representative nodes
+and, when enabled, a hexagonal grid layer in which each occupied cell is
+associated with the capability values of its representative node.
+
+The grid is built in projected coordinates so that the cell size is measured in
+metres. Once the spatial files have been written, the pipeline optionally builds
+a QGIS project, applies the requested styling parameters, and opens the project
+automatically when QGIS is available. This provides a direct path from the
+computed capability scores to an inspectable cartographic view.
+\end{document}

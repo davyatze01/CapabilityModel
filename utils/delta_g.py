@@ -5,7 +5,6 @@ import json
 import hashlib
 from typing import Hashable, TypeGuard, cast
 import networkx as nx
-import osmnx as ox
 from shapely.geometry.base import BaseGeometry
 import logging
 import walkability
@@ -16,11 +15,19 @@ logger = logging.getLogger(__name__)
 POI_GEOM_CACHE_FOLDER = "poi_geom_cache"
 os.makedirs(POI_GEOM_CACHE_FOLDER, exist_ok=True)
 
-_G_CACHE = None
 _POI_GEOM_CACHE = {}  # key: (feature, value) -> list geometries
 _MODE_GRAPH_CACHE = {}  # key: network_type -> graph
 _MODE_LENGTHS_CACHE = {}  # key: (origin, network_type, radius_key) -> dict node->distance
-_MODE_PATHS_CACHE = {}
+_MODE_PRED_CACHE = {}  # key: (origin, network_type, radius_key) -> dict node->predecessor list (walk only)
+
+# When True, edge `geometry` is dropped from mode graphs right after load to slash
+# per-worker RAM. Only safe in worker processes: the walkability signature is
+# overridden there and the edge-walkability index is loaded from disk, so geometry
+# is never read again. The parent process (which builds that index) must keep it.
+_STRIP_GRAPH_GEOMETRY = False
+_MODE_NODE_KDTREE = {}  # key: network_type -> (cKDTree over projected (x,y) meters, node_id ndarray)
+_COORD_NODE_MEMO = {}  # key: (network_type, round(lat,6), round(lon,6)) -> nearest node id
+_NODE_IDX_MEMO = {}  # key: (network_type, round(lat,6), round(lon,6)) -> full-graph CSR node index
 _WALK_EDGE_SCORES_CACHE: dict[str, dict[tuple[int, int, int], float]] = {}
 _WALK_GRAPH_SIG_BY_OBJID: dict[int, str] = {}
 _WALK_GRAPH_SIG_OVERRIDE: str | None = None
@@ -173,51 +180,291 @@ def _get_mode_graph(network_type, cfg: PipelineConfig | None = None):
     - graph object for the requested mode.
     """
     if network_type not in _MODE_GRAPH_CACHE:
-        _MODE_GRAPH_CACHE[network_type] = graphml.get_mode_graph(network_type, cfg)
+        # This accessor is the routing-graph path: prefer the simplified copy so
+        # workers hold a fraction of the full graph's RAM. Origins/POIs are still
+        # enumerated on the full graph elsewhere (context/snapping).
+        simplified = True if cfg is None else bool(getattr(cfg, "route_on_simplified_graph", True))
+        graph = graphml.get_mode_graph(network_type, cfg, simplified=simplified)
+        if _STRIP_GRAPH_GEOMETRY:
+            _strip_edge_geometry(graph)
+        _MODE_GRAPH_CACHE[network_type] = graph
     return _MODE_GRAPH_CACHE[network_type]
 
 
-def _get_mode_lengths_and_paths(grafo, origin, network_type, radius_m, origin_node=None, cfg: PipelineConfig | None = None):
-    """Get/calculate shortest-path lengths and node paths from one origin.
+def _strip_edge_geometry(graph) -> None:
+    """Drop edge `geometry` from a routing graph to free per-worker RAM.
+
+    Routing needs only `length`; walkability path scoring in workers uses the
+    pre-built edge-score index, not geometry. Mutates the graph in place.
+    """
+    for _u, _v, data in graph.edges(data=True):
+        if "geometry" in data:
+            data["geometry"] = None
+            del data["geometry"]
+
+
+def reset_origin_caches() -> None:
+    """Clear per-origin shortest-path caches between origin nodes.
+
+    `_MODE_LENGTHS_CACHE`/`_MODE_PRED_CACHE` only ever need the origin currently
+    being processed (all POI queries for one origin share the same key). Clearing
+    them per origin caps a worker's memory at one origin's data instead of letting
+    it grow without bound across every origin the worker handles.
+    """
+    _MODE_LENGTHS_CACHE.clear()
+    _MODE_PRED_CACHE.clear()
+
+
+def _reconstruct_path(pred, origin_node, target_node):
+    """Rebuild origin->target node path from a Dijkstra predecessor map.
+
+    Returns None when the target is unreachable. Predecessor maps are far smaller
+    than caching every node's full path, so we keep the map and rebuild only the
+    handful of POI-target paths actually needed.
+    """
+    if pred is None or target_node not in pred:
+        return None
+    path = [target_node]
+    node = target_node
+    while node != origin_node:
+        preds = pred.get(node)
+        if not preds:
+            return None
+        node = preds[0]
+        path.append(node)
+    path.reverse()
+    return path
+
+
+def _get_mode_node_kdtree(network_type, cfg: PipelineConfig | None = None):
+    """Get/build a cached KD-tree over a mode graph's node coordinates.
 
     Inputs:
-    - grafo: base graph reference (kept for compatibility).
-    - origin: origin coordinate `(lat, lon)`.
     - network_type: mode key.
-    - radius_m: optional routing radius.
-    - origin_node: optional pre-snapped origin node id.
     - cfg: optional PipelineConfig.
 
     Outputs:
-    - tuple `(lengths, paths)` where:
-      `lengths` maps reachable node id -> path length in meters and
-      `paths` maps reachable node id -> ordered node path from origin.
+    - tuple `(tree, node_ids, scale)` where `tree` is a scipy cKDTree over node
+      coordinates projected to local meters, `node_ids` is the parallel node-id
+      array, and `scale` is `(m_per_deg_lon, m_per_deg_lat)` used to project queries.
     """
-    radius_key = "all" if radius_m is None else f"r{int(radius_m)}"
-    if origin_node is None:
-        origin_key = (round(origin[0], 6), round(origin[1], 6))
-        key = (origin_key[0], origin_key[1], network_type, radius_key)
-    else:
-        key = (int(origin_node), network_type, radius_key)
+    cached = _MODE_NODE_KDTREE.get(network_type)
+    if cached is not None:
+        return cached
 
-    if key in _MODE_LENGTHS_CACHE and key in _MODE_PATHS_CACHE:
-        return (_MODE_LENGTHS_CACHE[key], _MODE_PATHS_CACHE[key])
-    
+    import numpy as np
+    from scipy.spatial import cKDTree
 
     mode_graph = _get_mode_graph(network_type, cfg)
-    if origin_node is None:
-        origin_nodes = ox.distance.nearest_nodes(mode_graph, [origin[1]], [origin[0]])
-        try:
-            origin_nodes = list(origin_nodes)
-        except TypeError:
-            origin_nodes = [origin_nodes]
-        if not origin_nodes:
-            raise RuntimeError("nearest_nodes returned no origin node")
-        origin_node = cast(Hashable, _normalize_node_id(origin_nodes[0]))
-    lengths, paths = nx.single_source_dijkstra(mode_graph, origin_node, weight="length")
-    _MODE_LENGTHS_CACHE[key] = lengths
-    _MODE_PATHS_CACHE[key] = paths
-    return (lengths, paths)
+    node_ids = []
+    lats = []
+    lons = []
+    for node_id, data in mode_graph.nodes(data=True):
+        if "x" not in data or "y" not in data:
+            continue
+        node_ids.append(node_id)
+        lons.append(float(data["x"]))
+        lats.append(float(data["y"]))
+    if not node_ids:
+        raise RuntimeError(f"mode graph '{network_type}' has no nodes with coordinates")
+
+    lats_arr = np.asarray(lats, dtype=float)
+    lons_arr = np.asarray(lons, dtype=float)
+    mean_lat_rad = math.radians(float(lats_arr.mean()))
+    m_per_deg_lat = 111320.0
+    m_per_deg_lon = 111320.0 * math.cos(mean_lat_rad)
+    node_xy = np.column_stack([lons_arr * m_per_deg_lon, lats_arr * m_per_deg_lat])
+    tree = cKDTree(node_xy)
+    node_ids_arr = np.asarray(node_ids, dtype=object)
+    result = (tree, node_ids_arr, (m_per_deg_lon, m_per_deg_lat))
+    _MODE_NODE_KDTREE[network_type] = result
+    return result
+
+
+def _nearest_mode_node(network_type, lat, lon, cfg: PipelineConfig | None = None):
+    """Snap one coordinate to the nearest mode-graph node, memoized per coordinate.
+
+    Inputs:
+    - network_type: mode key.
+    - lat, lon: coordinate to snap.
+    - cfg: optional PipelineConfig.
+
+    Outputs:
+    - nearest node id for the coordinate.
+    """
+    memo_key = (network_type, round(float(lat), 6), round(float(lon), 6))
+    cached = _COORD_NODE_MEMO.get(memo_key)
+    if cached is not None:
+        return cached
+    tree, node_ids, (m_per_deg_lon, m_per_deg_lat) = _get_mode_node_kdtree(network_type, cfg)
+    _, idx = tree.query([float(lon) * m_per_deg_lon, float(lat) * m_per_deg_lat])
+    node_id = cast(Hashable, _normalize_node_id(node_ids[int(idx)]))
+    _COORD_NODE_MEMO[memo_key] = node_id
+    return node_id
+
+
+def _snap_node_idx(network_type, lat, lon, cfg: PipelineConfig | None = None):
+    """Snap a coordinate to the nearest full-graph node, returning its CSR index.
+
+    Memoized per rounded coordinate. The CSR bundle's KD-tree is built over the full
+    (unsimplified) graph node coordinates, so snapping is as precise as it was before
+    simplification was ever introduced.
+    """
+    memo_key = (network_type, round(float(lat), 6), round(float(lon), 6))
+    cached = _NODE_IDX_MEMO.get(memo_key)
+    if cached is not None:
+        return cached
+    bundle = graphml.get_mode_csr(network_type, cfg)
+    tree = bundle["tree"]
+    m_per_deg_lon, m_per_deg_lat = bundle["scale"]
+    _, idx = tree.query([float(lon) * m_per_deg_lon, float(lat) * m_per_deg_lat])
+    i = int(idx)
+    _NODE_IDX_MEMO[memo_key] = i
+    return i
+
+
+def snap_origin_nodes_by_mode(coords_by_id, cfg: PipelineConfig | None = None, modes=("walk", "bike", "drive")):
+    """Batch-snap origin coordinates to each mode's full-graph node index, once.
+
+    Intended to run in the parent so workers reuse the result instead of snapping
+    lazily. One vectorized KD-tree query per mode; warms `_NODE_IDX_MEMO`.
+
+    Inputs:
+    - coords_by_id: mapping origin id -> `(lat, lon)`.
+
+    Outputs:
+    - dict origin id -> {mode: node_index}.
+    """
+    import numpy as np
+
+    ids = list(coords_by_id.keys())
+    result: dict = {nid: {} for nid in ids}
+    if not ids:
+        return result
+    for mode in modes:
+        bundle = graphml.get_mode_csr(mode, cfg)
+        tree = bundle["tree"]
+        m_per_deg_lon, m_per_deg_lat = bundle["scale"]
+        query_xy = np.array(
+            [
+                [float(coords_by_id[nid][1]) * m_per_deg_lon, float(coords_by_id[nid][0]) * m_per_deg_lat]
+                for nid in ids
+            ],
+            dtype=float,
+        )
+        _, idxs = tree.query(query_xy)
+        for nid, idx in zip(ids, np.atleast_1d(idxs)):
+            i = int(idx)
+            result[nid][mode] = i
+            lat, lon = coords_by_id[nid]
+            _NODE_IDX_MEMO[(mode, round(float(lat), 6), round(float(lon), 6))] = i
+    return result
+
+
+def _reconstruct_path_idx(predecessors, origin_idx, target_idx):
+    """Rebuild an origin->target node-index path from a scipy predecessor array.
+
+    Returns None when the target is unreachable (predecessor -9999) from the source.
+    """
+    if target_idx == origin_idx:
+        return [origin_idx]
+    path = [target_idx]
+    cur = target_idx
+    for _ in range(len(predecessors) + 1):
+        p = int(predecessors[cur])
+        if p < 0:
+            return None
+        path.append(p)
+        if p == origin_idx:
+            path.reverse()
+            return path
+        cur = p
+    return None
+
+
+def _csr_path_walkability(bundle, path_idx):
+    """Length-weighted walkability over a node-index path via the CSR + wscore arrays.
+
+    Mirrors `walkability.compute_path_walkability_from_edges` but reads each segment's
+    length and (min-length-edge) walkability score straight from the aligned CSR
+    arrays, so no NetworkX graph is needed in the worker. Returns None when the path
+    has no scorable length.
+    """
+    import numpy as np
+
+    wscore = bundle.get("wscore")
+    if wscore is None:
+        return None
+    indptr = bundle["indptr"]
+    indices = bundle["indices"]
+    length = bundle["length"]
+    wsum = 0.0
+    lsum = 0.0
+    for a, b in zip(path_idx[:-1], path_idx[1:]):
+        s = int(indptr[a])
+        e = int(indptr[a + 1])
+        row = indices[s:e]
+        j = int(np.searchsorted(row, b))
+        if j >= row.size or int(row[j]) != b:
+            continue  # segment not in CSR (should not happen on a real path)
+        l_e = float(length[s + j])
+        if l_e <= 0:
+            continue
+        wsum += l_e * float(wscore[s + j])
+        lsum += l_e
+    if lsum <= 0:
+        return None
+    return wsum / lsum
+
+
+def _get_mode_lengths_and_paths(origin, network_type, radius_m, origin_idx=None, cfg: PipelineConfig | None = None, cutoff_m=None):
+    """Single-source shortest distances on the mode's CSR graph from one origin.
+
+    Inputs:
+    - origin: origin coordinate `(lat, lon)`.
+    - network_type: mode key.
+    - radius_m: optional routing radius (cache-key only).
+    - origin_idx: optional pre-snapped origin node index.
+    - cfg: optional PipelineConfig.
+    - cutoff_m: optional distance cutoff (meters) passed to scipy as `limit`; nodes
+      beyond it come back as `inf`.
+
+    Outputs:
+    - tuple `(dist, pred, origin_idx)` where `dist` is a numpy array node_index ->
+      distance in meters (`inf` when unreachable/beyond cutoff), and `pred` is the
+      scipy predecessor array for path reconstruction (walk only; `None` otherwise).
+      Cached per origin index until `reset_origin_caches`.
+    """
+    import numpy as np
+    from scipy.sparse.csgraph import dijkstra
+
+    bundle = graphml.get_mode_csr(network_type, cfg)
+    if origin_idx is None:
+        origin_idx = _snap_node_idx(network_type, origin[0], origin[1], cfg)
+
+    radius_key = "all" if radius_m is None else f"r{int(radius_m)}"
+    cutoff_key = "all" if cutoff_m is None else f"c{int(cutoff_m)}"
+    key = (int(origin_idx), network_type, radius_key, cutoff_key)
+    if key in _MODE_LENGTHS_CACHE and key in _MODE_PRED_CACHE:
+        return (_MODE_LENGTHS_CACHE[key], _MODE_PRED_CACHE[key], origin_idx)
+
+    limit = np.inf if cutoff_m is None else float(cutoff_m)
+    want_pred = network_type == "walk"
+    out = dijkstra(
+        bundle["mat"],
+        directed=True,
+        indices=int(origin_idx),
+        limit=limit,
+        return_predecessors=want_pred,
+    )
+    if want_pred:
+        dist, pred = out
+    else:
+        dist = out
+        pred = None
+    _MODE_LENGTHS_CACHE[key] = dist
+    _MODE_PRED_CACHE[key] = pred
+    return (dist, pred, origin_idx)
 
 
 def build_rra(decay_walk, decay_bike, decay_drive, decay_bus):
@@ -230,11 +477,15 @@ def build_rra(decay_walk, decay_bike, decay_drive, decay_bus):
     - list[float]: merged RRA values for valid entries.
     """
     rra = []
-    for i in range(len(decay_walk)):
-        dw = decay_walk[i]
-        db = decay_bike[i]
-        dd = decay_drive[i]
-        d_bus = decay_bus[i]
+    n = max(len(decay_walk), len(decay_bike), len(decay_drive), len(decay_bus))
+    for i in range(n):
+        # Mode lists may differ in length (e.g. callers that only supply walk
+        # decays and leave bike/drive/bus empty). Treat a missing entry as 0.0,
+        # which is a no-op in calculate_rra's 1 - prod(1 - decay) formula.
+        dw = decay_walk[i] if i < len(decay_walk) else 0.0
+        db = decay_bike[i] if i < len(decay_bike) else 0.0
+        dd = decay_drive[i] if i < len(decay_drive) else 0.0
+        d_bus = decay_bus[i] if i < len(decay_bus) else 0.0
         if None not in (dw, db, dd, d_bus):
             rra.append(decay.calculate_rra(dw, db, dd, d_bus))
     return rra
@@ -281,7 +532,7 @@ def accessibility_from_rra(RRA, poi_type=None, contribution_coefficient=None):
     return out
 
 
-def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origine, poi_snap_info_by_mode, feature=None, radius_m=None, tags=None):
+def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origine, poi_snap_info_by_mode, feature=None, radius_m=None, tags=None, origin_nodes_by_mode=None):
     """Compute non-bus impedance ingredients for one origin/POI type from snap maps.
 
     Inputs:
@@ -299,123 +550,112 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
 
     mode_infos = poi_snap_info_by_mode or {}
     source_keys_seen = set()
-    source_coords = []
+    source_items: list[dict[str, object]] = []
     for mode in ("walk", "bike", "drive"):
         info = mode_infos.get(mode) or {}
-        for src_key in info.keys():
+        for src_key, src_info in info.items():
             if src_key in source_keys_seen:
                 continue
             source_keys_seen.add(src_key)
-            source_coords.append((float(src_key[0]), float(src_key[1])))
-
-    if not source_coords:
-        poi_key = str(poi_type)
-        if poi_key not in _EMPTY_SOURCE_COORDS_LOGGED:
-            _EMPTY_SOURCE_COORDS_LOGGED.add(poi_key)
-            print(
-                f"[Accessibility] No source_coords from snap cache for poi_type={poi_type} "
-                f"origin=({origine[0]:.6f},{origine[1]:.6f})",
-                flush=True,
+            if isinstance(src_info, dict):
+                source_coord = src_info.get("source_coord")
+            else:
+                source_coord = src_key
+            if not isinstance(source_coord, (list, tuple)) or len(source_coord) < 2:
+                continue
+            source_items.append(
+                {
+                    "source_key": src_key,
+                    "source_coord": (float(source_coord[0]), float(source_coord[1])),
+                }
             )
+
+    if radius_m is not None:
+        source_items = [
+            item for item in source_items
+            if _haversine_m(origine[0], origine[1], item["source_coord"][0], item["source_coord"][1]) <= radius_m
+        ]
+
+    if not source_items:
         return {
+            "source_items": [],
             "source_coords": [],
             "imp_walk": [],
             "imp_bike": [],
             "imp_drive": [],
         }
 
-    global _G_CACHE
-    if _G_CACHE is None:
-        _G_CACHE = graphml.get_graph()
-    grafo = _G_CACHE
+    # Bound Dijkstra exploration to a generous multiple of the POI radius. Source items
+    # are already pre-filtered to haversine <= radius_m, so a detour factor above the
+    # urban street-network detour ratio keeps every in-radius POI inside the cutoff.
+    cutoff_m = None
+    if radius_m is not None:
+        cutoff_m = float(radius_m) * float(getattr(config, "non_bus_dijkstra_detour_factor", 1.6))
 
     mode_distances = {}
-    walk_paths: dict[Hashable, list[Hashable]] = {}
+    walk_pred = None
+    walk_origin_idx = None
+    walk_bundle = None
     walk_paths_scores = []
-    walk_poi_nodes: list[Hashable] = []
-    walk_graph = None
+    walk_poi_idxs: list = []
     for mode in ("walk", "bike", "drive"):
         info = mode_infos.get(mode) or {}
         chosen_coords = []
-        for src in source_coords:
-            src_key = (round(src[0], 6), round(src[1], 6))
+        for item in source_items:
+            src = item["source_coord"]
+            src_key = item["source_key"]
             chosen_coords.append(_select_best_snap_for_origin(origine, src, info.get(src_key)))
         try:
-            mode_graph = _get_mode_graph(mode, config)
-            all_x = [origine[1]] + [coord[1] for coord in chosen_coords]
-            all_y = [origine[0]] + [coord[0] for coord in chosen_coords]
-            all_nodes = ox.distance.nearest_nodes(mode_graph, all_x, all_y)
-            try:
-                all_nodes = list(all_nodes)
-            except TypeError:
-                all_nodes = [all_nodes]
-            if not all_nodes:
-                mode_distances[mode] = [None] * len(source_coords)
-                continue
-            origin_node = cast(Hashable, _normalize_node_id(all_nodes[0]))
-            poi_nodes = [cast(Hashable, _normalize_node_id(n)) for n in all_nodes[1:]]
-            lengths_raw, paths_raw = _get_mode_lengths_and_paths(
-                grafo, origine, mode, radius_m, origin_node=origin_node, cfg=config
+            if origin_nodes_by_mode and mode in origin_nodes_by_mode:
+                origin_idx = origin_nodes_by_mode[mode]
+            else:
+                origin_idx = _snap_node_idx(mode, origine[0], origine[1], config)
+            # Snap each POI precisely to the nearest full-graph node (exact, no chains).
+            poi_idxs = [
+                _snap_node_idx(mode, coord[0], coord[1], config)
+                for coord in chosen_coords
+            ]
+
+            dist, pred, _ = _get_mode_lengths_and_paths(
+                origine, mode, radius_m, origin_idx=origin_idx, cfg=config, cutoff_m=cutoff_m
             )
-            lengths: dict[Hashable, float] = cast(dict[Hashable, float], lengths_raw)
-            paths: dict[Hashable, list[Hashable]] = cast(dict[Hashable, list[Hashable]], paths_raw)
+
+            # dist is keyed by node index; values are exact full-graph metres, inf
+            # beyond the cutoff/unreachable.
+            leg = []
+            for pidx in poi_idxs:
+                d = dist[pidx]
+                leg.append(float(d) if math.isfinite(d) else None)
+            mode_distances[mode] = leg
 
             if mode == "walk":
-                walk_paths = paths
-                walk_graph = mode_graph
-                walk_poi_nodes = poi_nodes
+                walk_pred = pred
+                walk_origin_idx = origin_idx
+                walk_bundle = graphml.get_mode_csr(mode, config)
+                walk_poi_idxs = poi_idxs
 
-            mode_distances[mode] = [lengths.get(node) for node in poi_nodes]
-
-        except (KeyError, ValueError, TypeError, nx.NodeNotFound, nx.NetworkXNoPath) as exc:
-            logger.warning("Walk routing fallback: mode=%s origin=%s reason=%s", mode, origine, exc)
-            mode_distances[mode] = [None] * len(source_coords)
+        except (KeyError, ValueError, TypeError, IndexError, MemoryError) as exc:
+            logger.warning("Non-bus routing fallback: mode=%s origin=%s reason=%s", mode, origine, exc)
+            mode_distances[mode] = [None] * len(source_items)
 
     imp_walk = []
     imp_bike = []
     imp_drive = []
-    walk_edge_scores = None
-    if walk_graph is not None:
-        graph_obj_id = id(walk_graph)
-        graph_sig = _WALK_GRAPH_SIG_OVERRIDE or _WALK_GRAPH_SIG_BY_OBJID.get(graph_obj_id)
-        if graph_sig is None:
-            graph_sig = walkability.compute_graph_signature(walk_graph)
-            _WALK_GRAPH_SIG_BY_OBJID[graph_obj_id] = graph_sig
 
-        cached_scores = _WALK_EDGE_SCORES_CACHE.get(graph_sig)
-        if cached_scores is None:
-            cache_obj = walkability.get_or_build_edge_walkability_index(
-                    cfg=config,
-                    G=walk_graph,
-                    force_rebuild=False,
-                    schema_version=1,
-            )
-            cached_scores = cache_obj.edge_scores
-            _WALK_EDGE_SCORES_CACHE[graph_sig] = cached_scores
-        walk_edge_scores = cached_scores
-    
-    for i in range(len(source_coords)):
+    for i in range(len(source_items)):
         iw = ib = idr = None
 
+        # Walkability score of the origin->POI walk path, read straight from the CSR
+        # length/score arrays (no NetworkX graph needed in the worker).
         w_i = None
         if (
-            walk_graph is not None
-            and walk_edge_scores is not None
-            and i < len(walk_poi_nodes)
+            walk_bundle is not None
+            and walk_pred is not None
+            and i < len(walk_poi_idxs)
         ):
-            target_node = walk_poi_nodes[i]
-            walk_path = walk_paths.get(target_node)
-            if walk_path:
-                try:
-                    path_edges = walkability.path_nodes_to_path_edges(walk_graph, walk_path)
-                    w_i = walkability.compute_path_walkability_from_edges(
-                        G=walk_graph,
-                        path_edges=path_edges,
-                        edge_scores=walk_edge_scores,
-                        length_attr="length",
-                    )
-                except (KeyError, ValueError, TypeError):
-                    w_i = None
+            path_idx = _reconstruct_path_idx(walk_pred, walk_origin_idx, walk_poi_idxs[i])
+            if path_idx and len(path_idx) >= 2:
+                w_i = _csr_path_walkability(walk_bundle, path_idx)
         walk_paths_scores.append(w_i)
 
         for mode in ("walk", "bike", "drive"):
@@ -425,9 +665,27 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
 
             dist_km = dist_m / 1000.0
             if mode == "walk":
-                imp = get_impedance.impedance_base(dist_km, mode, w_i)
+                imp = get_impedance.impedance_base(
+                    dist_km, mode, w_i,
+                    vot=config.vot,
+                    cost_per_liter=config.cost_per_liter,
+                    distance_for_liter=config.distance_for_liter,
+                    speed_walk_kmh=config.speed_walk_kmh,
+                    speed_bike_kmh=config.speed_bike_kmh,
+                    speed_drive_kmh=config.speed_drive_kmh,
+                    drive_access_time_min=config.drive_access_time_min,
+                )
             else:
-                imp = get_impedance.impedance_base(dist_km, mode)
+                imp = get_impedance.impedance_base(
+                    dist_km, mode,
+                    vot=config.vot,
+                    cost_per_liter=config.cost_per_liter,
+                    distance_for_liter=config.distance_for_liter,
+                    speed_walk_kmh=config.speed_walk_kmh,
+                    speed_bike_kmh=config.speed_bike_kmh,
+                    speed_drive_kmh=config.speed_drive_kmh,
+                    drive_access_time_min=config.drive_access_time_min,
+                )
             
             if imp is None:
                 continue
@@ -442,7 +700,8 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
         imp_drive.append(idr)
 
     return {
-        "source_coords": source_coords,
+        "source_items": source_items,
+        "source_coords": [item["source_coord"] for item in source_items],
         "imp_walk": imp_walk,
         "imp_bike": imp_bike,
         "imp_drive": imp_drive,

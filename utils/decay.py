@@ -18,6 +18,22 @@ def distance_decay(beta, imp):
 
     return math.exp(-beta * impedance)
 
+def threshold_radius_m(decay_coeff: float, threshold: float, max_speed_kmh: float = 60.0) -> float:
+    """Max haversine radius (metres) at which decay >= threshold.
+
+    Inputs:
+    - decay_coeff: POI-type decay coefficient (minutes at which decay = 0.5).
+    - threshold: minimum meaningful decay value (e.g. 0.05).
+    - max_speed_kmh: reference travel speed used to convert time to distance.
+
+    Outputs:
+    - float: radius in metres.
+    """
+    beta = math.log(2) / decay_coeff
+    max_time_min = -math.log(threshold) / beta
+    return max_time_min * max_speed_kmh * 1000.0 / 60.0
+
+
 def calculate_rra(decay_walk,decay_bike,decay_drive,decay_bus):
     """Combine modal decay values into a single RRA value.
 

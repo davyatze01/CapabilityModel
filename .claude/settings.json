@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python -c \"import pyDecision; import os; pkg_path = os.path.dirname\\(pyDecision.__file__\\); files = [f for f in os.listdir\\(os.path.join\\(pkg_path, 'algorithm'\\)\\) if 'tri' in f.lower\\(\\) or 'electre' in f.lower\\(\\)]; print\\(files\\)\" 2>&1)",
+      "PowerShell(python -c \"import pyDecision, os; p = os.path.join\\(os.path.dirname\\(pyDecision.__file__\\), 'algorithm', 'e_tri_b.py'\\); print\\(open\\(p\\).read\\(\\)\\)\" 2>&1)",
+      "Read(//c/Python312/Lib/site-packages/mcda/internal/outranking/**)",
+      "PowerShell(\"Logical CPUs: $env:NUMBER_OF_PROCESSORS\"; $p='C:\\\\Users\\\\mocci\\\\Desktop\\\\PhD\\\\II\\\\CapabilityModel\\\\artifacts\\\\Cagliari_popolazione_abitazione\\\\bus\\\\r5r_best_routes.pkl'; if\\(Test-Path $p\\){ \"{0:N1} MB stale pkl found\" -f \\(\\(Get-Item $p\\).Length/1MB\\); Remove-Item $p -Force; \"deleted: $\\(\\(Test-Path $p\\) -eq $false\\)\" } else { \"not present\" })",
+      "PowerShell(& python -m py_compile utils/delta_g.py non_bus_routing_stage.py context.py config.py)",
+      "PowerShell(if \\($?\\) { \"OK: all modules compile\" })",
+      "PowerShell(& python -c \"import psutil, os; print\\('psutil OK', psutil.__version__\\)\")",
+      "PowerShell(& python -c \"import os; os.environ['CAP_STUDY_CITY']='cagliari'; from config import PipelineConfig; c=PipelineConfig\\(study_city='cagliari'\\); print\\('use_shapefile=',c.use_shapefile\\); print\\('artifact_slug=',getattr\\(c,'artifact_slug',None\\)\\)\")",
+      "PowerShell(& python test_mem_flat.py)"
+    ]
+  }
+}

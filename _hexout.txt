@@ -1,0 +1,3 @@
+schema=hexagon_poi_ids_v1
+hexagons={"101": [1, 2], "102": [1, 2]}
+scores=None

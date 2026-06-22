@@ -250,9 +250,17 @@ plots/edge_interpolation
 
 # Generated local graph/OSM caches
 graph/*.graphml
+graph/*.npz
 gtfs/*.osm.pbf
 gtfs/*.osm.xml
 gtfs/*.zip
+
+# Large generated POI export artifacts (exceed GitHub's 100MB limit)
+/pois_used.gpkg
+outputs/poi_exports/
+
+# Throwaway diagnostic scripts
+_geom_probe.py
 
 # Paris data folder (large POI/boundary shapefiles)
 Paris/

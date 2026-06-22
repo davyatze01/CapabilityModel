@@ -8,7 +8,6 @@ import subprocess
 from pathlib import Path
 
 import osmnx as ox
-import pandas as pd
 import numpy as np
 from pipeline_types import BusRoutingStageResult, PipelineContext, SnappingStageResult
 from snapping_stage import build_selected_routing_destinations
@@ -197,36 +196,6 @@ def _validate_routing_artifacts_for_skip(skip_routing: bool, cache_path: str, de
             "Routing cache is invalid or incompatible while skip_routing=True. "
             f"Cache file: {cache_path}"
         )
-    
-def _validate_bus_matrix_meta(path: str, departure_iso: str, origins_sig: str, destinations_sig: str) -> None:
-    """Validate bus matrix metadata file against expected run signatures.
-
-    Inputs:
-    - path: metadata JSON path.
-    - departure_iso: expected departure datetime string.
-    - origins_sig: expected origin signature.
-    - destinations_sig: expected destination signature.
-
-    Outputs:
-    - None. Raises RuntimeError when metadata is missing or incompatible.
-    """
-    if not os.path.isfile(path):
-        raise RuntimeError(f"Missing bus matrix metadata while skip_routing=True. Expected file: {path}")
-    try:
-        with open(path, encoding="utf-8") as f:
-            meta = json.load(f)
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load bus matrix metadata: {path}") from exc
-
-    if (
-        meta.get("departure_iso") != departure_iso
-        or meta.get("origins_sig") != origins_sig
-        or meta.get("destinations_sig") != destinations_sig
-    ):
-        raise RuntimeError(
-            "Bus matrix metadata is invalid or incompatible while skip_routing=True. "
-            f"Meta file: {path}"
-        )
 
 def _coords_signature(coords: list[tuple[float, float]]) -> str:
     """Hash ordered coordinates to identify exact routing inputs across runs.
@@ -380,17 +349,20 @@ def _run_r5r_script(script_path: str, ctx: PipelineContext) -> None:
                 proc.kill()
         raise
 
-def build_bus_impedance_cache(context: PipelineContext, force_rebuild: bool = False) -> None:
+def build_bus_impedance_cache(context: PipelineContext, force_rebuild: bool = False, transport_type: str = "bus") -> None:
     """Build dense bus impedance matrix and index files from routing CSV.
 
     Inputs:
     - context: pipeline context with bus artifact paths.
     - force_rebuild: when True, rebuild matrix/indexes even if files exist.
+    - transport_type: public transport mode ("bus", "metro", or "train").
 
     Outputs:
     - None. Writes matrix `.dat` and row/column index JSON files.
     """
     cfg = context.config
+    ticket_price = {"bus": cfg.bus_ticket_price, "metro": cfg.metro_ticket_price, "train": cfg.train_ticket_price}.get(transport_type, cfg.bus_ticket_price)
+    gamma = (cfg.time_indifference_bus - cfg.vot * ticket_price) / cfg.time_indifference_bus
     source_id_to_row = {}
     dest_id_to_col = {}
 
@@ -454,13 +426,19 @@ def build_bus_impedance_cache(context: PipelineContext, force_rebuild: bool = Fa
                 impedance = 0.0
             else:
                 try:
-                    total_time = float(total_time_raw)
-                    wait_time = float(wait_time_raw) if wait_time_raw != "" else 0.0
+                    wait_time    = float(wait_time_raw) if wait_time_raw != "" else 0.0
+                    ride_time    = float(row.get("ride_time",     "") or 0.0)
+                    access_time  = float(row.get("access_time",   "") or 0.0)
+                    transfer_time = float(row.get("transfer_time","") or 0.0)
+                    egress_time  = float(row.get("egress_time",   "") or 0.0)
                 except ValueError:
                     impedance = 0.0
                 else:
-                    travel_time = max(0.0, total_time - wait_time)
-                    impedance = wait_time + float(cfg.bus_gamma) * travel_time
+                    impedance = (
+                        access_time + wait_time + gamma * ride_time
+                        + transfer_time + egress_time
+                        + float(cfg.vot) * ticket_price
+                    )
                     if impedance < 0:
                         impedance = 0.0
             impedance_matrix[source_row][dest_col] = impedance
@@ -489,30 +467,6 @@ def build_bus_impedance_cache(context: PipelineContext, force_rebuild: bool = Fa
     with open(cfg.bus_dest_id_to_col_path, 'w') as f:
         json.dump(dest_id_to_col, f)
 
-
-def _write_bus_matrix_meta(path, departure_iso, origins_sig, destinations_sig):
-    """Persist metadata used to validate matrix freshness across runs.
-
-    Inputs:
-    - path: metadata JSON destination.
-    - departure_iso: run departure datetime string.
-    - origins_sig: origin signature.
-    - destinations_sig: destination signature.
-
-    Outputs:
-    - None. Writes metadata JSON to disk.
-    """
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "departure_iso": departure_iso,
-                "origins_sig": origins_sig,
-                "destinations_sig": destinations_sig,
-            },
-            f,
-        )
-
-
 def _save_routing_cache(path: str, payload) -> None:
     """Atomically persist routing cache payload to pickle.
 
@@ -530,85 +484,14 @@ def _save_routing_cache(path: str, payload) -> None:
     os.replace(tmp_path, path)
 
 
-def _build_routing_cache_from_r5r_csv(
-    csv_path: str,
-    origin_id_to_coord: dict[str, tuple[float, float]],
-    destination_id_to_coord: dict[str, tuple[float, float]],
-    departure_iso: str,
-    origins_sig: str,
-    destinations_sig: str,
-    bus_gamma: float,
-):
-    """Build in-memory routing cache dictionary from expanded routing CSV.
-
-    Inputs:
-    - csv_path: expanded routing CSV path produced by R.
-    - origin_id_to_coord: mapping from origin ids to rounded coordinates.
-    - destination_id_to_coord: mapping from destination ids to rounded coordinates.
-    - departure_iso: departure datetime string.
-    - origins_sig: origin signature.
-    - destinations_sig: destination signature.
-
-    Outputs:
-    - dict: routing cache payload with metadata and `(origin,destination)` route map.
-    """
-    routes = {}
-    usecols = ["from_id", "to_id", "total_time", "wait_time", "routes"]
-
-    reader = pd.read_csv(
-        csv_path,
-        usecols=lambda c: c in usecols,
-        chunksize=200_000,
-        engine="python",   # avoids C parser native crash path
-    )
-
-    for chunk in reader:
-        for row in chunk.itertuples(index=False):
-            from_id = str(row.from_id)
-            to_id = str(row.to_id)
-
-            origin_coord = origin_id_to_coord.get(from_id)
-            destination_coord = destination_id_to_coord.get(to_id)
-            if origin_coord is None or destination_coord is None:
-                continue
-
-            total_time = row.total_time
-            wait_time = row.wait_time
-            if pd.isna(total_time) or pd.isna(wait_time):
-                continue
-
-            total_time = float(total_time)
-            wait_time = float(wait_time)
-            travel_time = total_time - wait_time
-            if travel_time < 0:
-                continue
-
-            impedance = wait_time + float(bus_gamma) * travel_time
-            if impedance < 0:
-                continue
-
-            routes[(origin_coord, destination_coord)] = {
-                "travel_time": travel_time,
-                "wait_time": wait_time,
-                "impedance": impedance,
-                "routes": getattr(row, "routes", None),
-            }
-
-    return {
-        "departure_iso": departure_iso,
-        "origins_sig": origins_sig,
-        "destinations_sig": destinations_sig,
-        "routes": routes,
-    }
-
-
 # This function runs the bus routing stage
-def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> BusRoutingStageResult:
-    """Execute transit routing stage and produce reusable bus routing artifacts.
+def run_public_transport_routing_stage(ctx: PipelineContext, snap: SnappingStageResult, transport_type: str = "bus") -> BusRoutingStageResult:
+    """Execute transit routing stage and produce reusable public transport routing artifacts.
 
     Inputs:
     - ctx: pipeline context with configuration and graph nodes.
-    - snap: snapping results with bus destination candidates.
+    - snap: snapping results with public transport destination candidates.
+    - transport_type: type of public transport being routed (e.g. "bus", "tram", "metro").
 
     Outputs:
     - BusRoutingStageResult: paths and signatures for downstream stages.
@@ -621,10 +504,18 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
     all_candidate_snapped_coords = set()
     has_multi_snap_candidates = False
     for snap_info_for_key in snap.poi_bus_snap_info_by_type.values():
-        for candidates in snap_info_for_key.values():
+        for snap_info in snap_info_for_key.values():
+            candidates = snap_info.get("candidates") if isinstance(snap_info, dict) else snap_info
+            if not isinstance(candidates, (list, tuple)):
+                continue
             if len(candidates) > 1:
                 has_multi_snap_candidates = True
-            for snapped, _ in candidates:
+            for cand in candidates:
+                if not isinstance(cand, (list, tuple)) or len(cand) < 2:
+                    continue
+                snapped = cand[0]
+                if not isinstance(snapped, (list, tuple)) or len(snapped) < 2:
+                    continue
                 all_candidate_snapped_coords.add(tuple(snapped))
 
     if has_multi_snap_candidates:
@@ -642,6 +533,22 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
         unique_snapped_coords = sorted(all_candidate_snapped_coords)
 
     origins = [(data["y"], data["x"]) for _, data in ctx.nodes_with_coords]
+
+    from utils import services as serv
+    global_radius_m = serv.get_global_radius_m(cfg)
+    if global_radius_m is not None and unique_snapped_coords:
+        from utils.delta_g import _haversine_m
+        filtered_coords = [
+            dest for dest in unique_snapped_coords
+            if any(_haversine_m(o[0], o[1], dest[0], dest[1]) <= global_radius_m for o in origins)
+        ]
+        print(
+            f"[Bus] Destination radius pre-filter: radius={global_radius_m/1000:.1f} km  "
+            f"kept={len(filtered_coords)}/{len(unique_snapped_coords)}",
+            flush=True,
+        )
+        unique_snapped_coords = filtered_coords
+
     destinations = list(unique_snapped_coords)
     origins_sig = _coords_signature(origins)
     destinations_sig = _coords_signature(destinations)
@@ -658,7 +565,7 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
         )
         _write_dummy_destination_csv(cfg.bus_routing_destinations_input_path)
         _write_empty_routing_csv(routing_csv)
-        build_bus_impedance_cache(ctx, force_rebuild=True)
+        build_bus_impedance_cache(ctx, force_rebuild=True, transport_type=transport_type)
 
         _save_routing_cache(
             routing_cache,
@@ -686,7 +593,7 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
             origins_sig=origins_sig,
             destinations_sig=destinations_sig,
         )
-        build_bus_impedance_cache(ctx, force_rebuild=True)
+        build_bus_impedance_cache(ctx, force_rebuild=True, transport_type=transport_type)
 
         print(f"[Bus] Skipping routing build; reusing cache: {routing_cache}", flush=True)
 
@@ -699,15 +606,6 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
         )
 
     
-    origin_id_to_coord = {
-        str(node_id): (round(float(data["y"]), COORD_ROUND), round(float(data["x"]), COORD_ROUND))
-        for node_id, data in ctx.nodes_with_coords
-    }
-    destination_id_to_coord = {
-        f"d{idx}": (round(float(lat), COORD_ROUND), round(float(lon), COORD_ROUND))
-        for idx, (lat, lon) in enumerate(destinations)
-    }
-
     r_origins_csv = cfg.bus_routing_origins_input_path
     r_dest_csv = cfg.bus_routing_destinations_input_path
 
@@ -726,18 +624,16 @@ def run_bus_routing_stage(ctx: PipelineContext, snap: SnappingStageResult) -> Bu
     _run_r5r_script(r_script_path, ctx)
     print("[Bus] Rscript completed. Building routing cache from CSV...", flush=True)
 
-    build_bus_impedance_cache(ctx, force_rebuild=True)
+    build_bus_impedance_cache(ctx, force_rebuild=True, transport_type=transport_type)
 
-    routing_payload = _build_routing_cache_from_r5r_csv(
-        routing_csv,
-        origin_id_to_coord=origin_id_to_coord,
-        destination_id_to_coord=destination_id_to_coord,
-        departure_iso=departure_iso,
-        origins_sig=origins_sig,
-        destinations_sig=destinations_sig,
-        bus_gamma=cfg.bus_gamma,
-    )
-    _save_routing_cache(routing_cache, routing_payload)
+    # Save a lightweight metadata pkl — actual impedances live in the .dat memmap.
+    # Materialising all routes in memory is prohibitive for large cities.
+    _save_routing_cache(routing_cache, {
+        "departure_iso": departure_iso,
+        "origins_sig": origins_sig,
+        "destinations_sig": destinations_sig,
+        "routes": {},
+    })
 
     return BusRoutingStageResult(
         routing_csv=routing_csv,

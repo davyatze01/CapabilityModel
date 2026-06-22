@@ -1,4 +1,5 @@
 import csv
+import gc
 import json
 import os
 from pathlib import Path
@@ -17,18 +18,23 @@ def load_impedance_bundle(
     if not os.path.isfile(path):
         return None
 
-    with np.load(path, allow_pickle=True) as z:
-        data = {k: z[k] for k in z.files}
-
-    node_ids = np.array(data["node_ids"]).astype(str)
-    bus_matrix = np.array(data["bus_impedance_matrix"], dtype=np.float32)
-    bus_dest_coords = np.array(data["bus_dest_coords"], dtype=np.float64)
-    blobs = np.array(data["non_bus_blobs"], dtype=object)
-
     cfg = ctx.config
     Path(cfg.non_bus_cache_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.bus_impedance_matrix_path).parent.mkdir(parents=True, exist_ok=True)
     Path(cfg.bus_source_id_to_row_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # ── Pass 1: load everything except blobs, write bus matrix, then free RAM ──
+    # Loading all npz keys at once (bus matrix + blobs) can exhaust RAM for large
+    # cities. We instead load scalars and the bus matrix first, flush them to disk,
+    # and only then load the blob array so peak RSS = max(bus_matrix, blobs) rather
+    # than bus_matrix + blobs.
+    with np.load(path, allow_pickle=True) as z:
+        node_ids = np.array(z["node_ids"]).astype(str)
+        bus_dest_coords = np.array(z["bus_dest_coords"], dtype=np.float64)
+        routing_departure_iso = str(np.array(z["routing_departure_iso"]).item())
+        origins_sig = str(np.array(z["origins_sig"]).item())
+        destinations_sig = str(np.array(z["destinations_sig"]).item())
+        bus_matrix = np.array(z["bus_impedance_matrix"], dtype=np.float32)
 
     source_id_to_row = {str(node_id): idx for idx, node_id in enumerate(node_ids.tolist())}
     with open(cfg.bus_source_id_to_row_path, "w", encoding="utf-8") as f:
@@ -43,6 +49,7 @@ def load_impedance_bundle(
         writer.writerow(["id", "lon", "lat"])
         for idx, (lat, lon) in enumerate(bus_dest_coords.tolist()):
             writer.writerow([f"d{idx}", float(lon), float(lat)])
+    del bus_dest_coords
 
     mat = np.memmap(
         cfg.bus_impedance_matrix_path,
@@ -59,20 +66,31 @@ def load_impedance_bundle(
         f"bus_impedance_zero={total_count - nonzero_count}",
         flush=True,
     )
+    del mat, bus_matrix
+    gc.collect()
 
+    # ── Pass 2: load blobs (now the only large allocation) and write pkl files ──
     cache_paths: dict[str, str] = {}
-    for idx, node_id in enumerate(node_ids.tolist()):
-        out_path = os.path.join(cfg.non_bus_cache_dir, f"{node_id}.pkl")
-        blob = blobs[idx]
-        if not isinstance(blob, (bytes, bytearray)):
-            raise ValueError(f"Invalid non_bus blob type at index {idx}: {type(blob)!r}")
-        with open(out_path, "wb") as f:
-            f.write(blob)
-        cache_paths[str(node_id)] = out_path
-
-    routing_departure_iso = str(np.array(data["routing_departure_iso"]).item())
-    origins_sig = str(np.array(data["origins_sig"]).item())
-    destinations_sig = str(np.array(data["destinations_sig"]).item())
+    schema_version_str = str(ctx.config.non_bus_cache_schema_version)
+    with np.load(path, allow_pickle=True) as z:
+        blobs = z["non_bus_blobs"]
+        node_ids_list = node_ids.tolist()
+        for idx, node_id in enumerate(node_ids_list):
+            out_path = os.path.join(cfg.non_bus_cache_dir, f"{node_id}.pkl")
+            blob = blobs[idx]
+            if not isinstance(blob, (bytes, bytearray)):
+                raise ValueError(f"Invalid non_bus blob type at index {idx}: {type(blob)!r}")
+            with open(out_path, "wb") as f:
+                f.write(blob)
+            # Write sidecar so _has_valid_non_bus_cache skips full unpickling.
+            try:
+                with open(out_path + ".v", "w") as fv:
+                    fv.write(schema_version_str)
+            except OSError:
+                pass
+            cache_paths[str(node_id)] = out_path
+        del blobs
+    gc.collect()
 
     bus = BusRoutingStageResult(
         routing_csv=cfg.bus_routing_matrix_path,

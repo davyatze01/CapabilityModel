@@ -1,0 +1,264 @@
+\section{Object content}
+
+The object model is organised around a three-level domain hierarchy:
+\emph{POI types} are aggregated into \emph{services}, and services are
+aggregated into \emph{capabilities}. All spatial results are evaluated for an
+origin transport-network node located within the study area. A POI may have
+more than one network access point when its geometry is linear or polygonal.
+
+\subsection*{Input objects}
+\begin{enumerate}
+    \item \textbf{Boundary of extraction.}
+    The boundary object defines the spatial extent associated with an analysis
+    run. Its mandatory fields are a polygon or multipolygon geometry and its
+    coordinate reference system. It also carries a stable boundary identifier,
+    a human-readable area name, and any source attributes required to identify
+    the represented administrative or analytical unit. The boundary geometry
+    determines the area in which origin transport-network nodes are evaluated.
+    The POI extraction extent is currently coincident with this geometry; a
+    separate buffered extraction geometry is specified by the cut-off threshold
+    object described below.
+
+    \item \textbf{POI shapefile collection.}
+    The POI input is a collection of point, line, and polygon feature sets that
+    share one logical POI schema. Each POI record contains:
+    \begin{itemize}
+        \item a source identity composed of an element category and a source
+        identifier;
+        \item a geometry and coordinate reference system;
+        \item a POI classification label used to associate the record with a
+        configured POI type;
+        \item a tag family identifying the principal classification attribute;
+        \item optional descriptive attributes, including name, address,
+        operator, opening hours, accessibility attributes, and source-specific
+        thematic tags.
+    \end{itemize}
+    Point geometries represent one candidate location. Line and polygon
+    geometries represent spatially extended POIs and therefore admit multiple
+    candidate access locations along their vertices and boundaries. The POI
+    classification label is matched against the labels declared by the POI type
+    configuration.
+
+    \item \textbf{GTFS feed.}
+    The GTFS object is a relational public-transport timetable dataset. Its
+    principal entities and relations are:
+    \begin{itemize}
+        \item \emph{agency}: operator identity, name, timezone, language, and
+        contact information;
+        \item \emph{stop}: stop identifier, name, longitude, latitude, location
+        type, parent station, and accessibility attributes;
+        \item \emph{route}: route identifier, agency reference, route names,
+        transport type, and display attributes;
+        \item \emph{trip}: trip identifier, route reference, service-calendar
+        reference, direction, headsign, shape reference, and accessibility
+        attributes;
+        \item \emph{stop time}: trip reference, stop reference, stop sequence,
+        arrival time, departure time, and boarding or alighting constraints;
+        \item \emph{calendar} and \emph{calendar exception}: service identifier,
+        active weekdays, validity interval, and date-specific additions or
+        removals;
+        \item \emph{shape}: shape identifier and an ordered sequence of
+        geographic points describing a trip path.
+    \end{itemize}
+    Optional feed entities include transfers, pathways, fares, booking rules,
+    and feed metadata. The trip, stop-time, calendar, and stop relations jointly
+    define which public-transport connections are available at the configured
+    departure date and time.
+\end{enumerate}
+
+\subsection*{Configuration objects}
+\begin{enumerate}
+    \item \textbf{General configuration.}
+    The general configuration identifies one analysis run and binds its spatial,
+    transport, temporal, and visualisation objects. Its fields are grouped as
+    follows:
+    \begin{itemize}
+        \item \emph{study-area identity}: study-city key, city name, city slug,
+        analysis-run identifier, boundary-selection flag, and boundary
+        reference;
+        \item \emph{POI source selection}: source type and references to the
+        point, line, and polygon POI collections;
+        \item \emph{transport scope}: the walking, cycling, driving, and public
+        transport modes; the GTFS feed references; the public-transport
+        departure date and time; and the coefficient controlling the relative
+        contribution of in-vehicle time to public-transport impedance;
+        \item \emph{evaluation scope}: optional limits on the set of origin
+        nodes and POIs included in the analysis;
+        \item \emph{visualisation specification}: selected capability field,
+        classification count, colour ramp, point and grid layer settings, grid
+        cell size, grid opacity, and maximum grid-cell count.
+    \end{itemize}
+
+    \item \textbf{POI types configuration.}
+    Each POI type configuration record defines one conceptual class of
+    destination. Its fields are:
+    \begin{itemize}
+        \item \texttt{poi\_type}: unique POI type identifier;
+        \item \texttt{decay\_coefficient}: impedance value, in minutes, at
+        which access to the POI type has a decay value of \(0.5\);
+        \item \texttt{choquet\_interactions}: ordered interaction coefficients
+        between this POI type and the other POI types belonging to the same
+        service; the self-interaction position is null;
+        \item \texttt{tags}: one conjunctive tag clause or a disjunction of tag
+        clauses used to classify source POIs;
+        \item \texttt{labels}: accepted source labels used to classify POIs
+        supplied as shapefile records.
+    \end{itemize}
+    The interaction-vector order is defined by the ordered POI type list of the
+    associated service.
+
+    \item \textbf{Service configuration.}
+    Each service configuration record defines an ordered aggregation of POI
+    types. Its fields are:
+    \begin{itemize}
+        \item \texttt{service}: unique service identifier;
+        \item \texttt{poi\_types}: ordered list of constituent POI type
+        identifiers;
+        \item \texttt{choquet\_capacity}: ordered singleton capacities
+        associated with the constituent POI types;
+        \item \texttt{contribution\_coefficient}: ordered coefficients
+        controlling how repeated accessible instances of each POI type
+        contribute to its accessibility value.
+    \end{itemize}
+    The three ordered arrays have equal cardinality. A service record is valid
+    only when every referenced POI type exists in the POI type configuration.
+
+    \item \textbf{Capability configuration.}
+    Each capability configuration record defines an ordered aggregation of
+    services. Its fields are:
+    \begin{itemize}
+        \item \texttt{capability}: unique capability identifier;
+        \item \texttt{services}: ordered list of constituent service
+        identifiers;
+        \item \texttt{electre\_weight}: ordered service-weight vector aligned
+        with the service list;
+        \item \texttt{enabled}: Boolean indicating whether the capability is
+        included in the result set.
+    \end{itemize}
+    The configured capability set comprises restorativeness, nutrition, and
+    care. Every referenced service must exist in the service configuration.
+\end{enumerate}
+
+\subsection*{Intermediate objects}
+\begin{enumerate}
+    \item \textbf{Impedance matrix.}
+    The impedance object relates origin transport-network nodes to candidate POI
+    access locations. Its origin dimension contains the origin node identifier
+    and coordinates. Its destination dimension contains a destination access
+    identifier, snapped access coordinates, and the associated POI type. For
+    each origin--destination pair, the object may contain walking, cycling,
+    driving, and public-transport impedance values expressed in minutes or an
+    explicit unreachable value.
+
+    Walking, cycling, and driving values are aligned vectors: position \(i\) in
+    each modal vector refers to the same candidate POI access location. Walking
+    impedance is associated with the walkability score of the selected walking
+    path. Public-transport impedance is represented as an origin-by-destination
+    matrix and is accompanied by origin and destination index mappings. The
+    impedance object also carries the departure timestamp and signatures of the
+    ordered origin and destination sets so that the represented routing problem
+    is unambiguous.
+
+    \item \textbf{Cut-off threshold and POI extraction buffer.}
+    This is a required derived object that is not yet represented independently
+    in the current object set. It separates the analysis boundary from the
+    larger area from which potentially relevant POIs and routing destinations
+    are selected. Its fields shall be:
+    \begin{itemize}
+        \item a minimum relevant decay value \(d_{\min}\), with
+        \(0 < d_{\min} < 1\);
+        \item the POI-type-specific maximum relevant impedance
+        \(I_{\max,p}=-\ln(d_{\min})c_p/\ln(2)\), where \(c_p\) is the configured
+        decay coefficient of POI type \(p\);
+        \item the mode-specific maximum relevant distance derived from each
+        maximum impedance and the corresponding modal travel relation;
+        \item the conservative extraction-buffer distance selected from the
+        mode- and POI-type-specific limits;
+        \item the source boundary geometry and the resulting buffered extraction
+        geometry;
+        \item the set of POI types and modes covered by the threshold.
+    \end{itemize}
+    The resulting buffered geometry is the spatial selection object for POIs,
+    while origin nodes remain associated with the unbuffered analysis boundary.
+
+    \item \textbf{Bus routing result.}
+    A bus routing result represents the selected public-transport connection for
+    one origin and one destination access location at a specified departure
+    time. A route record contains the origin identifier, destination identifier,
+    departure time, access time, waiting time, in-vehicle time, transfer time,
+    egress time, route sequence, number of rides, and total time. The associated
+    impedance record contains travel time excluding waiting, waiting time,
+    weighted impedance, and the route sequence. The result set carries the
+    departure timestamp and ordered-origin and ordered-destination signatures.
+
+    \item \textbf{Walking, cycling, and driving routing results.}
+    A non-public-transport routing result is defined for one origin node and one
+    POI type. It contains the origin coordinates, an ordered list of candidate
+    POI coordinates, and three equally aligned impedance vectors for walking,
+    cycling, and driving. An entry is null when the corresponding candidate is
+    unreachable by that mode. The object additionally contains the path-level
+    walkability score aligned with each walking impedance. Results are grouped
+    by service while retaining the POI type identifier of every entry.
+
+    \item \textbf{Walkability scores for edges.}
+    The edge walkability object is a relation from a directed network-edge
+    identifier \((u,v,k)\) to a walkability score in the interval from \(1\) to
+    \(5\). It contains a graph identity specifying the network snapshot to which
+    the scores apply. A path walkability value is a length-weighted aggregation
+    of the edge scores belonging to that path. Each edge score is conceptually
+    associated with observations at the start, midpoint, and end of the edge.
+
+    \item \textbf{Accessibility results.}
+    An accessibility result is defined for one origin node. Its fields are the
+    node identifier, latitude, longitude, and a mapping from each service to an
+    ordered collection of POI-type accessibility records. Each POI-type record
+    contains a POI type identifier and an accessibility value in \([0,1]\).
+
+    For each candidate POI access location, the four modal impedance values are
+    transformed into modal decay values and combined into one multimodal
+    route-resource-availability value. The ordered collection of candidate
+    values for a POI type is then reduced to the POI-type accessibility value.
+    The result preserves service membership without yet aggregating the POI
+    types into a service score.
+
+    \item \textbf{Service results.}
+    A service result is defined for one origin node. Its fields are the node
+    identifier, latitude, longitude, and a mapping from every configured service
+    identifier to one normalized service score in \([0,1]\). Each score
+    aggregates the accessibility values of the ordered POI types declared by
+    that service, using the associated singleton capacities and pairwise
+    interactions.
+\end{enumerate}
+
+\subsection*{Output objects}
+\begin{enumerate}
+    \item \textcolor{blue}{\textbf{Capability results.}}
+    A capability result is defined for one origin node and one enabled
+    capability. Its fields are the node identifier, latitude, longitude, the
+    normalized capability score in \([0,1]\), and the complete set of service
+    scores that constitute that capability. The service-score fields retain the
+    service identifiers, allowing each capability value to be decomposed into
+    its direct service components.
+
+    A run-level capability summary contains the study-city identifier,
+    analysis-run identifier, and the mean score of each capability over all
+    evaluated origin nodes.
+
+    \item \textbf{Visualisation map.}
+    The visualisation map is a spatial object composed of two related layers:
+    \begin{itemize}
+        \item the \emph{capability point layer}, containing one point per
+        evaluated origin node, with node identifier, longitude, latitude, point
+        geometry, and one field for each available capability result;
+        \item the \emph{capability grid layer}, containing regular hexagonal
+        cell geometry, column and row indices, the mean of each capability over
+        the nodes contained by the cell, a selected display mean, a data-
+        availability indicator, the selected capability field, and the cell's
+        metric dimensions.
+    \end{itemize}
+    The map specification associates the spatial layers with the selected
+    capability field, classification count, colour ramp, opacity, and optional
+    basemap reference.
+
+    \item \textcolor{blue}{provenance interface}
+\end{enumerate}

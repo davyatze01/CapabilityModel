@@ -12,6 +12,11 @@ dest_path <- Sys.getenv("R5_DEST_PATH", unset = "outputs/r5r_dest.csv")
 output_path <- Sys.getenv("R5_OUTPUT_PATH", unset = "outputs/r5r_expanded_travel_time_matrix.csv")
 chunk_dir <- Sys.getenv("R5_CHUNK_DIR", unset = "outputs/r5r_chunks")
 departure_dt_text <- Sys.getenv("R5_DEPARTURE_DATETIME", unset = "2025-10-15 12:00:00")
+dest_chunk_size_text <- Sys.getenv("R5_DEST_CHUNK_SIZE", unset = "4000")
+dest_chunk_size <- as.integer(dest_chunk_size_text)
+if (is.na(dest_chunk_size) || dest_chunk_size <= 0) {
+  dest_chunk_size <- 4000L
+}
 
 origins <- fread(
   origin_path,
@@ -69,6 +74,38 @@ process_chunk <- function(origins_chunk, chunk_index, n_chunks, chunk_path) {
 
 }
 
+process_origin_dest_chunk <- function(origins_chunk, destinations_chunk, chunk_label, chunk_path) {
+  cat(sprintf(
+    "\nProcessing %s with %d origins and %d destinations\n",
+    chunk_label, nrow(origins_chunk), nrow(destinations_chunk)
+  ))
+
+  ettm <- expanded_travel_time_matrix(
+      r5r_network = r5r_network,
+      origins = origins_chunk,
+      destinations = destinations_chunk,
+      mode = mode,
+      departure_datetime = departure_datetime,
+      time_window = 60,
+      breakdown = TRUE,
+      max_walk_time = 30,
+      max_trip_duration = max_trip_duration,
+      progress = TRUE,
+      verbose = FALSE
+  )
+  ettm[, from_id := as.character(from_id)]
+  ettm[, to_id := as.character(to_id)]
+  setorder(ettm, from_id, to_id, total_time, wait_time, departure_time)
+  best_ettm <- ettm[, .SD[1], by = .(from_id, to_id)]
+
+  fwrite(best_ettm, chunk_path)
+
+  rm(ettm, best_ettm)
+  gc()
+
+  chunk_path
+}
+
 n_origins <- nrow(origins)
 if (n_origins == 0) {
   stop("No origins found.")
@@ -76,11 +113,13 @@ if (n_origins == 0) {
 
 chunk_size <- 200L
 n_chunks <- ceiling(n_origins / chunk_size)
+destination_chunk_size <- min(dest_chunk_size, 5000L)
+n_destination_chunks <- ceiling(nrow(destinations) / destination_chunk_size)
 
 dir.create(chunk_dir, recursive = TRUE, showWarnings = FALSE)
 stale_chunk_files <- list.files(
   chunk_dir,
-  pattern = "^chunk_[0-9]{3}\\.csv$",
+  pattern = "^chunk_[0-9]{3}(_[0-9]{3})?\\.csv$",
   full.names = TRUE
 )
 if (length(stale_chunk_files) > 0) {
@@ -108,11 +147,30 @@ for (chunk_index in seq_len(n_chunks)) {
   if (start_idx > n_origins) {
     next
   }
-  chunk_path <- file.path(chunk_dir, sprintf("chunk_%03d.csv", chunk_index))
 
   origins_chunk <- origins[start_idx:end_idx]
-  chunk_path <- process_chunk(origins_chunk, chunk_index, n_chunks, chunk_path)
-  chunk_files <- c(chunk_files, chunk_path)
+
+  for (dest_chunk_index in seq_len(n_destination_chunks)) {
+    dest_start_idx <- ((dest_chunk_index - 1) * destination_chunk_size) + 1
+    dest_end_idx <- min(dest_chunk_index * destination_chunk_size, nrow(destinations))
+
+    if (dest_start_idx > nrow(destinations)) {
+      next
+    }
+
+    destinations_chunk <- destinations[dest_start_idx:dest_end_idx]
+    chunk_path <- file.path(
+      chunk_dir,
+      sprintf("chunk_%03d_%03d.csv", chunk_index, dest_chunk_index)
+    )
+    chunk_path <- process_origin_dest_chunk(
+      origins_chunk,
+      destinations_chunk,
+      sprintf("origin chunk %d/%d, destination chunk %d/%d", chunk_index, n_chunks, dest_chunk_index, n_destination_chunks),
+      chunk_path
+    )
+    chunk_files <- c(chunk_files, chunk_path)
+  }
 }
 
 all_chunks <- lapply(

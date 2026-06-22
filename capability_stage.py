@@ -3,6 +3,8 @@ import os
 import shutil
 from tqdm import tqdm
 
+tqdm.monitor_interval = 0  # disable background monitor thread (avoids Windows AV noise)
+
 from context import PipelineContext
 from pipeline_types import ServiceStageResult, CapabilityStageResult
 from utils import capabilities as cap
@@ -22,7 +24,7 @@ def _ensure_unique_path(path: str) -> str:
 
 
 def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> CapabilityStageResult:
-    """Aggregate service scores into capability scores and write capability CSV outputs.
+    """Aggregate service scores into capability scores and write a single capability CSV.
 
     Inputs:
     - ctx: pipeline context with capability-service mapping and output paths.
@@ -31,34 +33,31 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
     Outputs:
     - CapabilityStageResult: written output paths and number of processed rows.
     """
-    output_paths = ctx.output_paths
+    # Build a deduplicated ordered list of all services across all capabilities.
+    all_services: list[str] = []
+    seen_services: set[str] = set()
+    for services in cap.CAPABILITY_SERVICES.values():
+        for s in services:
+            if s not in seen_services:
+                seen_services.add(s)
+                all_services.append(s)
+
+    output_path = ctx.output_paths["capabilities"]
     rows_written = 0
     rest_sum = 0.0
     nut_sum = 0.0
     care_sum = 0.0
 
-    with (
-        open(output_paths["restorativeness"], "w", newline="", encoding="utf-8") as f_rest,
-        open(output_paths["nutrition"], "w", newline="", encoding="utf-8") as f_nut,
-        open(output_paths["care"], "w", newline="", encoding="utf-8") as f_care,
-    ):
-        writer_rest = csv.writer(f_rest)
-        writer_nut = csv.writer(f_nut)
-        writer_care = csv.writer(f_care)
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        header = [
+            "node_id", "lat", "lon",
+            "capability_restorativeness", "capability_nutrition", "capability_care",
+        ]
+        header.extend(f"service_{s}" for s in all_services)
+        writer.writerow(header)
 
-        header_rest = ["node_id", "lat", "lon", "capability_restorativeness"]
-        header_rest.extend([f"service_{service}" for service in ctx.rest_services])
-        writer_rest.writerow(header_rest)
-
-        header_nut = ["node_id", "lat", "lon", "capability_nutrition"]
-        header_nut.extend([f"service_{service}" for service in ctx.nut_services])
-        writer_nut.writerow(header_nut)
-
-        header_care = ["node_id", "lat", "lon", "capability_care"]
-        header_care.extend([f"service_{service}" for service in ctx.care_services])
-        writer_care.writerow(header_care)
-
-        pbar = tqdm(total=len(svc.node_results), desc="Capability stage", mininterval=0) if ctx.config.enable_progress else None
+        pbar = tqdm(total=len(svc.node_results), desc="Capability stage", mininterval=1) if ctx.config.enable_progress else None
         try:
             for node in svc.node_results:
                 scores = node.service_scores
@@ -67,26 +66,17 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
                 nut_vals = [scores[s] for s in cap.CAP_NUTRITION_IDX]
                 care_vals = [scores[s] for s in cap.CAP_CARE_IDX]
 
-                capability_rest = cap.electre_iii_integration(rest_vals, "restorativeness") if rest_vals else 0.0
-                capability_nut = cap.electre_iii_integration(nut_vals, "nutrition") if nut_vals else 0.0
-                capability_care = cap.electre_iii_integration(care_vals, "care") if care_vals else 0.0
+                capability_rest = cap.electre_tri_integration(rest_vals, "restorativeness") if rest_vals else 0.0
+                capability_nut = cap.electre_tri_integration(nut_vals, "nutrition") if nut_vals else 0.0
+                capability_care = cap.electre_tri_integration(care_vals, "care") if care_vals else 0.0
 
-                row_rest = [node.node_id, node.lat, node.lon, capability_rest]
-                row_rest.extend(scores[s] for s in ctx.rest_services)
-                writer_rest.writerow(row_rest)
-
-                row_nut = [node.node_id, node.lat, node.lon, capability_nut]
-                row_nut.extend(scores[s] for s in ctx.nut_services)
-                writer_nut.writerow(row_nut)
-
-                row_care = [node.node_id, node.lat, node.lon, capability_care]
-                row_care.extend(scores[s] for s in ctx.care_services)
-                writer_care.writerow(row_care)
+                row = [node.node_id, node.lat, node.lon, capability_rest, capability_nut, capability_care]
+                row.extend(scores.get(s, 0.0) for s in all_services)
+                writer.writerow(row)
 
                 rest_sum += capability_rest
                 nut_sum += capability_nut
                 care_sum += capability_care
-                
                 rows_written += 1
                 if pbar:
                     pbar.update(1)
@@ -101,13 +91,11 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
     experiments_dir = "experiments"
     os.makedirs(experiments_dir, exist_ok=True)
 
-    moved_output_paths = {}
-    for capability_key, src_path in output_paths.items():
-        basename = os.path.basename(src_path)
-        dst_path = os.path.join(experiments_dir, f"{ctx.config.artifact_slug}_{basename}")
-        dst_path = _ensure_unique_path(dst_path)
-        shutil.move(src_path, dst_path)
-        moved_output_paths[capability_key] = dst_path
+    basename = os.path.basename(output_path)
+    dst_path = os.path.join(experiments_dir, f"{ctx.config.artifact_slug}_{basename}")
+    dst_path = _ensure_unique_path(dst_path)
+    shutil.move(output_path, dst_path)
+    moved_output_paths = {"capabilities": dst_path}
 
     recap_path = os.path.join(experiments_dir, "capability_experiments_recap.csv")
     recap_header = [

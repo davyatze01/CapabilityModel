@@ -443,6 +443,28 @@ def get_decay_coefficient(poi_type: str) -> float:
     return POI_DECAY_COEFFICIENTS[poi_type]
 
 
+def get_global_radius_m(cfg) -> float | None:
+    """Return the single global POI radius used for all filtering.
+
+    Computed from the highest decay coefficient across all POI types, which gives
+    the largest effective radius and conservatively covers every type.
+    Returns None when radius filtering is disabled.
+
+    Inputs:
+    - cfg: PipelineConfig instance.
+
+    Outputs:
+    - float radius in metres, or None when disabled.
+    """
+    if not cfg.poi_radius_enabled:
+        return None
+    if cfg.poi_radius_m is not None:
+        return float(cfg.poi_radius_m)
+    from utils.decay import threshold_radius_m
+    max_coeff = max(POI_DECAY_COEFFICIENTS.values())
+    return threshold_radius_m(max_coeff, cfg.poi_radius_decay_threshold, cfg.poi_radius_max_speed_kmh)
+
+
 def get_contribution_coefficient(poi_type: str, service: str | None = None) -> float:
     """Return contribution coefficient for a POI type, optionally scoped by service.
 

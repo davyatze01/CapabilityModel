@@ -15,6 +15,8 @@ from utils import graphml, services as serv, delta_g
 from osmnx.distance import nearest_nodes
 import numpy as np
 
+_SNAP_CACHE_SCHEMA_VERSION = 2
+
 # Computes the haversine distance in meters between two points (lat1, lon1) and (lat2, lon2)
 def _haversine_m(lat1, lon1, lat2, lon2):
     """Compute great-circle distance between two coordinates in meters.
@@ -150,9 +152,27 @@ def _normalize_cached_snap_entries(cached):
         if not isinstance(coord_raw, (list, tuple)) or len(coord_raw) < 2:
             continue
         coord = (float(coord_raw[0]), float(coord_raw[1]))
+        source_key = None
         candidates = []
         second = item[1]
-        if (
+        third = item[2] if len(item) >= 3 else None
+        if len(item) >= 3 and isinstance(second, str):
+            source_key = second
+            candidates_raw = third
+            if not isinstance(candidates_raw, list):
+                continue
+            for cand in candidates_raw:
+                if not isinstance(cand, (list, tuple)) or len(cand) < 2:
+                    continue
+                snapped = cand[0]
+                if not isinstance(snapped, (list, tuple)) or len(snapped) < 2:
+                    continue
+                try:
+                    snap_dist_m = float(cand[1])
+                except Exception:
+                    snap_dist_m = _haversine_m(coord[0], coord[1], snapped[0], snapped[1])
+                candidates.append(((snapped[0], snapped[1]), snap_dist_m))
+        elif (
             isinstance(second, list)
             and second
             and isinstance(second[0], (list, tuple))
@@ -171,7 +191,7 @@ def _normalize_cached_snap_entries(cached):
                     snap_dist_m = _haversine_m(coord[0], coord[1], snapped[0], snapped[1])
                 candidates.append(((snapped[0], snapped[1]), snap_dist_m))
         else:
-            snapped = second
+            snapped = third if isinstance(second, str) else second
             if not isinstance(snapped, (list, tuple)) or len(snapped) < 2:
                 continue
             if len(item) >= 3 and isinstance(item[2], (int, float)):
@@ -187,7 +207,7 @@ def _normalize_cached_snap_entries(cached):
             prev = deduped.get(key)
             if prev is None or snap_dist_m < prev[1]:
                 deduped[key] = (snapped_coord, float(snap_dist_m))
-        normalized.append((coord, list(deduped.values())))
+        normalized.append((coord, source_key, list(deduped.values())))
     return normalized
 
 
@@ -227,7 +247,7 @@ def _poi_snap_cache_path(cache_dir, poi_key, cache_ns):
     - str: cache file path.
     """
     os.makedirs(cache_dir, exist_ok=True)
-    key_repr = f"{cache_ns}|{repr(poi_key)}"
+    key_repr = f"v{_SNAP_CACHE_SCHEMA_VERSION}|{cache_ns}|{repr(poi_key)}"
     key_hash = hashlib.sha1(key_repr.encode("utf-8")).hexdigest()
     return os.path.join(cache_dir, f"{key_hash}.pkl")
 
@@ -286,7 +306,7 @@ def _build_poi_snap_map(graph, query_by_key, enable_progress, cache_dir, cache_n
     - seed: random seed used for debug sampling.
 
     Outputs:
-    - dict: POI key -> list of source coords and candidate snapped coords.
+    - dict: POI key -> list of source coords, source keys, and candidate snapped coords.
     """
     poi_snap_map = {}
     rng = random.Random(seed)
@@ -308,7 +328,7 @@ def _build_poi_snap_map(graph, query_by_key, enable_progress, cache_dir, cache_n
         coords = []
         geom_vertices_list = []
         for item in geometries:
-            geom, _poi_name = delta_g._extract_geom_and_name(item)
+            geom, _poi_name, source_key = item
             if not delta_g._is_geometry(geom):
                 continue
             try:
@@ -324,19 +344,20 @@ def _build_poi_snap_map(graph, query_by_key, enable_progress, cache_dir, cache_n
                     coord = geom_vertices[0]
             except Exception:
                 continue
-            coords.append(coord)
+            coords.append((coord, source_key))
             geom_vertices_list.append(geom_vertices)
         if max_pois is not None and len(coords) > max_pois:
             idx = rng.sample(range(len(coords)), max_pois)
             coords = [coords[i] for i in idx]
             geom_vertices_list = [geom_vertices_list[i] for i in idx]
         pending_coords[poi_key] = coords
-        for idx, coord in enumerate(coords):
+        for idx, coord_item in enumerate(coords):
+            coord, source_key = coord_item
             coord_k = _coord_key(coord)
             if geom_vertices_list and idx < len(geom_vertices_list):
                 vertices = geom_vertices_list[idx]
                 if vertices:
-                    geom_vertex_map[(poi_key, coord_k)] = vertices
+                    geom_vertex_map[(poi_key, coord_k)] = (vertices, source_key)
                     point_coords.extend(vertices)
                     continue
             point_coords.append(coord)
@@ -346,9 +367,12 @@ def _build_poi_snap_map(graph, query_by_key, enable_progress, cache_dir, cache_n
 
     for poi_key, coords in pending_coords.items():
         snapped_list = []
-        for coord in coords:
+        for coord, source_key in coords:
             coord_k = _coord_key(coord)
-            geom_vertices = geom_vertex_map.get((poi_key, coord_k))
+            geom_vertices_item = geom_vertex_map.get((poi_key, coord_k))
+            geom_vertices = None
+            if geom_vertices_item is not None:
+                geom_vertices, source_key = geom_vertices_item
             if geom_vertices:
                 candidates = []
                 for vertex in geom_vertices:
@@ -372,7 +396,7 @@ def _build_poi_snap_map(graph, query_by_key, enable_progress, cache_dir, cache_n
                 prev = deduped.get(k)
                 if prev is None or snap_dist_m < prev[1]:
                     deduped[k] = (snapped_coord, snap_dist_m)
-            snapped_list.append((coord, list(deduped.values())))
+            snapped_list.append((coord, source_key, list(deduped.values())))
         poi_snap_map[poi_key] = snapped_list
         _save_poi_snap_cache(cache_dir, poi_key, snapped_list, cache_ns)
 
@@ -391,7 +415,7 @@ def _snap_map_to_info(poi_snap_map):
     - poi_snap_map: normalized snap map payload.
 
     Outputs:
-    - dict: POI key -> `{source_coord_key: [(snapped_coord, dist_m), ...]}`.
+    - dict: POI key -> `{source_key: {"source_coord": coord, "candidates": [...]}}`.
     """
     poi_snap_info_by_type = {}
     for poi_key, snapped_list in poi_snap_map.items():
@@ -400,7 +424,12 @@ def _snap_map_to_info(poi_snap_map):
             if not isinstance(item, (list, tuple)) or len(item) < 2:
                 continue
             coord = item[0]
-            candidates = item[1]
+            if len(item) >= 3 and isinstance(item[1], str):
+                source_key = item[1]
+                candidates = item[2]
+            else:
+                source_key = _coord_key(coord)
+                candidates = item[1]
             if not isinstance(candidates, list):
                 continue
             normalized_candidates = []
@@ -411,7 +440,11 @@ def _snap_map_to_info(poi_snap_map):
                 snap_dist_m = float(cand[1])
                 normalized_candidates.append((snapped, snap_dist_m))
             if normalized_candidates:
-                info[_coord_key(coord)] = normalized_candidates
+                info[source_key] = {
+                    "source_coord": coord,
+                    "source_key": source_key,
+                    "candidates": normalized_candidates,
+                }
         poi_snap_info_by_type[poi_key] = info
     return poi_snap_info_by_type
 
@@ -429,6 +462,8 @@ def _select_best_snap_candidate_for_origin(origin, coord, snap_info):
     Outputs:
     - tuple: `(selected_snapped_coord, selected_snap_distance_m)`.
     """
+    if snap_info and isinstance(snap_info, dict):
+        snap_info = snap_info.get("candidates")
     if snap_info and isinstance(snap_info, list):
         best_cand = None
         for cand in snap_info:
@@ -464,12 +499,17 @@ def _build_selected_routing_destinations(nodes_with_coords, poi_bus_snap_info_by
     multi_candidate_items = []
 
     for snap_info_for_key in poi_bus_snap_info_by_type.values():
-        for coord_k, snap_info in snap_info_for_key.items():
-            coord = (float(coord_k[0]), float(coord_k[1]))
-            if isinstance(snap_info, list) and len(snap_info) > 1:
-                multi_candidate_items.append((coord, snap_info))
+        for source_key, snap_info in snap_info_for_key.items():
+            if isinstance(snap_info, dict):
+                coord = tuple(snap_info.get("source_coord", (0.0, 0.0)))
+                candidates = snap_info.get("candidates")
+            else:
+                coord = (0.0, 0.0)
+                candidates = snap_info
+            if isinstance(candidates, list) and len(candidates) > 1:
+                multi_candidate_items.append((coord, candidates))
                 continue
-            snapped_coord, _ = _select_best_snap_candidate_for_origin(coord, coord, snap_info)
+            snapped_coord, _ = _select_best_snap_candidate_for_origin(coord, coord, candidates)
             single_candidate_selected.add(snapped_coord)
 
     total_pairs = len(multi_candidate_items) * len(nodes_with_coords)
@@ -496,6 +536,43 @@ def _build_selected_routing_destinations(nodes_with_coords, poi_bus_snap_info_by
     return sorted(selected)
 
 
+def _filter_snap_map_by_radius(snap_map, poi_type_for_key, origin_coords, cfg):
+    """Remove snap entries whose source coordinate is outside the global radius of all origins.
+
+    Uses a single radius derived from the highest decay coefficient across all POI types.
+
+    Inputs:
+    - snap_map: dict poi_key -> list of (source_coord, candidates).
+    - poi_type_for_key: dict poi_key -> poi_type string (used only for the print label).
+    - origin_coords: list of (lat, lon) origin points.
+    - cfg: PipelineConfig with radius settings.
+
+    Outputs:
+    - Filtered snap_map with the same structure.
+    """
+    radius_m = serv.get_global_radius_m(cfg)
+    if radius_m is None or not origin_coords:
+        return snap_map
+
+    filtered = {}
+    for poi_key, snap_entries in snap_map.items():
+        kept = [
+            entry for entry in snap_entries
+            if any(
+                _haversine_m(entry[0][0], entry[0][1], o[0], o[1]) <= radius_m
+                for o in origin_coords
+            )
+        ]
+        filtered[poi_key] = kept
+        if len(snap_entries) != len(kept):
+            poi_type = poi_type_for_key.get(poi_key, poi_key)
+            print(
+                f"[Snap] {poi_type:<35}  kept={len(kept)}/{len(snap_entries)} POIs within radius={radius_m/1000:.1f} km",
+                flush=True,
+            )
+    return filtered
+
+
 def run_snapping_stage(ctx: PipelineContext) -> SnappingStageResult:
     """Run snapping stage for walk/bike/drive and derive bus snap candidates.
 
@@ -509,6 +586,8 @@ def run_snapping_stage(ctx: PipelineContext) -> SnappingStageResult:
     cfg = ctx.config
     unique_queries = serv.unique_query_keys()
     query_by_key = {serv.query_key(q): q for q in unique_queries}
+    poi_type_for_key = {serv.query_key(q): q.poi_type for q in unique_queries}
+    origin_coords = [(data["y"], data["x"]) for _, data in ctx.nodes_with_coords]
 
     # For each mode, gets the corresponding graph
     shared_mode_graphs = {
@@ -530,6 +609,7 @@ def run_snapping_stage(ctx: PipelineContext) -> SnappingStageResult:
             max_pois=cfg.debug_max_pois,
             seed=cfg.seed,
         )
+        mode_snap_map = _filter_snap_map_by_radius(mode_snap_map, poi_type_for_key, origin_coords, cfg)
         mode_snap_info = _snap_map_to_info(mode_snap_map)
         for poi_key, info in mode_snap_info.items():
             poi_mode_snap_info_by_type.setdefault(poi_key, {})[mode] = info
