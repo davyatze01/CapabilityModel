@@ -169,4 +169,3 @@ if __name__ == "__main__":
     except BaseException:
         traceback.print_exc()
         sys.exit(1)
-auroauuasadm.mo
