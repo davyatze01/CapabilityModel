@@ -14,10 +14,10 @@ study_city = "cagliari"
 # SAFE_MODE: gentle execution to avoid pinning the machine at full load — caps native math
 #   library threads to 1 per process, halves the worker count to ~physical_cores//2, and runs
 #   workers at below-normal priority. Results are identical; only scheduling changes.
-SAFE_MODE = True
+SAFE_MODE = False
 # WORKER_COUNT: force the number of pool workers. None = automatic (memory/CPU derived, then
 #   the safe-mode cap if SAFE_MODE). Set to 1 for a single-process "survival" run.
-WORKER_COUNT = 1
+WORKER_COUNT = None
 
 
 def main():

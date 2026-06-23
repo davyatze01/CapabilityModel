@@ -118,7 +118,7 @@ class PipelineConfig:
     # priority. Pools already recycle workers (maxtasksperchild). Reduces sustained CPU/power
     # load without changing results.
     safe_mode: bool = field(init=False)
-    skip_routing: bool = True
+    skip_routing: bool = False
     accessibility_chunksize: int = 100
     accessibility_deduplicate_entries: bool = True
     artifacts_root_dir: str = "artifacts"
