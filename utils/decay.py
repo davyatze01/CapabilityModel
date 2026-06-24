@@ -45,7 +45,7 @@ def calculate_rra(decay_walk,decay_bike,decay_drive,decay_bus):
     """
     all_decay = [decay_walk,decay_bike,decay_drive,decay_bus]
     all_decay.sort(reverse=True)
-    lambdas = [1,1,1,1]
+    lambdas = [1, 1/2, 1/3, 1/4]
     weighted_decay = []
     for i in range(len(all_decay)):
         weighted_decay.append(all_decay[i] * lambdas[i])
