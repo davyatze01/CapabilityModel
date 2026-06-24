@@ -1,0 +1,18 @@
+[Unit]
+Description=Offline faulty CPU core 24 (logical CPUs 12,13)
+# Hardware workaround: physical core 24 (logical CPUs 12 & 13) produces memory/register
+# corruption under load — every observed segfault was logged by the kernel on this core,
+# and the board has no ECC memory. Offlining keeps all work off it. The real fix is to
+# repair/replace the hardware.
+After=multi-user.target
+# Re-apply after waking, since resume re-onlines CPUs.
+After=suspend.target hibernate.target hybrid-sleep.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/chcpu -d 12,13
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=suspend.target hibernate.target hybrid-sleep.target

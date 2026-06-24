@@ -1,8 +1,8 @@
 # Core pipeline runtime
-numpy>=1.26,<3.0
-scipy>=1.11,<2.0
+numpy>=1.26,<2.3
+scipy>=1.11,<1.15
 pandas>=2.2,<3.0
-networkx>=3.2,<4.0
+networkx>=3.2,<3.4
 osmnx>=1.9,<2.0
 # lxml enables networkx's incremental (streaming) GraphML writer. Without it, save_graphml
 # falls back to a pure-Python ElementTree path that builds the whole graph in memory and
@@ -10,13 +10,18 @@ osmnx>=1.9,<2.0
 lxml>=4.9,<6.0
 geopandas>=0.14.1,<1.0
 shapely>=2.0.1,<3.0
+# pyogrio is geopandas' vector IO engine. We force it over the default (fiona) because fiona
+# bundles its own GDAL+GEOS, and once shapely's separately-bundled GEOS has been used in the
+# same process (e.g. during graph building), invoking fiona's GEOS afterwards segfaults the
+# interpreter. pyogrio shares GDAL state cleanly and avoids the conflict. See runtime_setup.
+pyogrio>=0.7,<1.0
 psutil>=5.9,<7.0
 tqdm>=4.66,<5.0
 shutup>=0.2,<1.0
 
 # Utility scripts in this repo
 beautifulsoup4>=4.12,<5.0
-scikit-learn>=1.4,<2.0
+scikit-learn>=1.4,<1.6
 matplotlib>=3.8,<4.0
 seaborn>=0.13,<1.0
 pyDecision>=5.1,<6.0

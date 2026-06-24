@@ -1,4 +1,5 @@
 import csv
+import glob
 import hashlib
 import os
 import pickle
@@ -276,6 +277,30 @@ def _write_dummy_destination_csv(path: str) -> None:
         writer.writerow(["d0", 0.0, 0.0])
 
 
+def _resolve_r5r_java_home() -> str | None:
+    """Locate a Java 21 home for r5r, which targets Java 21 and breaks on newer JDKs.
+
+    The default system Java here is OpenJDK 25, which r5r/rJava reject. Resolution order:
+    1. CAP_JAVA_HOME, if set (explicit override; must point at a JDK).
+    2. The Fedora-conventional /usr/lib/jvm/java-21-openjdk symlink.
+    3. Any /usr/lib/jvm/java-21* or *-21-* directory (other distros / versioned paths).
+
+    Returns the JAVA_HOME path, or None if no Java 21 is found (caller leaves env untouched
+    and lets R surface its own error).
+    """
+    override = os.environ.get("CAP_JAVA_HOME", "").strip()
+    if override:
+        return override
+
+    candidates = ["/usr/lib/jvm/java-21-openjdk"]
+    for pattern in ("/usr/lib/jvm/java-21*", "/usr/lib/jvm/*-21-*", "/usr/lib/jvm/jdk-21*"):
+        candidates.extend(sorted(glob.glob(pattern)))
+    for path in candidates:
+        if os.path.isfile(os.path.join(path, "bin", "java")):
+            return path
+    return None
+
+
 def _run_r5r_script(script_path: str, ctx: PipelineContext) -> None:
     """Run the external R routing script and keep shell output concise.
 
@@ -293,6 +318,22 @@ def _run_r5r_script(script_path: str, ctx: PipelineContext) -> None:
     cfg = ctx.config
     r5_data_path = _prepare_r5r_data_bundle(cfg)
     env = os.environ.copy()
+
+    # r5r runs R5 on the JVM and only supports Java 21; the system default here is Java 25,
+    # which it rejects. Pin JAVA_HOME (and prepend its bin to PATH) for the R subprocess so the
+    # right JVM is used regardless of the shell's default java.
+    java_home = _resolve_r5r_java_home()
+    if java_home:
+        env["JAVA_HOME"] = java_home
+        env["PATH"] = os.path.join(java_home, "bin") + os.pathsep + env.get("PATH", "")
+        print(f"[Bus Routing] Using Java 21 for r5r: {java_home}", flush=True)
+    else:
+        print(
+            "[Bus Routing] No Java 21 found (looked for /usr/lib/jvm/java-21-openjdk; set "
+            "CAP_JAVA_HOME to override). r5r may fail on the default JVM.",
+            flush=True,
+        )
+
     env["R5_DATA_PATH"] = r5_data_path
     env["R5_ORIGINS_PATH"] = cfg.bus_routing_origins_input_path
     env["R5_DEST_PATH"] = cfg.bus_routing_destinations_input_path

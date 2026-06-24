@@ -1,10 +1,12 @@
 import osmnx as ox
 import os
 import math
+import warnings
 import geopandas as gpd
 import pandas as pd
 import hashlib
 import json
+from shapely.geometry import shape
 from typing import TypeAlias
 
 from utils.load_shapefile import poi_from_shp
@@ -338,12 +340,23 @@ def get_mode_graph(network_type, cfg: PipelineConfig | None = None, simplified: 
                 gdf_buffered["geometry"] = gdf_metric.geometry.buffer(buffer_m)
                 polygon = gdf_buffered.to_crs("EPSG:4326").geometry.iloc[0]
                 print(f"[Graph] Expanding graph area by {buffer_m/1000:.1f} km buffer", flush=True)
-                graph = ox.graph_from_polygon(
-                    polygon,
-                    network_type=network_type,
-                    simplify=cfg.osm_autobuild_simplify,
-                    retain_all=cfg.osm_autobuild_retain_all,
-                )
+                # clean_periphery=True (osmnx default) runs stats.count_streets_per_node over
+                # the buffered graph. That call hard-crashes the interpreter (SIGSEGV) on large
+                # graphs in this environment — verified to still crash even on networkx 3.3 — and
+                # only computes the `street_count` attribute, which is unused anywhere in this repo.
+                # We pass clean_periphery=False to skip it entirely. The caller already applied its
+                # own buffer, so osmnx's extra ~500 m peripheral buffer adds nothing here.
+                # osmnx 1.9 emits a FutureWarning for this arg (removed in v2.0); suppress it so the
+                # warning isn't mistaken for the cause of a crash it actually prevents.
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", FutureWarning)
+                    graph = ox.graph_from_polygon(
+                        polygon,
+                        network_type=network_type,
+                        simplify=cfg.osm_autobuild_simplify,
+                        retain_all=cfg.osm_autobuild_retain_all,
+                        clean_periphery=False,
+                    )
             else:
                 graph = ox.graph_from_place(
                     place_name,
@@ -540,10 +553,29 @@ def _download_poi_for_place(place_name: str, query_tags: TagClause, buffer_m: fl
         polygon = place_gdf.geometry.iloc[0]
         return ox.features_from_polygon(polygon, query_tags)
 
+def _read_geojson_without_gdal(path: str) -> gpd.GeoDataFrame:
+    """Read a GeoJSON file using only json + shapely, never GDAL.
+
+    geopandas' normal read path (fiona or pyogrio) goes through GDAL, which bundles its own
+    GEOS. shapely bundles a *different* GEOS. Once shapely's GEOS has been heavily exercised
+    in the process (building the walk/bike/drive graphs in the snapping stage), any subsequent
+    GDAL geometry read segfaults the interpreter with no traceback — reproducible with both
+    fiona and pyogrio. Parsing the GeoJSON as plain JSON and building geometries with
+    shapely.geometry.shape uses shapely's GEOS exclusively, sidestepping the conflict entirely.
+    GeoJSON is always EPSG:4326 per RFC 7946, which matches what GDAL returned for these files.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    features = data.get("features", []) if isinstance(data, dict) else []
+    geometries = [shape(ft["geometry"]) if ft.get("geometry") else None for ft in features]
+    properties = [ft.get("properties", {}) or {} for ft in features]
+    return gpd.GeoDataFrame(pd.DataFrame(properties), geometry=geometries, crs="EPSG:4326")
+
+
 def _load_cached_poi_if_nonempty(path: str):
     """Load cached POI file and return None when missing/invalid/empty."""
     try:
-        poi = gpd.read_file(path)
+        poi = _read_geojson_without_gdal(path)
     except Exception:
         return None
     if poi is None or poi.empty:
