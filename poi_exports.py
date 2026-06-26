@@ -1,6 +1,8 @@
 import json
 import os
 import pickle
+import shutil
+import zipfile
 from collections import OrderedDict
 from typing import Any
 
@@ -12,7 +14,6 @@ from context import PipelineContext
 from pipeline_types import AccessibilityStageResult, NonBusRoutingStageResult, SnappingStageResult
 from utils import capabilities as cap_mod, delta_g, graphml, services as serv
 from utils.poi_identity import build_poi_source_key
-from non_bus_routing_stage import _non_bus_cache_path
 from snapping_stage import select_best_snap_candidate_for_origin
 
 
@@ -182,12 +183,22 @@ def _build_poi_index(poi_rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]
 
 
 def _load_non_bus_payloads(ctx: PipelineContext, non_bus: NonBusRoutingStageResult) -> dict[Any, dict[str, Any]]:
-    """Load cached non-bus payloads for all known node ids."""
+    """Load cached non-bus payloads for all known node ids.
+
+    Paths come from `non_bus.cache_paths` when available, otherwise they are derived directly
+    from `config.non_bus_cache_dir`. We avoid `_non_bus_cache_path`, whose module-global cache
+    dir is only initialized while `run_non_bus_routing_stage` runs — when the impedance bundle
+    is loaded that stage is skipped, but the per-node `.pkl` files written by the run that
+    created the bundle still exist on disk.
+    """
+    cache_dir = ctx.config.non_bus_cache_dir
     out: dict[Any, dict[str, Any]] = {}
     for node_id, _ in ctx.nodes_with_coords:
         path = non_bus.cache_paths.get(node_id)
         if path is None:
-            path = _non_bus_cache_path(node_id)
+            if not cache_dir:
+                continue
+            path = os.path.join(cache_dir, f"{node_id}.pkl")
         if not os.path.exists(path):
             continue
         try:
@@ -397,6 +408,76 @@ def _build_hexagon_report(
     )
 
 
+def _compact_hex_payload(hexagons: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
+    """Shrink the hexagon->POI map using short keys for browser delivery.
+
+    Full POI attributes live in the pois_used GeoPackage (keyed by `id`), so each object keeps
+    only the POI id plus its non-empty power maps: id -> "i", service_power -> "sp",
+    capability_power -> "cp". `sp`/`cp` are omitted when absent/empty (e.g. the pre-routing,
+    acc-less export, where objects are id-only).
+    """
+    compact: dict[str, list[dict[str, Any]]] = {}
+    for hex_id, poi_objs in hexagons.items():
+        items: list[dict[str, Any]] = []
+        for obj in poi_objs:
+            item: dict[str, Any] = {"i": obj["id"]}
+            sp = obj.get("service_power")
+            cp = obj.get("capability_power")
+            if sp:
+                item["sp"] = sp
+            if cp:
+                item["cp"] = cp
+            items.append(item)
+        compact[hex_id] = items
+    return compact
+
+
+def _write_hex_poi_files(
+    compact: dict[str, list[dict[str, Any]]],
+    out_dir: str,
+    slug: str,
+    zip_path: str,
+) -> dict[str, Any]:
+    """Write one JSONP `.js` file per hexagon plus a manifest, then zip the directory.
+
+    JSONP (not `.json`) so the offline OpenLayers interface can load a single hexagon on demand
+    via `<script>` injection — browsers block fetch()/XHR of local files over file://, but not
+    script tags. The zip is a convenience artifact to hand to the interface developer.
+    """
+    # Regenerate from scratch so hexagons removed since a prior run don't linger.
+    if os.path.isdir(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    for hex_id, items in compact.items():
+        body = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+        with open(os.path.join(out_dir, f"{hex_id}.js"), "w", encoding="utf-8") as f:
+            f.write(f'__onHexPois("{hex_id}",{body});')
+
+    hex_ids = sorted(compact.keys())
+    manifest = {
+        "schema": "hexagon_poi_powers_v1",
+        "slug": slug,
+        "count": len(hex_ids),
+        "hex_ids": hex_ids,
+    }
+    manifest_body = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))
+    with open(os.path.join(out_dir, "index.js"), "w", encoding="utf-8") as f:
+        f.write(f"__onHexPoisManifest({manifest_body});")
+
+    # Zip every generated file (per-hexagon + manifest), flat inside the archive.
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name in sorted(os.listdir(out_dir)):
+            if name.endswith(".js"):
+                zf.write(os.path.join(out_dir, name), arcname=name)
+
+    return {
+        "hex_pois_dir": out_dir,
+        "hex_pois_zip_path": zip_path,
+        "hex_pois_count": len(hex_ids),
+    }
+
+
 def generate_poi_exports(
     ctx: PipelineContext,
     snap: SnappingStageResult | None = None,
@@ -411,22 +492,30 @@ def generate_poi_exports(
         raise ValueError("No POIs were collected for export.")
 
     poi_gdf = gpd.GeoDataFrame(poi_rows, geometry="geometry", crs="EPSG:4326")
-    hex_payload, hex_scores_payload = _build_hexagon_report(poi_rows, ctx, snap, non_bus, acc)
-    # The hexagon<->POI relationship now lives entirely in hexagon_service_pois.json
-    # (hexagon id -> POI ids), so the per-POI hexagon column is dropped from the GPKG.
+    hex_payload, _hex_scores_payload = _build_hexagon_report(poi_rows, ctx, snap, non_bus, acc)
+    # The hexagon<->POI relationship is exported via per-hex files, so the per-POI
+    # hexagon column is dropped from the GPKG.
     poi_gdf = poi_gdf[["id", "source_key", "lon", "lat", "angular_coords", "poi_types", "svc_map", "geometry"]].copy()
     poi_gdf.to_file(ctx.config.poi_export_geopackage_path, driver="GPKG", layer="pois_used")
 
-    score_path = os.path.join(ctx.config.poi_export_dir, "hexagon_service_pois_scores.json")
+    legacy_paths = (
+        ctx.config.hexagon_service_pois_path,
+        os.path.join(ctx.config.poi_export_dir, "hexagon_service_pois_scores.json"),
+    )
     has_hexagon_payload = bool(hex_payload.get("hexagons"))
 
     if not has_hexagon_payload:
-        for path in (ctx.config.hexagon_service_pois_path, score_path):
+        for path in (*legacy_paths, ctx.config.hex_pois_zip_path):
             if os.path.exists(path):
                 try:
                     os.remove(path)
                 except OSError:
                     pass
+        if os.path.isdir(ctx.config.hex_pois_dir):
+            try:
+                shutil.rmtree(ctx.config.hex_pois_dir)
+            except OSError:
+                pass
         print(
             "[Output] POI export: "
             f"{ctx.config.poi_export_geopackage_path} (hexagon/service update deferred)",
@@ -438,28 +527,34 @@ def generate_poi_exports(
             "poi_shapefile_path": ctx.config.poi_export_geopackage_path,
         }
 
-    with open(ctx.config.hexagon_service_pois_path, "w", encoding="utf-8") as f:
-        json.dump(hex_payload, f, ensure_ascii=False, separators=(",", ":"))
+    # Export the compact hexagon->POI map as one JSONP `.js` file per hexagon
+    # (+ manifest), then zip that directory for the offline interface.
+    compact_hexagons = _compact_hex_payload(hex_payload["hexagons"])
+    hex_files_info = _write_hex_poi_files(
+        compact_hexagons,
+        ctx.config.hex_pois_dir,
+        ctx.config.artifact_slug,
+        ctx.config.hex_pois_zip_path,
+    )
 
-    if hex_scores_payload is not None:
-        with open(score_path, "w", encoding="utf-8") as f:
-            json.dump(hex_scores_payload, f, ensure_ascii=False, indent=2)
-    elif os.path.exists(score_path):
-        try:
-            os.remove(score_path)
-        except OSError:
-            pass
+    for path in legacy_paths:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     print(
         "[Output] POI export: "
-        f"{ctx.config.poi_export_geopackage_path} | {ctx.config.hexagon_service_pois_path}"
-        + (f" | {score_path}" if hex_scores_payload is not None else ""),
+        f"{ctx.config.poi_export_geopackage_path} | {hex_files_info['hex_pois_dir']}"
+        f" | {ctx.config.hex_pois_zip_path} ({hex_files_info['hex_pois_count']} hex files)",
         flush=True,
     )
     print(f"[Output] POI export rows: {len(poi_rows)}", flush=True)
     return {
         "poi_geopackage_path": ctx.config.poi_export_geopackage_path,
         "poi_shapefile_path": ctx.config.poi_export_geopackage_path,
-        "hexagon_service_pois_path": ctx.config.hexagon_service_pois_path,
-        **({"hexagon_service_pois_scores_path": score_path} if hex_scores_payload is not None else {}),
+        "hex_pois_dir": hex_files_info["hex_pois_dir"],
+        "hex_pois_zip_path": hex_files_info["hex_pois_zip_path"],
+        "hex_pois_count": str(hex_files_info["hex_pois_count"]),
     }

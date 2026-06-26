@@ -35,6 +35,7 @@ def main():
 
     import shutup
     from config import PipelineConfig
+    
     from context import build_context
     from snapping_stage import run_snapping_stage
     from public_transport_routing_stage import run_public_transport_routing_stage
@@ -124,12 +125,12 @@ def main():
     print("[Stage] Accessibility", flush=True)
     acc = run_accessibility_stage(ctx, non_bus, bus)
 
-    if not os.path.exists(cfg.poi_export_geopackage_path):
-        print("[Stage] POI Export (post-routing)", flush=True)
-        poi_exports = generate_poi_exports(ctx, snap=snap, non_bus=non_bus, acc=acc)
-    else:
-        print("[Stage] POI Export (post-routing) skipped — already exported.", flush=True)
-        poi_exports = {"poi_geopackage_path": cfg.poi_export_geopackage_path}
+    # Always run the post-routing export: it is the authoritative version that carries the
+    # per-(hexagon, POI) service/capability powers (from `acc`). The pre-routing export only
+    # writes a provisional id-only version and creates the GeoPackage — gating this on the
+    # GeoPackage's existence would skip the powered export and leave only id-only hex files.
+    print("[Stage] POI Export (post-routing)", flush=True)
+    poi_exports = generate_poi_exports(ctx, snap=snap, non_bus=non_bus, acc=acc)
 
     # Each poi type contributes to one or multiple services. Based on the accessibility to the poi types, we compute the opportunity for services.
     print("[Stage] Service Aggregation", flush=True)

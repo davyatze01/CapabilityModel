@@ -105,7 +105,17 @@ def _get_simplified_mode_graph(network_type, cfg: PipelineConfig):
     full_path = _resolve_mode_graph_path(network_type, cfg)
     simp_path = full_path[: -len(".graphml")] + "_simplified.graphml"
 
-    if os.path.isfile(simp_path):
+    simp_stale = (
+        os.path.isfile(simp_path)
+        and os.path.isfile(full_path)
+        and os.path.getmtime(full_path) > os.path.getmtime(simp_path)
+    )
+    if simp_stale:
+        print(
+            f"[Graph] Source graph is newer than simplified cache; rebuilding for '{network_type}'",
+            flush=True,
+        )
+    if os.path.isfile(simp_path) and not simp_stale:
         graph = ox.io.load_graphml(simp_path)
     else:
         # Build from the full graph (loaded only here, normally in the parent).
@@ -140,13 +150,14 @@ def get_mode_csr(network_type, cfg: PipelineConfig | None = None):
     per mode in the parent and cached to `<full>_csr.npz`; workers load that file.
 
     Returns a dict with:
-    - `mat`: scipy.sparse.csr_matrix (directed, value = min `length` per (u, v)).
+    - `mat`: scipy.sparse.csr_matrix over the full routing topology, with
+      additional virtual nodes when needed to preserve parallel edges.
     - `indptr`, `indices`, `length`: the raw CSR arrays (for fast path walkability).
-    - `node_ids`: int64 array, row/col index -> OSM node id.
+    - `node_ids`: int64 array, row/col index -> OSM node id or synthetic virtual id.
     - `id_to_idx`: dict OSM node id -> index.
-    - `tree`, `scale`: cKDTree over node coords (m) + `(m_per_deg_lon, m_per_deg_lat)`.
-    - `wscore`: float array aligned to `length` (walk only; else None) holding the
-      walkability score of the min-length parallel edge for each (u, v).
+    - `tree`, `snap_indices`, `scale`: cKDTree over real node coords (m), the
+      matching matrix row indices for those real nodes, and the projection scale.
+    - `wscore`: float array aligned to `length` (walk only; else None).
     """
     import numpy as np
     from scipy.sparse import csr_matrix
@@ -160,39 +171,40 @@ def get_mode_csr(network_type, cfg: PipelineConfig | None = None):
         return cached
 
     full_path = _resolve_mode_graph_path(network_type, cfg)
-    csr_path = full_path[: -len(".graphml")] + "_csr.npz"
+    csr_path = full_path[: -len(".graphml")] + "_csr_v2.npz"
 
-    if os.path.isfile(csr_path):
+    csr_stale = (
+        os.path.isfile(csr_path)
+        and os.path.isfile(full_path)
+        and os.path.getmtime(full_path) > os.path.getmtime(csr_path)
+    )
+    if csr_stale:
+        print(
+            f"[Graph] Source graph is newer than CSR cache; rebuilding CSR for '{network_type}'",
+            flush=True,
+        )
+    if os.path.isfile(csr_path) and not csr_stale:
         data = np.load(csr_path, allow_pickle=False)
         indptr = data["indptr"]
         indices = data["indices"]
         length = data["length"]
         node_ids = data["node_ids"]
-        node_x = data["node_x"]
-        node_y = data["node_y"]
+        snap_x = data["snap_x"]
+        snap_y = data["snap_y"]
+        snap_indices = data["snap_indices"]
         m_per_deg_lon = float(data["m_per_deg_lon"])
         m_per_deg_lat = float(data["m_per_deg_lat"])
         wscore = data["wscore"] if "wscore" in data.files else None
     else:
         G = get_mode_graph(network_type, cfg, simplified=False)
-        nodes = list(G.nodes())
-        n = len(nodes)
-        idx = {nid: i for i, nid in enumerate(nodes)}
-
-        # Collapse parallel edges to the shortest representative, remembering which
-        # original key won (needed to fetch its walkability score for walk mode).
-        emin: dict = {}
-        for u, v, k, d in G.edges(keys=True, data=True):
-            w = float(d.get("length", 0.0) or 0.0)
-            ek = (idx[u], idx[v])
-            cur = emin.get(ek)
-            if cur is None or w < cur[0]:
-                emin[ek] = (w, u, v, k)
-
-        m = len(emin)
-        rows = np.empty(m, dtype=np.int64)
-        cols = np.empty(m, dtype=np.int64)
-        length_vals = np.empty(m, dtype=float)
+        base_nodes = list(G.nodes())
+        real_node_count = len(base_nodes)
+        idx = {nid: i for i, nid in enumerate(base_nodes)}
+        node_ids_list = [int(nid) for nid in base_nodes]
+        next_virtual_id = -1
+        rows_list: list[int] = []
+        cols_list: list[int] = []
+        length_list: list[float] = []
 
         need_scores = network_type == "walk"
         if need_scores:
@@ -201,33 +213,62 @@ def get_mode_csr(network_type, cfg: PipelineConfig | None = None):
                 cfg=cfg, G=G, force_rebuild=False, schema_version=1
             )
             escores = cache_obj.edge_scores
-            score_vals = np.empty(m, dtype=float)
+            score_list: list[float] = []
 
-        for j, (ek, val) in enumerate(emin.items()):
-            rows[j] = ek[0]
-            cols[j] = ek[1]
-            length_vals[j] = val[0]
-            if need_scores:
-                score_vals[j] = float(escores.get((val[1], val[2], val[3]), 5.0))
+        edges_by_pair: dict[tuple[int, int], list[tuple[float, int, int, int]]] = {}
+        for u, v, k, d in G.edges(keys=True, data=True):
+            length_val = float(d.get("length", 0.0) or 0.0)
+            pair = (idx[u], idx[v])
+            edges_by_pair.setdefault(pair, []).append((length_val, int(u), int(v), int(k)))
 
+        for (u_idx, v_idx), options in edges_by_pair.items():
+            options.sort(key=lambda item: item[0])
+            for option_idx, (edge_len, u_id, v_id, edge_key) in enumerate(options):
+                edge_score = float(escores.get((u_id, v_id, edge_key), 5.0)) if need_scores else None
+                if option_idx == 0:
+                    rows_list.append(u_idx)
+                    cols_list.append(v_idx)
+                    length_list.append(edge_len)
+                    if need_scores:
+                        score_list.append(edge_score if edge_score is not None else 5.0)
+                    continue
+
+                virtual_idx = len(node_ids_list)
+                node_ids_list.append(next_virtual_id)
+                next_virtual_id -= 1
+
+                rows_list.append(u_idx)
+                cols_list.append(virtual_idx)
+                length_list.append(edge_len)
+                rows_list.append(virtual_idx)
+                cols_list.append(v_idx)
+                length_list.append(0.0)
+                if need_scores:
+                    score_list.append(edge_score if edge_score is not None else 5.0)
+                    score_list.append(edge_score if edge_score is not None else 5.0)
+
+        n = len(node_ids_list)
+        rows = np.asarray(rows_list, dtype=np.int64)
+        cols = np.asarray(cols_list, dtype=np.int64)
+        length_vals = np.asarray(length_list, dtype=float)
         mat = csr_matrix((length_vals, (rows, cols)), shape=(n, n))
         mat.sort_indices()
         indptr = mat.indptr.astype(np.int64)
         indices = mat.indices.astype(np.int64)
         length = mat.data.astype(float)
         if need_scores:
-            # Identical sparsity to `mat` (same rows/cols, no duplicates) so after
-            # sort_indices the data arrays align position-for-position.
+            score_vals = np.asarray(score_list, dtype=float)
             smat = csr_matrix((score_vals, (rows, cols)), shape=(n, n))
             smat.sort_indices()
             wscore = smat.data.astype(float)
         else:
             wscore = None
 
-        node_ids = np.asarray([int(nid) for nid in nodes], dtype=np.int64)
-        node_x = np.asarray([float(G.nodes[nid]["x"]) for nid in nodes], dtype=float)
-        node_y = np.asarray([float(G.nodes[nid]["y"]) for nid in nodes], dtype=float)
-        mean_lat_rad = math.radians(float(node_y.mean())) if node_y.size else 0.0
+        node_ids = np.asarray(node_ids_list, dtype=np.int64)
+        snap_x = np.asarray([float(G.nodes[nid]["x"]) for nid in base_nodes], dtype=float)
+        snap_y = np.asarray([float(G.nodes[nid]["y"]) for nid in base_nodes], dtype=float)
+        snap_indices = np.arange(real_node_count, dtype=np.int64)
+        mean_lat_rad = math.radians(float(snap_y.mean())) if snap_y.size else 0.0
         m_per_deg_lat = 111320.0
         m_per_deg_lon = 111320.0 * math.cos(mean_lat_rad)
 
@@ -236,8 +277,9 @@ def get_mode_csr(network_type, cfg: PipelineConfig | None = None):
             indices=indices,
             length=length,
             node_ids=node_ids,
-            node_x=node_x,
-            node_y=node_y,
+            snap_x=snap_x,
+            snap_y=snap_y,
+            snap_indices=snap_indices,
             m_per_deg_lon=np.float64(m_per_deg_lon),
             m_per_deg_lat=np.float64(m_per_deg_lat),
         )
@@ -248,13 +290,13 @@ def get_mode_csr(network_type, cfg: PipelineConfig | None = None):
         os.replace(tmp_path, csr_path)
         print(
             f"[Graph] Built CSR routing matrix for '{network_type}': "
-            f"{csr_path} nodes={n} edges={m}",
+            f"{csr_path} nodes={n} real_nodes={real_node_count} edges={len(rows_list)}",
             flush=True,
         )
 
     n_nodes = len(node_ids)
     mat = csr_matrix((length, indices, indptr), shape=(n_nodes, n_nodes))
-    node_xy = np.column_stack([node_x * m_per_deg_lon, node_y * m_per_deg_lat])
+    node_xy = np.column_stack([snap_x * m_per_deg_lon, snap_y * m_per_deg_lat])
     tree = cKDTree(node_xy)
     id_to_idx = {int(nid): i for i, nid in enumerate(node_ids)}
     bundle = {
@@ -265,6 +307,7 @@ def get_mode_csr(network_type, cfg: PipelineConfig | None = None):
         "node_ids": node_ids,
         "id_to_idx": id_to_idx,
         "tree": tree,
+        "snap_indices": snap_indices,
         "scale": (m_per_deg_lon, m_per_deg_lat),
         "wscore": wscore,
     }

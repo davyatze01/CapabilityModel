@@ -337,6 +337,9 @@ def generate_combined_experiment_gpkg(
     grid_cell_size_m: float = 10.0,
     grid_capability_field: str = "capability_care",
     grid_max_cells: int = 500000,
+    grid_fill_hull: bool = True,
+    grid_hull_buffer_m: float = 0.0,
+    grid_hull_ratio: float = 0.3,
 ) -> Path:
     """Generate one GeoPackage containing all selected experiment CSVs."""
     graph_dir = Path(graph_dir)
@@ -362,6 +365,9 @@ def generate_combined_experiment_gpkg(
             capability_field=grid_capability_field,
             cell_size_m=float(grid_cell_size_m),
             max_cells=int(grid_max_cells),
+            fill_hull=bool(grid_fill_hull),
+            hull_buffer_m=float(grid_hull_buffer_m),
+            hull_ratio=float(grid_hull_ratio),
         )
         if grid_layer is not None and not grid_layer.empty:
             grid_layer = _prepare_gpkg_layer(grid_layer)
@@ -392,14 +398,29 @@ def _build_capability_grid(
     capability_field: str,
     cell_size_m: float,
     max_cells: int,
+    fill_hull: bool = True,
+    hull_buffer_m: float = 0.0,
+    hull_ratio: float = 0.3,
 ) -> gpd.GeoDataFrame | None:
     """Build a regular hex grid in the same coordinate system as the sampling grid.
 
     Uses the identical approximate-Cartesian projection as _hex_grid_sample_nodes
     (xs = lon × m_per_deg_lon, ys = lat × 111320) so that the display grid and the
-    sampling grid share the same scaling and column-offset pattern.  For each display
-    cell the nearest computed node within hex_radius_m is assigned; cells with no node
-    that close are left uncolored (genuine gaps in the network).
+    sampling grid share the same scaling and column-offset pattern.
+
+    Cell selection (when fill_hull=True, the default): keep every cell whose centroid lies
+    inside the convex hull of the sampled nodes, as well as any cell with a node within
+    hex_radius_m. This fills the interior holes that the legacy "node within hex_radius only"
+    rule left in sparse parts of the network, and yields a clean hull outline so the study
+    area's shape/perimeter is recognizable instead of a ragged bounding-box-style grid. Measured
+    cells (a node within hex_radius_m) are colored by that node; hull-fill cells carry NO value
+    (null capability columns) and exist only to make the area solid. A `has_data` flag (1 =
+    measured, 0 = hull-fill) lets QGIS style the two differently. Set fill_hull=False to restore
+    the legacy node-hugging behavior. hull_buffer_m optionally grows the hull (in metres).
+
+    hull_ratio selects the boundary shape: >= 1.0 = convex hull; ~0.3 = concave hull that follows
+    a real concave outline (coastlines/bays); lower gets tighter/jaggier. Falls back to the convex
+    hull if concave_hull is unavailable or fails.
     """
     from scipy.spatial import cKDTree
 
@@ -505,6 +526,39 @@ def _build_capability_grid(
     centroid_xy = np.array([(cx, cy) for cx, cy, _, _ in centroids], dtype=float)
     dists, idxs = tree.query(centroid_xy)
 
+    # ── Decide which cells to keep ────────────────────────────────────────────
+    # near_mask = cells with a real node within hex_radius_m (the legacy criterion).
+    # When fill_hull is on, also keep cells whose centroid is inside the convex hull of the
+    # sampled nodes, so interior holes are filled and the perimeter follows the study area.
+    near_mask = dists <= hex_radius_m
+    keep_mask = near_mask
+    if fill_hull and node_xy.shape[0] >= 3:
+        import shapely
+        from shapely.geometry import MultiPoint
+
+        mp = MultiPoint([(float(x), float(y)) for x, y in node_xy])
+        # hull_ratio controls how tightly the boundary follows the nodes:
+        #   >= 1.0  -> convex hull (bridges across bays/coastline)
+        #   ~0.3    -> concave hull that follows the real, possibly concave study-area outline
+        #   -> 0    -> very tight, can get jagged
+        # allow_holes=False keeps the area solid (interior gaps are still filled). Any failure
+        # or an unexpected (non-polygonal) result falls back to the convex hull.
+        hull = None
+        if hull_ratio < 1.0 and hasattr(shapely, "concave_hull"):
+            try:
+                hull = shapely.concave_hull(mp, ratio=float(max(0.0, hull_ratio)), allow_holes=False)
+            except Exception:
+                hull = None
+        if hull is None or hull.is_empty or hull.geom_type not in ("Polygon", "MultiPolygon"):
+            hull = mp.convex_hull
+        if hull_buffer_m and hull_buffer_m > 0:
+            hull = hull.buffer(float(hull_buffer_m))
+        if not hull.is_empty and hull.geom_type in ("Polygon", "MultiPolygon"):
+            inside_hull = np.asarray(
+                shapely.contains_xy(hull, centroid_xy[:, 0], centroid_xy[:, 1]), dtype=bool
+            )
+            keep_mask = near_mask | inside_hull
+
     # ── Build hex geometries in lon/lat by inverting the projection ───────────
     # Each vertex (vx, vy) in approx-Cartesian maps back to
     #   lon = vx / m_per_deg_lon,  lat = vy / M_LAT
@@ -512,8 +566,8 @@ def _build_capability_grid(
     # as long as grid_params.json (bbox + cell_size) does not change.
     rename_map = {col: f"grid_mean_{col.replace('capability_', '')}" for col in capability_columns}
     cells: list[dict[str, object]] = []
-    for (cx, cy, c_i, r_i), dist, node_idx in zip(centroids, dists, idxs):
-        if dist > hex_radius_m:
+    for cell_idx, ((cx, cy, c_i, r_i), node_idx) in enumerate(zip(centroids, idxs)):
+        if not keep_mask[cell_idx]:
             continue
         hex_id = f"H{c_i:04d}_{r_i:04d}"
         verts = []
@@ -527,24 +581,25 @@ def _build_capability_grid(
             vy = cy + hex_radius_m * math.sin(angle)
             verts.append((vx / m_per_deg_lon, vy / M_LAT))
         cell: dict[str, object] = {"hex_id": hex_id, "geometry": Polygon(verts)}
+        # 1 = a real node sits within hex_radius_m (measured cell); 0 = hull-fill cell (an
+        # interior hole or boundary cell) that exists only to make the study area's shape
+        # solid. Hull-fill cells carry NO capability value — they are geometry-only.
+        is_real = bool(near_mask[cell_idx])
+        cell["has_data"] = int(is_real)
         if node_ids is not None:
-            cell["node_id"] = str(node_ids[node_idx])
+            cell["node_id"] = str(node_ids[node_idx]) if is_real else None
         for j, col in enumerate(capability_columns):
-            v = cap_arr[node_idx, j]
-            cell[rename_map[col]] = float(v) if np.isfinite(v) else None
+            if is_real:
+                v = cap_arr[node_idx, j]
+                cell[rename_map[col]] = float(v) if np.isfinite(v) else None
+            else:
+                cell[rename_map[col]] = None
         cells.append(cell)
 
     if not cells:
         return None
 
     grid_gdf = gpd.GeoDataFrame(cells, geometry="geometry", crs="EPSG:4326")
-    selected_col = f"grid_mean_{capability_field.replace('capability_', '')}"
-    has_data_col = (
-        grid_gdf[selected_col]
-        if selected_col in grid_gdf.columns
-        else grid_gdf[list(rename_map.values())[0]]
-    )
-    grid_gdf["has_data"]      = has_data_col.notna().astype(int)
     grid_gdf["cell_size_m"]   = float(cell_size_m)
     grid_gdf["hex_radius_m"]  = float(hex_radius_m)
     grid_gdf["hex_width_m"]   = float(hex_width_m)

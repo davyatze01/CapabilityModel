@@ -170,7 +170,7 @@ def _select_best_snap_for_origin(origin, source_coord, candidates):
 
 
 def _get_mode_graph(network_type, cfg: PipelineConfig | None = None):
-    """Get mode-specific graph from in-memory cache or disk loader.
+    """Get the full unsimplified mode graph from in-memory cache or disk.
 
     Inputs:
     - network_type: mode key.
@@ -180,11 +180,7 @@ def _get_mode_graph(network_type, cfg: PipelineConfig | None = None):
     - graph object for the requested mode.
     """
     if network_type not in _MODE_GRAPH_CACHE:
-        # This accessor is the routing-graph path: prefer the simplified copy so
-        # workers hold a fraction of the full graph's RAM. Origins/POIs are still
-        # enumerated on the full graph elsewhere (context/snapping).
-        simplified = True if cfg is None else bool(getattr(cfg, "route_on_simplified_graph", True))
-        graph = graphml.get_mode_graph(network_type, cfg, simplified=simplified)
+        graph = graphml.get_mode_graph(network_type, cfg, simplified=False)
         if _STRIP_GRAPH_GEOMETRY:
             _strip_edge_geometry(graph)
         _MODE_GRAPH_CACHE[network_type] = graph
@@ -236,53 +232,8 @@ def _reconstruct_path(pred, origin_node, target_node):
     return path
 
 
-def _get_mode_node_kdtree(network_type, cfg: PipelineConfig | None = None):
-    """Get/build a cached KD-tree over a mode graph's node coordinates.
-
-    Inputs:
-    - network_type: mode key.
-    - cfg: optional PipelineConfig.
-
-    Outputs:
-    - tuple `(tree, node_ids, scale)` where `tree` is a scipy cKDTree over node
-      coordinates projected to local meters, `node_ids` is the parallel node-id
-      array, and `scale` is `(m_per_deg_lon, m_per_deg_lat)` used to project queries.
-    """
-    cached = _MODE_NODE_KDTREE.get(network_type)
-    if cached is not None:
-        return cached
-
-    import numpy as np
-    from scipy.spatial import cKDTree
-
-    mode_graph = _get_mode_graph(network_type, cfg)
-    node_ids = []
-    lats = []
-    lons = []
-    for node_id, data in mode_graph.nodes(data=True):
-        if "x" not in data or "y" not in data:
-            continue
-        node_ids.append(node_id)
-        lons.append(float(data["x"]))
-        lats.append(float(data["y"]))
-    if not node_ids:
-        raise RuntimeError(f"mode graph '{network_type}' has no nodes with coordinates")
-
-    lats_arr = np.asarray(lats, dtype=float)
-    lons_arr = np.asarray(lons, dtype=float)
-    mean_lat_rad = math.radians(float(lats_arr.mean()))
-    m_per_deg_lat = 111320.0
-    m_per_deg_lon = 111320.0 * math.cos(mean_lat_rad)
-    node_xy = np.column_stack([lons_arr * m_per_deg_lon, lats_arr * m_per_deg_lat])
-    tree = cKDTree(node_xy)
-    node_ids_arr = np.asarray(node_ids, dtype=object)
-    result = (tree, node_ids_arr, (m_per_deg_lon, m_per_deg_lat))
-    _MODE_NODE_KDTREE[network_type] = result
-    return result
-
-
 def _nearest_mode_node(network_type, lat, lon, cfg: PipelineConfig | None = None):
-    """Snap one coordinate to the nearest mode-graph node, memoized per coordinate.
+    """Snap one coordinate to the nearest full-graph node id, memoized.
 
     Inputs:
     - network_type: mode key.
@@ -296,9 +247,13 @@ def _nearest_mode_node(network_type, lat, lon, cfg: PipelineConfig | None = None
     cached = _COORD_NODE_MEMO.get(memo_key)
     if cached is not None:
         return cached
-    tree, node_ids, (m_per_deg_lon, m_per_deg_lat) = _get_mode_node_kdtree(network_type, cfg)
+    bundle = graphml.get_mode_csr(network_type, cfg)
+    tree = bundle["tree"]
+    node_ids = bundle["node_ids"]
+    snap_indices = bundle["snap_indices"]
+    m_per_deg_lon, m_per_deg_lat = bundle["scale"]
     _, idx = tree.query([float(lon) * m_per_deg_lon, float(lat) * m_per_deg_lat])
-    node_id = cast(Hashable, _normalize_node_id(node_ids[int(idx)]))
+    node_id = cast(Hashable, _normalize_node_id(node_ids[int(snap_indices[int(idx)])]))
     _COORD_NODE_MEMO[memo_key] = node_id
     return node_id
 
@@ -316,9 +271,10 @@ def _snap_node_idx(network_type, lat, lon, cfg: PipelineConfig | None = None):
         return cached
     bundle = graphml.get_mode_csr(network_type, cfg)
     tree = bundle["tree"]
+    snap_indices = bundle["snap_indices"]
     m_per_deg_lon, m_per_deg_lat = bundle["scale"]
     _, idx = tree.query([float(lon) * m_per_deg_lon, float(lat) * m_per_deg_lat])
-    i = int(idx)
+    i = int(snap_indices[int(idx)])
     _NODE_IDX_MEMO[memo_key] = i
     return i
 
@@ -344,6 +300,7 @@ def snap_origin_nodes_by_mode(coords_by_id, cfg: PipelineConfig | None = None, m
     for mode in modes:
         bundle = graphml.get_mode_csr(mode, cfg)
         tree = bundle["tree"]
+        snap_indices = bundle["snap_indices"]
         m_per_deg_lon, m_per_deg_lat = bundle["scale"]
         query_xy = np.array(
             [
@@ -354,7 +311,7 @@ def snap_origin_nodes_by_mode(coords_by_id, cfg: PipelineConfig | None = None, m
         )
         _, idxs = tree.query(query_xy)
         for nid, idx in zip(ids, np.atleast_1d(idxs)):
-            i = int(idx)
+            i = int(snap_indices[int(idx)])
             result[nid][mode] = i
             lat, lon = coords_by_id[nid]
             _NODE_IDX_MEMO[(mode, round(float(lat), 6), round(float(lon), 6))] = i
@@ -722,5 +679,3 @@ def merge_rra_and_accessibility(decay_walk, decay_bike, decay_drive, decay_bus, 
     """
     rra = build_rra(decay_walk, decay_bike, decay_drive, decay_bus)
     return rra, accessibility_from_rra(rra, poi_type=poi_type, contribution_coefficient=contribution_coefficient)
-
-

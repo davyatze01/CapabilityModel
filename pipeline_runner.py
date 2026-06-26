@@ -34,15 +34,26 @@ def _resolve_qgis_executable(cfg: PipelineConfig) -> str | None:
     if qgis_on_path:
         return qgis_on_path
 
-    # Mac detection
+    # macOS and Linux detection (non-Windows). Covers distro packages, snap, and flatpak —
+    # the flatpak/snap export wrappers are single executables that forward args (the project
+    # path), so they work with the same Popen([exe, project]) launch path below.
     if os.name != "nt":
-        mac_candidates = [
+        home = os.path.expanduser("~")
+        unix_candidates = [
+            # macOS app bundles
             "/Applications/QGIS.app/Contents/MacOS/QGIS",
             "/Applications/QGIS-LTR.app/Contents/MacOS/QGIS",
-            "/usr/local/bin/qgis",
             "/opt/homebrew/bin/qgis",
+            # Linux: distro packages
+            "/usr/bin/qgis",
+            "/usr/local/bin/qgis",
+            # Linux: snap
+            "/snap/bin/qgis",
+            # Linux: flatpak export wrappers (system + per-user)
+            "/var/lib/flatpak/exports/bin/org.qgis.qgis",
+            os.path.join(home, ".local/share/flatpak/exports/bin/org.qgis.qgis"),
         ]
-        for candidate in mac_candidates:
+        for candidate in unix_candidates:
             if os.path.exists(candidate):
                 return candidate
         return None
@@ -70,10 +81,27 @@ def _resolve_qgis_executable(cfg: PipelineConfig) -> str | None:
     return candidates[0]
 
 
+def _python_has_pyqgis(python_path: str) -> bool:
+    """Return True if the given interpreter can import PyQGIS (qgis.core)."""
+    try:
+        env = dict(os.environ)
+        env.setdefault("QT_QPA_PLATFORM", "offscreen")  # don't need a display just to import
+        result = subprocess.run(
+            [python_path, "-c", "import qgis.core"],
+            capture_output=True,
+            timeout=60,
+            env=env,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def _resolve_qgis_python_launcher(qgis_exe: str) -> str | None:
     qgis_bin_dir = Path(qgis_exe).parent
-    
-    # Windows launcher candidates
+
+    # Windows: the .bat launchers set up the QGIS environment before invoking python, so they
+    # are the canonical entry point — return them directly without an import probe.
     windows_candidates = [
         qgis_bin_dir / "python-qgis-ltr.bat",
         qgis_bin_dir / "python-qgis.bat",
@@ -81,23 +109,38 @@ def _resolve_qgis_python_launcher(qgis_exe: str) -> str | None:
     for candidate in windows_candidates:
         if candidate.exists():
             return str(candidate)
-    
-    # Mac launcher candidates
+
+    # macOS bundled launchers/interpreters.
     qgis_contents_dir = qgis_bin_dir.parent
     qgis_app_dir = qgis_contents_dir.parent
     mac_candidates = [
         qgis_bin_dir / "python-qgis-ltr",
         qgis_bin_dir / "python-qgis",
-        qgis_bin_dir / "python3",
         qgis_bin_dir / "bin" / "python3",
         qgis_contents_dir / "Resources" / "python" / "bin" / "python3",
         qgis_contents_dir / "Resources" / "bin" / "python3",
         qgis_app_dir / "Contents" / "MacOS" / "bin" / "python3",
     ]
-    for candidate in mac_candidates:
-        if candidate.exists():
-            return str(candidate)
-    
+
+    # Linux: PyQGIS is installed into a system python by the distro/snap/flatpak, not a
+    # dedicated launcher. Candidates, checked in order of preference.
+    linux_candidates: list[Path] = [qgis_bin_dir / "python3", Path("/usr/bin/python3")]
+    which_py = shutil.which("python3")
+    if which_py:
+        linux_candidates.append(Path(which_py))
+
+    # Crucially, only accept an interpreter that can actually import PyQGIS. The previous code
+    # returned the first python3 it found, which on Linux could be one *without* the bindings
+    # (silently breaking the styling step). The import probe makes this correct by construction.
+    seen: set[str] = set()
+    for candidate in mac_candidates + linux_candidates:
+        path = str(candidate)
+        if path in seen or not candidate.exists():
+            continue
+        seen.add(path)
+        if _python_has_pyqgis(path):
+            return path
+
     return None
 
 
@@ -206,6 +249,9 @@ grid_layer = QgsVectorLayer({gpkg_literal} + "|layername=capability_grid", "Capa
 if not grid_layer.isValid():
     grid_layer = QgsVectorLayer({grid_sidecar_literal} + "|layername=capability_grid", "Capability grid", "ogr")
 if grid_layer.isValid():
+    # The colored (graduated) layer shows measured cells only. Hull-fill cells have null
+    # values so they wouldn't be colored anyway; the separate outline layer below draws every
+    # cell's border, so the filled study-area shape/perimeter still reads clearly.
     if "has_data" in [field.name() for field in grid_layer.fields()]:
         grid_layer.setSubsetString("has_data = 1")
 
@@ -281,7 +327,12 @@ app.exitQgis()
         script_path = handle.name
 
     try:
-        subprocess.run([python_launcher, script_path], check=True)
+        # Project generation needs no GUI; force the offscreen Qt platform so it also works
+        # over SSH / on headless machines without a display. setdefault lets an explicit
+        # QT_QPA_PLATFORM override win.
+        gen_env = dict(os.environ)
+        gen_env.setdefault("QT_QPA_PLATFORM", "offscreen")
+        subprocess.run([python_launcher, script_path], check=True, env=gen_env)
     except subprocess.CalledProcessError as exc:
         print(f"[QGIS] Failed to generate project: {exc}", flush=True)
         # Still return the path if it exists from a previous run
@@ -329,7 +380,12 @@ def _maybe_open_qgis(cfg: PipelineConfig, gpkg_path: Path | None) -> None:
         print("[QGIS] Skipping launch: no project or output path to open.", flush=True)
         return
 
-    subprocess.Popen(args)
+    # Detach so QGIS keeps running independently once the pipeline exits, and don't let it
+    # inherit/clutter our stdio. start_new_session is POSIX-only.
+    popen_kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    subprocess.Popen(args, **popen_kwargs)
     print(f"[QGIS] Launched QGIS: {qgis_exe}", flush=True)
 
 
@@ -452,6 +508,9 @@ def generate_spatial_outputs(cfg, cap):
             grid_cell_size_m=cfg.qgis_grid_cell_size_m,
             grid_capability_field=cfg.qgis_autostyle_field,
             grid_max_cells=cfg.qgis_grid_max_cells,
+            grid_fill_hull=cfg.qgis_grid_fill_hull,
+            grid_hull_buffer_m=cfg.qgis_grid_hull_buffer_m,
+            grid_hull_ratio=cfg.qgis_grid_hull_ratio,
         )
         print(f"[Output] Combined GeoPackage: {gpkg_output_path}", flush=True)
     except Exception as exc:

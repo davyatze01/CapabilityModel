@@ -54,6 +54,9 @@ def rebuild(slug_suffix: str = "") -> None:
         grid_cell_size_m=cfg.qgis_grid_cell_size_m,
         grid_capability_field=cfg.qgis_autostyle_field,
         grid_max_cells=cfg.qgis_grid_max_cells,
+        grid_fill_hull=cfg.qgis_grid_fill_hull,
+        grid_hull_buffer_m=cfg.qgis_grid_hull_buffer_m,
+        grid_hull_ratio=cfg.qgis_grid_hull_ratio,
     )
     print(f"[Rebuild] GeoPackage written: {gpkg_path} ({gpkg_path.stat().st_size / 1024:.0f} KB)")
 

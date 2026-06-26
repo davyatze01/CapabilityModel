@@ -103,6 +103,14 @@ class PipelineConfig:
     qgis_grid_capability_field: str = "capability_care"
     qgis_grid_opacity: float = 0.55
     qgis_grid_max_cells: int = 500000
+    # Fill the convex hull of the sampled nodes with hexagons (vs. only cells next to a node),
+    # so the study area's shape/perimeter is recognizable and interior holes are filled.
+    qgis_grid_fill_hull: bool = True
+    # Optional margin (metres) added around the hull before filling.
+    qgis_grid_hull_buffer_m: float = 0.0
+    # Boundary shape: >=1.0 = convex hull; ~0.3 = concave hull following a real concave outline
+    # (coastlines/bays); lower = tighter/jaggier. Falls back to convex if concave_hull fails.
+    qgis_grid_hull_ratio: float = 0.3
     poi_from_shp: bool = True
     poi_shapefile_paths: list[str] = field(
         default_factory=lambda: [
@@ -146,6 +154,8 @@ class PipelineConfig:
     poi_export_shapefile_path: str = ""
     poi_export_geopackage_path: str = ""
     hexagon_service_pois_path: str = ""
+    hex_pois_dir: str = ""
+    hex_pois_zip_path: str = ""
 
     debug_max_nodes: int | None = None
     debug_max_pois: int | None = None
@@ -153,7 +163,7 @@ class PipelineConfig:
     enable_progress: bool = True
 
     non_bus_cache_dir: str = ""
-    non_bus_cache_schema_version: int = 8
+    non_bus_cache_schema_version: int = 9
     poi_snap_cache_dir: str = ""
 
     # POI radius filtering — applies to bus and non-bus routing
@@ -191,15 +201,12 @@ class PipelineConfig:
     pool_max_retries: int = 4
     pool_retry_delay_s: float = 2.0
     non_bus_max_workers: int = 24
-    # Route non-bus Dijkstra on a topology-simplified copy of each mode graph.
-    # Origins/POIs are still enumerated and snapped on the full graph; only the
-    # shortest-path graph is simplified, which preserves network distances while
-    # cutting node count (and per-worker RAM) ~5x. Disable to route on full graphs.
-    route_on_simplified_graph: bool = True
-    # Estimated resident RAM per worker (mostly the mode graphs it loads). Used to
-    # derive a memory-safe worker count in context.build_context. Tune per dataset.
-    # Simplified routing graphs are far smaller, so this can be low when the flag
-    # above is on; raise it if you route on full graphs (Cagliari full ~= 3 GB).
+    # Non-bus routing always uses the full unsimplified graph topology, but workers
+    # load it through a compressed CSR/KD-tree bundle rather than a full NetworkX
+    # object. The legacy simplified-routing toggle is intentionally disabled.
+    route_on_simplified_graph: bool = False
+    # Estimated resident RAM per worker. With CSR-based routing this is mostly the
+    # compressed adjacency arrays and related caches rather than full mode graphs.
     mem_per_worker_gb: float = 1.2
     worker_mem_reserve_gb: float = 10.0
     bus_ticket_price : float = 1.3
@@ -255,3 +262,5 @@ class PipelineConfig:
         self.poi_export_geopackage_path = os.path.join(self.poi_export_dir, "pois_used.gpkg")
         self.poi_export_shapefile_path = self.poi_export_geopackage_path
         self.hexagon_service_pois_path = os.path.join(self.poi_export_dir, "hexagon_service_pois.json")
+        self.hex_pois_dir = os.path.join(self.poi_export_dir, "hex_pois")
+        self.hex_pois_zip_path = os.path.join(self.poi_export_dir, "hex_pois.zip")

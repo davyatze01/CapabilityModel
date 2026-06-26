@@ -18,14 +18,11 @@ Important implementation note:
 """
 
 import bisect
+import csv
 import os
 from collections import Counter, OrderedDict
 from pathlib import Path
-
-import geopandas as gpd
-import numpy as np
-import pandas as pd
-
+from statistics import pstdev
 
 from config import ELECTRE_Q_FACTOR, ELECTRE_P_FACTOR
 
@@ -142,6 +139,162 @@ _CAT_SCORE   = {cat: (lo + hi) / 2
 _DEFAULT_V = float("inf")
 
 
+def electre_tri_details(x, capability):
+    """Return a step-by-step ELECTRE TRI explanation for one capability.
+
+    Inputs:
+    - x: service score list aligned to the capability service order.
+    - capability: target capability key.
+
+    Outputs:
+    - dict with thresholds, per-boundary concordance/credibility steps,
+      assigned category, and returned midpoint score.
+    """
+    services = CAPABILITY_SERVICES[capability]
+    if not services:
+        return {
+            "capability": capability,
+            "services": [],
+            "service_scores": {},
+            "boundaries": [],
+            "assigned_category": _CATEGORIES[0],
+            "assigned_category_index": 0,
+            "score": 0.0,
+        }
+    if len(x) != len(services):
+        raise ValueError(
+            f"Expected {len(services)} service scores for capability={capability!r}, got {len(x)}."
+        )
+
+    x_arr = [float(xi) for xi in x]
+    service_scores = {service: x_arr[idx] for idx, service in enumerate(services)}
+    std = float(pstdev(x_arr))
+    v = _ELECTRE_PARAMS[capability]["v"]
+
+    details = {
+        "capability": capability,
+        "services": list(services),
+        "service_scores": service_scores,
+        "std": std,
+        "q_factor": float(ELECTRE_Q_FACTOR),
+        "p_factor": float(ELECTRE_P_FACTOR),
+        "veto_threshold": float(v),
+        "lambda_cut": 0.65,
+        "boundaries": [],
+    }
+
+    if std < 1e-9:
+        idx = bisect.bisect_right(_BOUNDARIES, x_arr[0])
+        assigned_idx = min(idx, len(_CATEGORIES) - 1)
+        details.update(
+            {
+                "mode": "constant_scores",
+                "q": 0.0,
+                "p": 0.0,
+                "assigned_category": _CATEGORIES[assigned_idx],
+                "assigned_category_index": assigned_idx,
+                "score": _CAT_SCORE[_CATEGORIES[assigned_idx]],
+                "rule": "All service scores are equal, so thresholds collapse to zero and the score is placed by boundary bisection.",
+            }
+        )
+        return details
+
+    q = std * ELECTRE_Q_FACTOR
+    p = std * ELECTRE_P_FACTOR
+    inf_veto = v == float("inf")
+    pq_range = p - q
+    w = 1.0 / len(x_arr)
+
+    assigned_idx = 0
+    for k, b in enumerate(_BOUNDARIES):
+        concordance_terms = []
+        concordance_sum = 0.0
+        for service, xj in zip(services, x_arr):
+            d = xj - b
+            if d >= -q:
+                c_j = 1.0
+                rule = "full"
+            elif d > -p:
+                c_j = (d + p) / pq_range
+                rule = "partial"
+            else:
+                c_j = 0.0
+                rule = "none"
+            concordance_sum += c_j
+            concordance_terms.append(
+                {
+                    "service": service,
+                    "score": xj,
+                    "difference_vs_boundary": d,
+                    "partial_concordance": c_j,
+                    "rule": rule,
+                }
+            )
+
+        C = concordance_sum * w
+        cred = C
+        discordance_terms = []
+        veto_triggered = False
+
+        if not inf_veto and C < 1.0:
+            for service, xj in zip(services, x_arr):
+                gap = b - xj
+                term = {
+                    "service": service,
+                    "gap": gap,
+                    "discordance": 0.0,
+                    "adjusted_credibility": cred,
+                    "rule": "inactive",
+                }
+                if gap > v:
+                    cred = 0.0
+                    veto_triggered = True
+                    term["rule"] = "full_veto"
+                    term["adjusted_credibility"] = cred
+                    discordance_terms.append(term)
+                    break
+                if gap > p:
+                    dj = (gap - p) / (v - p)
+                    term["discordance"] = dj
+                    if dj > C:
+                        cred *= (1.0 - dj) / (1.0 - C)
+                        term["rule"] = "attenuates"
+                    else:
+                        term["rule"] = "below_concordance"
+                    term["adjusted_credibility"] = cred
+                discordance_terms.append(term)
+
+        outranks = cred >= 0.65
+        if outranks:
+            assigned_idx = k + 1
+
+        details["boundaries"].append(
+            {
+                "boundary_index": k,
+                "boundary_value": b,
+                "concordance_terms": concordance_terms,
+                "global_concordance": C,
+                "discordance_terms": discordance_terms,
+                "credibility": cred,
+                "veto_triggered": veto_triggered,
+                "outranks_boundary": outranks,
+                "assigned_category_if_stopped_here": _CATEGORIES[min(k + 1, len(_CATEGORIES) - 1)] if outranks else _CATEGORIES[assigned_idx],
+            }
+        )
+
+    details.update(
+        {
+            "mode": "electre_tri_b",
+            "q": q,
+            "p": p,
+            "assigned_category": _CATEGORIES[assigned_idx],
+            "assigned_category_index": assigned_idx,
+            "score": _CAT_SCORE[_CATEGORIES[assigned_idx]],
+        }
+    )
+    return details
+
+
 def electre_tri_integration(x, capability):
     """Aggregate service scores into one capability score via ELECTRE TRI.
 
@@ -154,60 +307,7 @@ def electre_tri_integration(x, capability):
     - p = std(x) * ELECTRE_P_FACTOR  (preference)
     - v = read from config/capability.csv column veto_threshold
     """
-    services = CAPABILITY_SERVICES[capability]
-    if not services:
-        return 0.0
-    if len(x) != len(services):
-        raise ValueError(
-            f"Expected {len(services)} service scores for capability={capability!r}, got {len(x)}."
-        )
-
-    x_arr = [float(xi) for xi in x]
-    std = float(np.std(x_arr))
-
-    # When all scores are equal the thresholds collapse to zero → bisect directly.
-    if std < 1e-9:
-        idx = bisect.bisect_right(_BOUNDARIES, x_arr[0])
-        return _CAT_SCORE[_CATEGORIES[min(idx, len(_CATEGORIES) - 1)]]
-
-    q = std * ELECTRE_Q_FACTOR
-    p = std * ELECTRE_P_FACTOR
-    v = _ELECTRE_PARAMS[capability]["v"]
-    w = 1.0 / len(x_arr)          # uniform weights (equal for all criteria)
-    inf_veto = v == float("inf")
-    pq_range = p - q               # always > 0 since p > q
-
-    # ELECTRE TRI-B pessimistic rule: find the highest boundary that the
-    # alternative outranks (credibility ≥ λ=0.65) and assign to the next category.
-    assigned_idx = 0               # default: Very Low
-    for k, b in enumerate(_BOUNDARIES):
-        # --- concordance (per-criterion partial agreement) ---
-        C = 0.0
-        for xj in x_arr:
-            d = xj - b
-            if d >= -q:
-                C += 1.0
-            elif d > -p:
-                C += (d + p) / pq_range
-        C *= w
-
-        # --- credibility (concordance attenuated by discordance) ---
-        cred = C
-        if not inf_veto and C < 1.0:
-            for xj in x_arr:
-                gap = b - xj       # how much the boundary dominates this criterion
-                if gap > v:        # full veto
-                    cred = 0.0
-                    break
-                if gap > p:
-                    dj = (gap - p) / (v - p)
-                    if dj > C:
-                        cred *= (1.0 - dj) / (1.0 - C)
-
-        if cred >= 0.65:
-            assigned_idx = k + 1
-
-    return _CAT_SCORE[_CATEGORIES[assigned_idx]]
+    return float(electre_tri_details(x, capability)["score"])
 
 
 # Stable service order for each capability.
@@ -230,9 +330,15 @@ output_path = Path(__file__).resolve().parents[1] / "config" / "capability.csv"
 _saved_v: dict[str, float] = {}
 if output_path.exists():
     try:
-        _existing = pd.read_csv(output_path)
-        for _, row in _existing.iterrows():
-            _saved_v[row["capability"]] = float(row.get("veto_threshold", _DEFAULT_V))
+        with open(output_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                capability = str(row.get("capability", "")).strip()
+                if not capability:
+                    continue
+                raw_veto = str(row.get("veto_threshold", "")).strip()
+                if raw_veto:
+                    _saved_v[capability] = float(raw_veto)
     except Exception:
         pass
 
@@ -246,13 +352,17 @@ for capability, services in CAPABILITY_SERVICES.items():
         "enabled":        True,
     })
 
-df = pd.DataFrame(rows)
-df.to_csv(output_path, index=False)
+with open(output_path, "w", newline="", encoding="utf-8") as f:
+    writer = csv.DictWriter(
+        f,
+        fieldnames=["capability", "services", "electre_weight", "veto_threshold", "enabled"],
+    )
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
 
 # Runtime lookup consumed by electre_tri_integration().
 _ELECTRE_PARAMS = {
-    row["capability"]: {
-        "v": float(row["veto_threshold"]),
-    }
-    for _, row in df.iterrows()
+    str(row["capability"]): {"v": float(row["veto_threshold"])}
+    for row in rows
 }

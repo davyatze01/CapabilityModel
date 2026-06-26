@@ -292,8 +292,14 @@ def _resolve_r5r_java_home() -> str | None:
     if override:
         return override
 
+    home = os.path.expanduser("~")
     candidates = ["/usr/lib/jvm/java-21-openjdk"]
-    for pattern in ("/usr/lib/jvm/java-21*", "/usr/lib/jvm/*-21-*", "/usr/lib/jvm/jdk-21*"):
+    for pattern in (
+        "/usr/lib/jvm/java-21*", "/usr/lib/jvm/*-21-*", "/usr/lib/jvm/jdk-21*",
+        # Fedora 44 has no Java 21 package, so it's commonly a home/tarball install.
+        os.path.join(home, "jdks", "jdk-21*"), os.path.join(home, "jdks", "*-21*"),
+        os.path.join(home, ".sdkman", "candidates", "java", "21*"),
+    ):
         candidates.extend(sorted(glob.glob(pattern)))
     for path in candidates:
         if os.path.isfile(os.path.join(path, "bin", "java")):
@@ -326,6 +332,13 @@ def _run_r5r_script(script_path: str, ctx: PipelineContext) -> None:
     if java_home:
         env["JAVA_HOME"] = java_home
         env["PATH"] = os.path.join(java_home, "bin") + os.pathsep + env.get("PATH", "")
+        # JAVA_HOME alone is not enough: R's etc/ldpaths sets R_JAVA_LD_LIBRARY_PATH (only if
+        # unset) to whatever JVM `R CMD javareconf` detected — here the system Java 25 — and
+        # prepends it to LD_LIBRARY_PATH, so rJava's dlopen("libjvm.so") loads Java 25 and r5r
+        # aborts with "requires Java-SE Development Kit 21". Exporting it ourselves to Java 21's
+        # lib/server pre-empts that default and makes rJava load the right JVM, with no root/
+        # javareconf change needed.
+        env["R_JAVA_LD_LIBRARY_PATH"] = os.path.join(java_home, "lib", "server")
         print(f"[Bus Routing] Using Java 21 for r5r: {java_home}", flush=True)
     else:
         print(

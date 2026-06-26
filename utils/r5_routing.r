@@ -27,7 +27,11 @@ destinations <- fread(
   colClasses = list(character = "id")
 )
 
-download_r5(version = "7.4.0", force_update = FALSE)
+# Use the R5 version that the installed r5r package expects by default (currently 7.5.1).
+# Hard-pinning 7.4.0 fails on this r5r release: it looks for a 7.4.0 jar that doesn't match
+# r5r's expected size and reports "R5 Jar file is corrupted". The matching jar is already
+# cached under ~/.cache/R/r5r by the package default.
+download_r5(force_update = FALSE)
 
 gtfs_files <- list.files(gtfs_path, pattern = "\\.zip$", full.names = TRUE)
 if (length(gtfs_files) == 0) {
