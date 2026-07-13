@@ -1,9 +1,89 @@
-# Set memory to 16 GB
-options(java.parameters = "-Xmx16G")
+# JVM heap: read from R5_JVM_MAX_HEAP_GB (set by Python from the cgroup budget)
+# or fall back to 12G. Smaller than the old 16G so that G1GC's concurrent
+# collection cycles are faster — each cycle scans less heap and the stop-the-world
+# pause after an expanded_travel_time_matrix call stays under the MaxGCPauseMillis
+# target instead of blocking for several minutes on a 16G heap.
+r5_jvm_max_heap_gb <- Sys.getenv("R5_JVM_MAX_HEAP_GB", unset = "16")
+cat(sprintf("[r5_routing] JVM heap: -Xmx%sG\n", r5_jvm_max_heap_gb))
+options(java.parameters = c(
+  sprintf("-Xmx%sG", r5_jvm_max_heap_gb),
+  "-XX:ErrorFile=hs_err_pid%p.log",
+  # Fail fast instead of struggling indefinitely. By default the JVM only throws
+  # OutOfMemoryError once it truly cannot allocate — with a large heap and plenty of
+  # headroom, G1GC will instead spend a very long time running increasingly expensive
+  # concurrent-mark/refinement cycles trying to free enough space, which from the
+  # outside is indistinguishable from a hang. These two flags make it declare defeat
+  # much sooner (default GCTimeLimit=98%/GCHeapFreeLimit=2% tolerates near-total time
+  # spent GCing before giving up) and then immediately exit the process instead of
+  # continuing to try — restoring the old "runs out of memory -> crashes" behaviour
+  # instead of the current "runs out of memory -> hangs" one. The retry loop around
+  # this script already resumes from the last completed chunk on any crash.
+  "-XX:+ExitOnOutOfMemoryError",
+  "-XX:GCTimeLimit=90",
+  "-XX:GCHeapFreeLimit=5"
+))
 
 # R library for bus routing
 library(r5r)
 library(data.table)
+
+# Memory visibility around each chunk. Three independent numbers, because each one can
+# lie on its own:
+#   - JVM heap (Runtime.totalMemory/freeMemory): only the Java heap. System.gc() acts here.
+#   - R heap (gc()): only R's own Ncells/Vcells (data.table's expanded/best-route tables).
+#   - Process RSS (/proc/self/status): the OS's actual view of this process's resident
+#     memory, INCLUDING off-heap/native allocations (JNI direct buffers, Arrow arenas,
+#     GDAL/GEOS native memory) that neither gc() nor System.gc() can touch. If RSS keeps
+#     climbing chunk over chunk while JVM-used and R-used stay flat, that proves the leak
+#     is in native/off-heap memory, not something more rm()/gc() calls can fix.
+# Printed before routing, right after routing (peak, before cleanup), and after
+# rm()+gc() so we can see directly whether cleanup is actually reclaiming space between
+# chunks, or whether usage is ratcheting up chunk over chunk.
+.mem_baseline_rss_gb <- NULL
+
+process_rss_gb <- function() {
+  status_lines <- tryCatch(readLines("/proc/self/status"), error = function(e) character(0))
+  rss_line <- grep("^VmRSS:", status_lines, value = TRUE)
+  if (length(rss_line) == 0) return(NA_real_)
+  kb <- as.numeric(gsub("[^0-9]", "", rss_line[1]))
+  kb / 1024^2
+}
+
+report_memory <- function(label, track_baseline = FALSE, trigger_gc = FALSE) {
+  rt <- rJava::.jcall("java/lang/Runtime", "Ljava/lang/Runtime;", "getRuntime")
+  jvm_total <- rJava::.jcall(rt, "J", "totalMemory") / 1024^3
+  jvm_free  <- rJava::.jcall(rt, "J", "freeMemory") / 1024^3
+  jvm_max   <- rJava::.jcall(rt, "J", "maxMemory") / 1024^3
+  jvm_used  <- jvm_total - jvm_free
+
+  # gc() doesn't just report memory, it RUNS a collection (even with full=FALSE it still
+  # collects gen0). Only the "after cleanup" checkpoint should trigger one — that's the
+  # collection this code already intentionally did before this instrumentation existed.
+  # Forcing it at "before"/"peak" too would scan live data (ettm can be 9M+ rows with
+  # JNI/Arrow buffers behind it right at peak) that was never collected at those points
+  # before, and risks being the actual stall itself. So skip R-heap reporting there
+  # entirely — RSS (below) already reflects R's live memory without forcing anything.
+  r_used_str <- "n/a (not measured, to avoid forcing GC)"
+  if (trigger_gc) {
+    g <- gc(verbose = FALSE)
+    r_used_str <- sprintf("%.0fMB", sum(g[, 2]))  # "used" column (Mb), Ncells + Vcells rows
+  }
+
+  rss_gb <- process_rss_gb()
+  rss_delta_str <- ""
+  if (track_baseline && !is.na(rss_gb)) {
+    if (is.null(.mem_baseline_rss_gb)) {
+      .mem_baseline_rss_gb <<- rss_gb
+    } else {
+      rss_delta_str <- sprintf("  (%+0.2fGB vs first post-cleanup baseline)", rss_gb - .mem_baseline_rss_gb)
+    }
+  }
+
+  cat(sprintf(
+    "[mem] %-28s  RSS=%.2fGB%s   JVM used=%.2fGB / max=%.2fGB   R used=%s\n",
+    label, rss_gb, rss_delta_str, jvm_used, jvm_max, r_used_str
+  ))
+}
 
 # Paths can be injected by Python via env vars.
 gtfs_path <- Sys.getenv("R5_DATA_PATH", unset = "gtfs")
@@ -66,10 +146,17 @@ process_chunk <- function(origins_chunk, chunk_index, n_chunks, chunk_path) {
   # Keep routing IDs as character to avoid numeric/bit64 coercion artifacts.
   ettm[, from_id := as.character(from_id)]
   ettm[, to_id := as.character(to_id)]
-  setorder(ettm, from_id, to_id, total_time, wait_time, departure_time)
-  best_ettm <- ettm[, .SD[1], by = .(from_id, to_id)]
+  # Pick the minimum-total_time row per (from_id, to_id) pair via index lookup
+  # instead of sorting the full table first.  setorder on 48M rows is O(n log n)
+  # and was causing multi-minute stalls after "Preparing final output... DONE!".
+  best_idx <- ettm[, .I[which.min(total_time)], by = .(from_id, to_id)]$V1
+  best_ettm <- ettm[best_idx]
 
-  fwrite(best_ettm, chunk_path)
+  # Write atomically so a crash mid-write can't leave a truncated chunk that a
+  # later resume would mistake for completed work.
+  tmp_path <- paste0(chunk_path, ".tmp")
+  fwrite(best_ettm, tmp_path)
+  file.rename(tmp_path, chunk_path)
 
   rm(ettm, best_ettm)
   gc()
@@ -83,6 +170,7 @@ process_origin_dest_chunk <- function(origins_chunk, destinations_chunk, chunk_l
     "\nProcessing %s with %d origins and %d destinations\n",
     chunk_label, nrow(origins_chunk), nrow(destinations_chunk)
   ))
+  report_memory(sprintf("before routing (%s)", chunk_label))
 
   ettm <- expanded_travel_time_matrix(
       r5r_network = r5r_network,
@@ -97,15 +185,37 @@ process_origin_dest_chunk <- function(origins_chunk, destinations_chunk, chunk_l
       progress = TRUE,
       verbose = FALSE
   )
+  cat(sprintf(
+    "Got %d expanded rows for %s; selecting fastest departure per OD pair...\n",
+    nrow(ettm), chunk_label
+  ))
+  report_memory(sprintf("after routing, peak (%s)", chunk_label))
   ettm[, from_id := as.character(from_id)]
   ettm[, to_id := as.character(to_id)]
-  setorder(ettm, from_id, to_id, total_time, wait_time, departure_time)
-  best_ettm <- ettm[, .SD[1], by = .(from_id, to_id)]
+  # Pick the minimum-total_time row per (from_id, to_id) pair via index lookup
+  # instead of sorting the full table first. setorder on tens of millions of rows
+  # is O(n log n) and was silently stalling for minutes after "DONE!" with no
+  # console output — this mirrors the fix already applied in process_chunk().
+  best_idx <- ettm[, .I[which.min(total_time)], by = .(from_id, to_id)]$V1
+  best_ettm <- ettm[best_idx]
 
-  fwrite(best_ettm, chunk_path)
+  cat(sprintf(
+    "Selected %d OD pairs for %s; writing chunk to disk...\n",
+    nrow(best_ettm), chunk_label
+  ))
+
+  # Write atomically so a crash mid-write can't leave a truncated chunk that a
+  # later resume would mistake for completed work.
+  tmp_path <- paste0(chunk_path, ".tmp")
+  fwrite(best_ettm, tmp_path)
+  file.rename(tmp_path, chunk_path)
 
   rm(ettm, best_ettm)
   gc()
+  tryCatch(rJava::.jcall("java/lang/System", "V", "gc"), error = function(e) NULL)
+  report_memory(sprintf("after cleanup (%s)", chunk_label), track_baseline = TRUE, trigger_gc = TRUE)
+
+  cat(sprintf("Chunk written: %s\n", chunk_path))
 
   chunk_path
 }
@@ -121,19 +231,15 @@ destination_chunk_size <- min(dest_chunk_size, 5000L)
 n_destination_chunks <- ceiling(nrow(destinations) / destination_chunk_size)
 
 dir.create(chunk_dir, recursive = TRUE, showWarnings = FALSE)
-stale_chunk_files <- list.files(
-  chunk_dir,
-  pattern = "^chunk_[0-9]{3}(_[0-9]{3})?\\.csv$",
-  full.names = TRUE
-)
-if (length(stale_chunk_files) > 0) {
-  cat(sprintf("Removing %d stale chunk file(s) from %s\n", length(stale_chunk_files), chunk_dir))
-  unlink(stale_chunk_files, force = TRUE)
-}
 chunk_files <- character()
 
 # routing inputs
-mode <- c("WALK", "TRANSIT")
+# Transit mode is injected by Python (R5_TRANSIT_MODE): "TRANSIT" routes all transit layers
+# (single-feed cities), while "BUS"/"SUBWAY" route a single layer so each modality of a
+# combined feed (e.g. IDFM) is routed separately.
+transit_mode <- Sys.getenv("R5_TRANSIT_MODE", unset = "TRANSIT")
+mode <- c("WALK", transit_mode)
+cat(sprintf("Routing transit mode: %s\n", transit_mode))
 max_trip_duration <- 60 # minutes
 
 
@@ -142,6 +248,23 @@ departure_datetime <- as.POSIXct(
   departure_dt_text,
   format = "%Y-%m-%d %H:%M:%S"
 )
+
+# Resume support: skip chunks already computed by a previous run. No fingerprint
+# check against the origin/destination CSVs or routing parameters -- a chunk
+# file present in this city+transport-type's own chunk_dir (a distinct directory
+# per city and per transport type, e.g. artifacts/<city>/bus/r5r_chunks) is
+# treated as valid and reused as-is. This trades away protection against a
+# genuinely stale chunk left over from a *different* job reusing this same
+# directory (e.g. a prior run with a different chunk_size, destination set, or
+# departure time) in exchange for never discarding good progress: the previous
+# md5-based fingerprint invalidated (and wiped) all chunks whenever Python
+# regenerated the origin/destination CSVs with any incidental difference (byte
+# order, floating-point formatting, etc.) even when the job was identical --
+# which is what caused a mid-job crash retry to restart from chunk 1 instead of
+# resuming. If you deliberately change chunk_size, destination_chunk_size, mode,
+# or the origins/destinations for a city+transport_type, clear that chunk_dir
+# yourself before rerunning.
+cat(sprintf("Resume: reusing any existing chunk files in %s.\n", chunk_dir))
 
 
 for (chunk_index in seq_len(n_chunks)) {
@@ -167,12 +290,19 @@ for (chunk_index in seq_len(n_chunks)) {
       chunk_dir,
       sprintf("chunk_%03d_%03d.csv", chunk_index, dest_chunk_index)
     )
-    chunk_path <- process_origin_dest_chunk(
-      origins_chunk,
-      destinations_chunk,
-      sprintf("origin chunk %d/%d, destination chunk %d/%d", chunk_index, n_chunks, dest_chunk_index, n_destination_chunks),
-      chunk_path
-    )
+    if (file.exists(chunk_path) && file.info(chunk_path)$size > 0) {
+      cat(sprintf(
+        "Skipping completed origin chunk %d/%d, destination chunk %d/%d\n",
+        chunk_index, n_chunks, dest_chunk_index, n_destination_chunks
+      ))
+    } else {
+      process_origin_dest_chunk(
+        origins_chunk,
+        destinations_chunk,
+        sprintf("origin chunk %d/%d, destination chunk %d/%d", chunk_index, n_chunks, dest_chunk_index, n_destination_chunks),
+        chunk_path
+      )
+    }
     chunk_files <- c(chunk_files, chunk_path)
   }
 }

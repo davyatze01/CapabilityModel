@@ -1,10 +1,26 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Mapping
 
 import pandas as pd
 from shapely.geometry.base import BaseGeometry
+
+
+# Every column build_poi_source_key may read. Callers that iterate large POI tables
+# should extract only these (plus geometry) once and pass plain dicts, instead of
+# materializing a full per-row Series over a frame that can have thousands of OSM tag
+# columns — doing the latter over hundreds of thousands of rows is both very slow and
+# has segfaulted pandas on large OSM universes.
+SOURCE_KEY_COLUMNS: tuple[str, ...] = (
+    "osmid", "element_type",
+    "id", "fid", "objectid", "OBJECTID", "osm_id",
+    "name",
+    "addr:street", "street", "road",
+    "addr:neighbourhood", "neighbourhood", "suburb", "district", "quarter",
+    "city_district", "locality",
+    "addr:postcode", "postcode", "postal_code", "CAP",
+)
 
 
 def _normalize_scalar(value: Any) -> Any:
@@ -27,8 +43,12 @@ def _normalize_scalar(value: Any) -> Any:
     return value
 
 
-def build_poi_source_key(row: pd.Series, geom: BaseGeometry) -> str:
-    """Build a stable identifier for one POI source row."""
+def build_poi_source_key(row: Mapping[str, Any], geom: BaseGeometry) -> str:
+    """Build a stable identifier for one POI source row.
+
+    ``row`` may be a pandas Series or a plain dict — only ``.get`` over
+    :data:`SOURCE_KEY_COLUMNS` is used, so both behave identically.
+    """
     osmid = row.get("osmid")
     if osmid is not None:
         return json.dumps(

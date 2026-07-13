@@ -3,6 +3,7 @@ import os
 import pickle
 import math
 import multiprocessing as mp
+import sqlite3
 import threading
 import time
 from typing import Any, cast
@@ -51,7 +52,14 @@ atexit.register(_terminate_active_accessibility_pool)
 _BUS_IMPEDANCE_MATRIX: NDArray[np.float32] | None = None
 _BUS_SOURCE_ID_TO_ROW: dict[str, int] | None = None
 _BUS_DEST_COORD_TO_COL: dict[tuple[float, float], int] | None = None
+# Optional second public-transport modality (subway). Left None when the city has no subway,
+# in which case subway is excluded from the RRA entirely (mode count stays 4).
+_SUBWAY_IMPEDANCE_MATRIX: NDArray[np.float32] | None = None
+_SUBWAY_SOURCE_ID_TO_ROW: dict[str, int] | None = None
+_SUBWAY_DEST_COORD_TO_COL: dict[tuple[float, float], int] | None = None
 _ACCESS_DEDUPLICATE_ENTRIES: bool = True
+# Per-service POI dedup: source_keys each poi_type must drop (owned by another type).
+_POI_DROP_BY_TYPE: dict[str, set[str]] = {}
 
 _POI_RADIUS_ENABLED: bool = False
 _POI_RADIUS_M: float | None = None
@@ -190,6 +198,8 @@ def _accessibility_run_signature(ctx: PipelineContext, bus: BusRoutingStageResul
     Outputs:
     - str SHA1 signature used to validate cache reuse.
     """
+    from utils import poi_dedup
+    dedup_enabled = bool(ctx.config.poi_service_dedup_enabled and poi_dedup.is_osm_mode(ctx.config))
     payload = {
         "schema": int(ctx.config.accessibility_matrix_schema_version),
         "bus_departure": bus.routing_departure_iso,
@@ -197,9 +207,22 @@ def _accessibility_run_signature(ctx: PipelineContext, bus: BusRoutingStageResul
         "bus_destinations_sig": bus.destinations_sig,
         "non_bus_cache_schema": int(ctx.config.non_bus_cache_schema_version),
         "poi_config_signature": serv.config_signature(),
+        # Toggling/altering per-service POI dedup changes per-poi_type accessibility,
+        # so its state must invalidate the cached matrix.
+        "poi_dedup_enabled": dedup_enabled,
+        "poi_dedup_drop_sig": _file_sha1(ctx.config.poi_ownership_drop_path) if dedup_enabled else "",
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _file_sha1(path: str) -> str:
+    """SHA1 of a file's bytes, or empty string when absent/unreadable."""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha1(f.read()).hexdigest()
+    except Exception:
+        return ""
 
 
 
@@ -311,6 +334,54 @@ def _load_poi_by_node(path: str) -> dict[str, dict[str, float]]:
         return {}
 
 
+def _load_source_key_to_id(gpkg_path: str) -> dict[str, int]:
+    """Read source_key -> integer poi id from the POI export GeoPackage.
+
+    Uses sqlite3 directly to avoid loading geometry data.
+    Returns {} when the GPKG is absent or lacks the expected table/columns.
+    """
+    if not os.path.exists(gpkg_path):
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{gpkg_path}?mode=ro", uri=True)
+        rows = con.execute("SELECT source_key, id FROM pois_used").fetchall()
+        con.close()
+        return {row[0]: int(row[1]) for row in rows}
+    except Exception:
+        return {}
+
+
+def _write_poi_by_node_sparse(
+    node_id: Any,
+    accessibility_by_poi: dict[str, float],
+    source_key_to_id: dict[str, int],
+    out_dir: str,
+) -> None:
+    """Persist per-POI accessibility for one node as a compact compressed numpy file.
+
+    Stores only nonzero values whose source_key has a known poi id in source_key_to_id.
+    The file {out_dir}/{node_id}.npz contains two 1-D arrays:
+      - 'poi_ids'  uint32: poi integer ids from the POI export GPKG
+      - 'values'   float32: corresponding accessibility values
+    """
+    poi_ids_list: list[int] = []
+    values_list: list[float] = []
+    for sk, val in accessibility_by_poi.items():
+        if val > 0.0:
+            pid = source_key_to_id.get(sk)
+            if pid is not None:
+                poi_ids_list.append(pid)
+                values_list.append(val)
+    if not poi_ids_list:
+        return
+    path = os.path.join(out_dir, f"{node_id}.npz")
+    np.savez_compressed(
+        path,
+        poi_ids=np.array(poi_ids_list, dtype=np.uint32),
+        values=np.array(values_list, dtype=np.float32),
+    )
+
+
 def _build_node_result_from_matrix_row(
     node_id: Any,
     node_data: dict[str, Any],
@@ -389,6 +460,11 @@ def _init_accessibility_worker(
     poi_radius_m=None,
     poi_radius_decay_threshold=0.05,
     poi_radius_max_speed_kmh=60.0,
+    subway_matrix_path=None,
+    subway_source_id_to_row_path=None,
+    subway_dest_id_to_col_path=None,
+    subway_dest_csv_path=None,
+    poi_drop_map_path=None,
 ):
     """Initialize worker-local state for accessibility multiprocessing.
 
@@ -403,13 +479,17 @@ def _init_accessibility_worker(
     - poi_radius_m: fixed radius in metres (skips decay computation when set).
     - poi_radius_decay_threshold: threshold for computing radius from decay coefficient.
     - poi_radius_max_speed_kmh: reference speed for computing radius.
+    - subway_matrix_path / subway_source_id_to_row_path / subway_dest_id_to_col_path /
+      subway_dest_csv_path: optional paths for the subway modality. When all are provided the
+      worker loads a second impedance matrix; when None subway is excluded from the RRA.
 
     Outputs:
     - None. Populates worker globals used during node computation.
     """
     global _NON_BUS_CACHE_SCHEMA_VERSION, _NON_BUS_POI_CONFIG_SIGNATURE, _ACCESS_PROGRESS_VALUE
     global _BUS_SOURCE_ID_TO_ROW, _BUS_DEST_COORD_TO_COL, _BUS_IMPEDANCE_MATRIX
-    global _ACCESS_DEDUPLICATE_ENTRIES
+    global _SUBWAY_SOURCE_ID_TO_ROW, _SUBWAY_DEST_COORD_TO_COL, _SUBWAY_IMPEDANCE_MATRIX
+    global _ACCESS_DEDUPLICATE_ENTRIES, _POI_DROP_BY_TYPE
     global _POI_RADIUS_ENABLED, _POI_RADIUS_M, _POI_RADIUS_DECAY_THRESHOLD, _POI_RADIUS_MAX_SPEED_KMH, _global_radius_m
     _POI_RADIUS_ENABLED = bool(poi_radius_enabled)
     _POI_RADIUS_M = poi_radius_m
@@ -430,6 +510,8 @@ def _init_accessibility_worker(
     _NON_BUS_CACHE_SCHEMA_VERSION = non_bus_cache_schema_version
     _NON_BUS_POI_CONFIG_SIGNATURE = str(non_bus_poi_config_signature or "")
     _ACCESS_DEDUPLICATE_ENTRIES = bool(deduplicate_entries)
+    from utils import poi_dedup
+    _POI_DROP_BY_TYPE = poi_dedup.load_drop_map(poi_drop_map_path) if poi_drop_map_path else {}
     _ACCESS_PROGRESS_VALUE = access_progress_value
     with open(source_id_to_row_path, encoding="utf-8") as f:
         source_id_to_row_raw = json.load(f)
@@ -451,6 +533,33 @@ def _init_accessibility_worker(
         matrix_path, dtype=np.float32, mode="r",
         shape=(len(_BUS_SOURCE_ID_TO_ROW), len(dest_id_to_col))
     )
+
+    # Optional subway modality: load a second impedance matrix + coord index when configured.
+    _SUBWAY_SOURCE_ID_TO_ROW = None
+    _SUBWAY_DEST_COORD_TO_COL = None
+    _SUBWAY_IMPEDANCE_MATRIX = None
+    if subway_matrix_path:
+        with open(subway_source_id_to_row_path, encoding="utf-8") as f:
+            subway_src_raw = json.load(f)
+        _SUBWAY_SOURCE_ID_TO_ROW = {str(k): int(v) for k, v in subway_src_raw.items()}
+
+        with open(subway_dest_id_to_col_path, encoding="utf-8") as f:
+            subway_dest_raw = json.load(f)
+        subway_dest_id_to_col = {str(k): int(v) for k, v in subway_dest_raw.items()}
+
+        _SUBWAY_DEST_COORD_TO_COL = {}
+        with open(subway_dest_csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                coord = (round(float(row["lat"]), 6), round(float(row["lon"]), 6))
+                col = subway_dest_id_to_col.get(row["id"])
+                if col is not None:
+                    _SUBWAY_DEST_COORD_TO_COL[coord] = int(col)
+
+        _SUBWAY_IMPEDANCE_MATRIX = np.memmap(
+            subway_matrix_path, dtype=np.float32, mode="r",
+            shape=(len(_SUBWAY_SOURCE_ID_TO_ROW), len(subway_dest_id_to_col))
+        )
+
     # Yield CPU under safe mode so accessibility workers don't pin the machine at full load.
     from runtime_setup import lower_process_priority_if_safe
     lower_process_priority_if_safe()
@@ -519,6 +628,15 @@ def _compute_node_accessibility(item):
         coord_key_cache: dict[tuple[float, float], tuple[float, float]] = {}
         exp = math.exp
 
+        # Subway is optional: only active when the worker was initialized with a subway matrix.
+        subway_enabled = (
+            _SUBWAY_IMPEDANCE_MATRIX is not None
+            and _SUBWAY_SOURCE_ID_TO_ROW is not None
+            and _SUBWAY_DEST_COORD_TO_COL is not None
+        )
+        subway_source_row = _SUBWAY_SOURCE_ID_TO_ROW.get(str(node_id)) if subway_enabled else None
+        subway_imp_cache: dict[tuple[float, float], float | None] = {}
+
         def _get_imp(coord_key: tuple[float, float]) -> float | None:
             """Return bus impedance for one destination coordinate using lazy memoization.
 
@@ -543,6 +661,21 @@ def _compute_node_accessibility(item):
             v = float(impedance_matrix[source_row, dest_col])
             imp = v if v > 0 else None
             imp_cache[coord_key] = imp
+            return imp
+
+        def _get_imp_subway(coord_key: tuple[float, float]) -> float | None:
+            """Return subway impedance for one destination coordinate (None when no subway)."""
+            if not subway_enabled or subway_source_row is None:
+                return None
+            if coord_key in subway_imp_cache:
+                return subway_imp_cache[coord_key]
+            dest_col = _SUBWAY_DEST_COORD_TO_COL.get(coord_key)
+            if dest_col is None:
+                subway_imp_cache[coord_key] = None
+                return None
+            v = float(_SUBWAY_IMPEDANCE_MATRIX[subway_source_row, dest_col])
+            imp = v if v > 0 else None
+            subway_imp_cache[coord_key] = imp
             return imp
 
         def _normalize_coord_key(coord: tuple[float, float]) -> tuple[float, float]:
@@ -583,9 +716,17 @@ def _compute_node_accessibility(item):
             imp_walk_list = entry.get("imp_walk", [])
             imp_bike_list = entry.get("imp_bike", [])
             imp_drive_list = entry.get("imp_drive", [])
+            # Per-service dedup: this poi_type does not own these physical POIs, so they
+            # are counted under another poi_type of the same service. Zeroing keeps index
+            # alignment with source_keys and is equivalent to removal in the Delta-g sum.
+            source_keys = entry.get("source_keys", [])
+            drop_keys = _POI_DROP_BY_TYPE.get(poi_type)
 
             poi_accs: list[float] = []
             for i, coord in enumerate(entry["poi_coords"]):
+                if drop_keys and i < len(source_keys) and str(source_keys[i]) in drop_keys:
+                    poi_accs.append(0.0)
+                    continue
                 if _POI_RADIUS_ENABLED and origin_coord is not None and _global_radius_m is not None:
                     if _haversine_m(origin_coord[0], origin_coord[1], coord[0], coord[1]) > _global_radius_m:
                         poi_accs.append(0.0)
@@ -595,6 +736,13 @@ def _compute_node_accessibility(item):
                 imp_bus = _get_imp(coord_key)
                 d_bus = 0.0 if imp_bus is None else exp(neg_beta * imp_bus)
 
+                # Subway is an independent extra mode; only included when the city has it.
+                if subway_enabled:
+                    imp_subway = _get_imp_subway(coord_key)
+                    d_subway = 0.0 if imp_subway is None else exp(neg_beta * imp_subway)
+                else:
+                    d_subway = None
+
                 walk_i = imp_walk_list[i] if i < len(imp_walk_list) else None
                 bike_i = imp_bike_list[i] if i < len(imp_bike_list) else None
                 drive_i = imp_drive_list[i] if i < len(imp_drive_list) else None
@@ -603,11 +751,16 @@ def _compute_node_accessibility(item):
                 d_bike  = 0.0 if bike_i  is None else exp(neg_beta * float(bike_i))
                 d_drive = 0.0 if drive_i is None else exp(neg_beta * float(drive_i))
 
-                _, poi_acc = delta_g.merge_rra_and_accessibility(
+                # Per-POI accessibility A^i_k(x, y) is exactly the RRA over modes
+                # (formula 2). The Delta-g aggregation belongs only at the POI-type
+                # level (Step 2), so do not pass this single value through it.
+                # Passing [d_subway] only when subway is enabled keeps the mode count at 4
+                # for cities without subway (identical results) and 5 where it exists.
+                rra_list = delta_g.build_rra(
                     [d_walk], [d_bike], [d_drive], [d_bus],
-                    poi_type=poi_type,
+                    [d_subway] if subway_enabled else None,
                 )
-                poi_accs.append(poi_acc)
+                poi_accs.append(rra_list[0] if rra_list else 0.0)
             return poi_accs
 
         # --- Step 1: compute per-POI accessibility for every unique entry ----
@@ -694,14 +847,37 @@ def run_accessibility_stage(
     node_to_row: dict[str, int] = {}
     poi_to_col: dict[str, int] = {}
 
+    # Resolve per-service POI ownership and persist the drop map BEFORE the matrix
+    # cache check, so the run signature reflects the current dedup state. Writing an
+    # empty map when disabled/shapefile clears any stale map from a prior run.
+    from utils import poi_dedup
+    if ctx.config.poi_service_dedup_enabled and poi_dedup.is_osm_mode(ctx.config):
+        try:
+            drop_map = poi_dedup.build_drop_map(ctx.config)
+            poi_dedup.write_drop_map(ctx.config, drop_map=drop_map)
+            n_dropped = sum(len(v) for v in drop_map.values())
+            print(
+                f"[Accessibility] POI service dedup: {n_dropped} duplicate POI assignments "
+                f"removed across {len(drop_map)} poi_types.",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[Accessibility] POI dedup drop-map build failed ({exc}); proceeding without dedup.", flush=True)
+            poi_dedup.write_drop_map(ctx.config, drop_map={})
+    else:
+        poi_dedup.write_drop_map(ctx.config, drop_map={})
+
     mat, node_to_row, poi_to_col = _open_or_create_accessibility_matrix_cache(ctx, bus)
 
-    # Load per-POI accessibility companion (used to restore individual POI scores on cache hits).
-    poi_by_node_map: dict[str, dict[str, float]] = (
-        _load_poi_by_node(ctx.config.accessibility_poi_by_node_path)
-        if ctx.config.accessibility_matrix_cache_enabled
-        else {}
-    )
+    # Set up per-node sparse accessibility directory — individual POI accessibility is
+    # written as one small compressed .npz per node instead of a single giant JSON file,
+    # so it is never fully resident in memory during or after the accessibility stage.
+    poi_by_node_dir: str = ctx.config.accessibility_poi_by_node_dir or ""
+    source_key_to_id: dict[str, int] = {}
+    if poi_by_node_dir:
+        source_key_to_id = _load_source_key_to_id(ctx.config.poi_export_geopackage_path)
+        if source_key_to_id:
+            os.makedirs(poi_by_node_dir, exist_ok=True)
 
     # Preload complete node rows from cache and compute only missing rows.
     pending: dict[Any, str] = {}
@@ -714,11 +890,17 @@ def run_accessibility_stage(
         )
         for node_id, data in ctx.nodes_with_coords:
             row = node_to_row[str(node_id)]
-            if required_cols.size > 0 and _row_is_complete(mat, row, required_cols):
+            # A node is a full cache hit only when its matrix row is complete AND its
+            # per-node sparse file already exists (or no sparse files are needed).
+            need_sparse = bool(source_key_to_id and poi_by_node_dir)
+            sparse_exists = (
+                os.path.exists(os.path.join(poi_by_node_dir, f"{node_id}.npz"))
+                if need_sparse else True
+            )
+            if required_cols.size > 0 and _row_is_complete(mat, row, required_cols) and sparse_exists:
                 result.node_results.append(
                     _build_node_result_from_matrix_row(
                         node_id, data, row, mat, poi_to_col,
-                        accessibility_by_poi=poi_by_node_map.get(str(node_id)),
                     )
                 )
                 reused_cached_rows += 1
@@ -793,6 +975,12 @@ def run_accessibility_stage(
                         ctx.config.poi_radius_m,
                         ctx.config.poi_radius_decay_threshold,
                         ctx.config.poi_radius_max_speed_kmh,
+                        # Subway modality (None when disabled for this city).
+                        ctx.config.subway_impedance_matrix_path if ctx.config.enable_subway else None,
+                        ctx.config.subway_source_id_to_row_path if ctx.config.enable_subway else None,
+                        ctx.config.subway_dest_id_to_col_path if ctx.config.enable_subway else None,
+                        ctx.config.subway_routing_destinations_input_path if ctx.config.enable_subway else None,
+                        ctx.config.poi_ownership_drop_path,
                     ),
                 )
                 _ACTIVE_ACCESSIBILITY_POOL = pool
@@ -806,11 +994,16 @@ def run_accessibility_stage(
                 for data in pool.imap_unordered(_compute_node_accessibility, pending_batch, chunksize=chunksize):
                     if data is None:
                         continue
-                    result.node_results.append(data)
                     if mat is not None:
                         row = node_to_row.get(str(data.node_id))
                         if row is not None:
                             _write_node_result_to_matrix(mat, row, poi_to_col, data)
+                    if source_key_to_id and poi_by_node_dir and data.accessibility_by_poi:
+                        _write_poi_by_node_sparse(
+                            data.node_id, data.accessibility_by_poi, source_key_to_id, poi_by_node_dir
+                        )
+                        data.accessibility_by_poi = {}
+                    result.node_results.append(data)
                     if data.node_id in pending:
                         pending.pop(data.node_id, None)
                         made_progress = True
@@ -859,15 +1052,6 @@ def run_accessibility_stage(
 
     if mat is not None:
         mat.flush()
-
-    # Persist per-POI accessibility so cache-hit nodes can restore it on future runs.
-    if ctx.config.accessibility_matrix_cache_enabled:
-        for node in result.node_results:
-            if node.accessibility_by_poi:
-                poi_by_node_map[str(node.node_id)] = node.accessibility_by_poi
-        if poi_by_node_map:
-            with open(ctx.config.accessibility_poi_by_node_path, "w", encoding="utf-8") as f:
-                json.dump(poi_by_node_map, f, ensure_ascii=False, separators=(",", ":"))
 
     total_entries = 0
     nonzero_entries = 0

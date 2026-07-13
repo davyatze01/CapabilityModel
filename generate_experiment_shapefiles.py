@@ -16,6 +16,28 @@ DEFAULT_GRAPH_MODE = "bike"
 DEFAULT_EXPERIMENTS_DIR = Path("experiments")
 DEFAULT_OUTPUT_DIR = Path("outputs/shapefiles")
 
+# Table name for the capability-grid layer in the exported GeoPackage. When a
+# colleague drags the whole .gpkg into QGIS (rather than opening our generated
+# project), QGIS's own "select layers to add" dialog re-sorts the candidate
+# layers by name before adding them -- our gpkg_contents insertion order (which
+# controls plain GDAL/OGR enumeration) turned out not to matter for that
+# dialog. A name that alphabetically sorts after every "service_*" view name
+# is the only thing that reliably keeps this hatch layer on top once dragged
+# in, since each newly-added layer stacks above the ones already added.
+GRID_TABLE_NAME = "zz_capability_grid"
+
+# One isobands table per capability, one dissolved region per ELECTRE class band
+# (Very Low .. Very High) in each. Named to sort after GRID_TABLE_NAME so a bare
+# drag-in stacks them consistently relative to the hatch grid, and split per
+# capability so all three can be loaded side by side in the project and toggled
+# independently instead of only ever showing whichever single field the grid
+# happens to be colored by.
+ISOBANDS_TABLE_NAMES = {
+    "nutrition": "zzz_capability_isobands_nutrition",
+    "care": "zzz_capability_isobands_care",
+    "restorativeness": "zzz_capability_isobands_restorativeness",
+}
+
 
 def _read_experiment_csv(csv_path: Path) -> pd.DataFrame:
     """Read one experiment CSV and reject files that are empty or malformed."""
@@ -155,10 +177,16 @@ def _prepare_combined_geodataframe(csv_paths: list[Path], graph: nx.Graph) -> gp
         if combined is not None and metric_name in combined.columns:
             metric_name = f"{value_column}_{current_csv.stem}"
 
-        # Include all capability_* columns so a single CSV carrying all capabilities
-        # is passed through intact rather than reduced to one column.
-        cap_cols = [col for col in gdf.columns if str(col).startswith("capability_") and col != value_column]
-        keep = ["join_key", "node_id", "lon", "lat", "geometry", value_column] + cap_cols
+        # Include all capability_* and service_* columns so a single CSV carrying
+        # every capability and its underlying services is passed through intact
+        # rather than reduced to one column.
+        extra_cols = [
+            col
+            for col in gdf.columns
+            if (str(col).startswith("capability_") or str(col).startswith("service_"))
+            and col != value_column
+        ]
+        keep = ["join_key", "node_id", "lon", "lat", "geometry", value_column] + extra_cols
         slim = gdf[[col for col in keep if col in gdf.columns]].copy()
         slim = slim.rename(columns={value_column: metric_name})
 
@@ -340,6 +368,9 @@ def generate_combined_experiment_gpkg(
     grid_fill_hull: bool = True,
     grid_hull_buffer_m: float = 0.0,
     grid_hull_ratio: float = 0.3,
+    grid_params_path: str | Path | None = None,
+    grid_exclude_water: bool = True,
+    grid_water_cache_path: str | Path | None = None,
 ) -> Path:
     """Generate one GeoPackage containing all selected experiment CSVs."""
     graph_dir = Path(graph_dir)
@@ -368,18 +399,70 @@ def generate_combined_experiment_gpkg(
             fill_hull=bool(grid_fill_hull),
             hull_buffer_m=float(grid_hull_buffer_m),
             hull_ratio=float(grid_hull_ratio),
+            grid_params_path=grid_params_path,
+            exclude_water=bool(grid_exclude_water),
+            water_cache_path=grid_water_cache_path,
         )
         if grid_layer is not None and not grid_layer.empty:
             grid_layer = _prepare_gpkg_layer(grid_layer)
+            # Write the grid to its own throwaway single-layer GeoPackage (a GDAL
+            # write that never appends, so it can't hit the "NULL pointer" append
+            # bug), then fold its table into output_path via plain SQL. This keeps
+            # the export to exactly one file instead of sometimes falling back to
+            # a second "_grid" sidecar when GDAL's append path is broken.
+            staging_grid = output_path.with_name(f"{output_path.stem}_grid_staging{output_path.suffix}")
+            if staging_grid.exists():
+                staging_grid.unlink()
+            _write_gpkg_layer(grid_layer, staging_grid, layer_name=GRID_TABLE_NAME, mode="w")
             try:
-                _write_gpkg_layer(grid_layer, output_path, layer_name="capability_grid", mode="a")
-            except Exception:
-                # Keep point-layer export successful even when some GDAL builds
-                # fail to append a second (polygon) layer with "NULL pointer".
-                sidecar_grid = output_path.with_name(f"{output_path.stem}_grid{output_path.suffix}")
-                if sidecar_grid.exists():
-                    sidecar_grid.unlink()
-                _write_gpkg_layer(grid_layer, sidecar_grid, layer_name="capability_grid", mode="w")
+                _merge_gpkg_table(staging_grid, output_path, GRID_TABLE_NAME)
+            finally:
+                staging_grid.unlink()
+
+            try:
+                service_views = _create_service_grid_views(output_path)
+                if service_views:
+                    print(f"[Export] Registered {len(service_views)} per-service views in {output_path.name}", flush=True)
+            except Exception as exc:
+                print(f"[Export] Failed to register per-service views: {exc}", flush=True)
+
+            # Filled iso-value polygons, one per capability, each dissolving the
+            # grid's own hexagon cells into one region per ELECTRE class band
+            # (Very Low .. Very High) -- so band boundaries follow hexagon edges
+            # instead of a smoothed contour. Built for every capability present
+            # in the grid, not just the one it's currently colored by, so all
+            # three can be loaded in the project and toggled independently.
+            from utils.isolines import compute_capability_isobands_from_cells
+
+            for _capability, _iso_table in ISOBANDS_TABLE_NAMES.items():
+                try:
+                    iso_value_field = f"grid_mean_{_capability}"
+                    if iso_value_field not in grid_layer.columns:
+                        print(f"[Export] Skipping iso-bands: {iso_value_field} not in grid.", flush=True)
+                        continue
+
+                    isobands = compute_capability_isobands_from_cells(grid_layer, iso_value_field)
+                    if isobands is None or isobands.empty:
+                        print(f"[Export] No iso-value bands produced for {_capability} (field too sparse).", flush=True)
+                        continue
+
+                    isobands = _prepare_gpkg_layer(isobands)
+                    staging_iso = output_path.with_name(
+                        f"{output_path.stem}_iso_staging_{_capability}{output_path.suffix}"
+                    )
+                    if staging_iso.exists():
+                        staging_iso.unlink()
+                    _write_gpkg_layer(isobands, staging_iso, layer_name=_iso_table, mode="w")
+                    try:
+                        _merge_gpkg_table(staging_iso, output_path, _iso_table)
+                    finally:
+                        staging_iso.unlink()
+                    print(
+                        f"[Export] Wrote {len(isobands)} iso-value bands ({_iso_table}) from {iso_value_field}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(f"[Export] Failed to build iso-bands for {_capability}: {exc}", flush=True)
 
             # Write a flat CSV indexed by hex_id so QGIS attributes and the
             # tabular output share the same primary key.
@@ -390,7 +473,159 @@ def generate_combined_experiment_gpkg(
                 ) + [c for c in grid_layer.columns if c.startswith("grid_mean_")]
                 grid_layer[csv_cols].to_csv(hex_csv_path, index=False)
 
+    # Done last, and only via a plain sqlite3 DDL edit (not a GDAL/OGR write):
+    # doing this in between the GDAL writes above confuses GDAL's own cache of
+    # the file's schema and reliably breaks the capability_grid append that
+    # follows (observed as GDAL's "NULL pointer" error).
+    try:
+        _hide_gpkg_layer(output_path, "capability_points")
+    except Exception as exc:
+        print(f"[Export] Failed to hide capability_points layer: {exc}", flush=True)
+
     return output_path
+
+
+def _merge_gpkg_table(src_gpkg: Path, dest_gpkg: Path, table_name: str) -> None:
+    """Copy one vector table from src_gpkg into dest_gpkg via plain SQLite.
+
+    GDAL's own "append a second layer" path (`to_file(..., mode="a")`) is
+    unreliable in some environments -- both the pyogrio and fiona engines can
+    fail identically with a "NULL pointer error" -- which used to force a
+    second, sidecar .gpkg file just to hold the grid layer. Writing the grid to
+    its own throwaway single-layer GeoPackage (a GDAL write that always
+    succeeds, since it never appends) and then copying its table straight into
+    the main file with SQL avoids GDAL's append path entirely, so the caller
+    always ends up with exactly one output file.
+
+    A GeoPackage geometry column is a BLOB with a small header wrapping
+    standard WKB, so a raw `CREATE TABLE ... AS SELECT *` byte-copies valid
+    geometries as-is. Both files share the same CRS (EPSG:4326), so the srs_id
+    referenced by src's gpkg_geometry_columns row already exists in dest.
+
+    The connection is opened on src (not dest) and dest is ATTACHed, not the
+    other way around: dest was already written by GDAL earlier in this same
+    process, and a fresh sqlite3 connection rooted on a file GDAL just touched
+    fails to see tables in a freshly-ATTACHed second file ("no such table"),
+    even though that file is on disk and intact -- some GDAL builds leave
+    process-wide SQLite state (e.g. shared-cache mode) that only manifests when
+    that file is the *primary* connection. Rooting the connection on src (the
+    one nothing has opened yet) and writing into the ATTACHed dest avoids it.
+    """
+    import sqlite3
+
+    with sqlite3.connect(src_gpkg) as conn:
+        conn.execute("ATTACH DATABASE ? AS dest", (str(dest_gpkg),))
+        try:
+            conn.execute(f'DROP TABLE IF EXISTS dest."{table_name}"')
+            conn.execute(f'CREATE TABLE dest."{table_name}" AS SELECT * FROM "{table_name}"')
+            conn.execute("DELETE FROM dest.gpkg_contents WHERE table_name = ?", (table_name,))
+            conn.execute(
+                "INSERT INTO dest.gpkg_contents SELECT * FROM gpkg_contents WHERE table_name = ?",
+                (table_name,),
+            )
+            conn.execute("DELETE FROM dest.gpkg_geometry_columns WHERE table_name = ?", (table_name,))
+            conn.execute(
+                "INSERT INTO dest.gpkg_geometry_columns SELECT * FROM gpkg_geometry_columns WHERE table_name = ?",
+                (table_name,),
+            )
+            conn.commit()
+        finally:
+            conn.execute("DETACH DATABASE dest")
+
+
+def _hide_gpkg_layer(gpkg_path: Path, table_name: str) -> None:
+    """Unregister a table as a GeoPackage vector layer without touching its data.
+
+    Removes the table from gpkg_contents/gpkg_geometry_columns so QGIS/OGR no
+    longer list it as a layer on import, while the table itself (and its rows)
+    stays intact -- debug tooling (inspect_hex_pois.py, debug_pipeline.py) reads
+    it with plain `sqlite3` SELECTs on node_id/lon/lat, not through OGR, so it
+    keeps working unchanged.
+    """
+    import sqlite3
+
+    with sqlite3.connect(gpkg_path) as conn:
+        conn.execute("DELETE FROM gpkg_contents WHERE table_name = ?", (table_name,))
+        conn.execute("DELETE FROM gpkg_geometry_columns WHERE table_name = ?", (table_name,))
+        conn.commit()
+
+
+def _create_service_grid_views(gpkg_path: Path) -> list[str]:
+    """Expose each grid_mean_service_* column of the grid table as its own layer.
+
+    A GeoPackage can only carry ONE default style per table, so embedding the 11
+    per-service color maps on the grid table leaves them invisible on plain
+    import (QGIS applies just the table's default style). Registering one SQL
+    view per service (service_<name>) in gpkg_contents/gpkg_geometry_columns
+    makes each service appear as its own layer when the file is imported, and
+    each view can then carry its color map as its own default style. Views add
+    no data: they select straight from the grid table, filtered to measured
+    cells (has_data = 1) so hull-fill cells with NULL values are not drawn.
+    """
+    import sqlite3
+
+    created: list[str] = []
+    with sqlite3.connect(gpkg_path) as conn:
+        geom_row = conn.execute(
+            "SELECT column_name, geometry_type_name, srs_id, z, m "
+            "FROM gpkg_geometry_columns WHERE table_name = ?",
+            (GRID_TABLE_NAME,),
+        ).fetchone()
+        if geom_row is None:
+            return created
+        geom_col = str(geom_row[0])
+
+        columns = [str(row[1]) for row in conn.execute(f'PRAGMA table_info("{GRID_TABLE_NAME}")')]
+        service_columns = [c for c in columns if c.startswith("grid_mean_service_")]
+        base_columns = [c for c in ("fid", geom_col, "hex_id", "node_id", "has_data") if c in columns]
+        where_clause = 'WHERE "has_data" = 1' if "has_data" in columns else ""
+
+        for service_column in service_columns:
+            view = "service_" + service_column[len("grid_mean_service_"):]
+            select_list = ", ".join(f'"{c}"' for c in base_columns + [service_column])
+            conn.execute(f'DROP VIEW IF EXISTS "{view}"')
+            conn.execute(
+                f'CREATE VIEW "{view}" AS SELECT {select_list} FROM "{GRID_TABLE_NAME}" {where_clause}'
+            )
+            conn.execute("DELETE FROM gpkg_contents WHERE table_name = ?", (view,))
+            conn.execute(
+                "INSERT INTO gpkg_contents "
+                "(table_name, data_type, identifier, description, min_x, min_y, max_x, max_y, srs_id) "
+                "SELECT ?, data_type, ?, 'Per-service view of the capability grid', "
+                "min_x, min_y, max_x, max_y, srs_id "
+                "FROM gpkg_contents WHERE table_name = ?",
+                (view, view, GRID_TABLE_NAME),
+            )
+            conn.execute("DELETE FROM gpkg_geometry_columns WHERE table_name = ?", (view,))
+            conn.execute(
+                "INSERT INTO gpkg_geometry_columns "
+                "(table_name, column_name, geometry_type_name, srs_id, z, m) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (view, geom_col, geom_row[1], geom_row[2], geom_row[3], geom_row[4]),
+            )
+            created.append(view)
+
+        # Re-register the grid table last (highest gpkg_contents rowid). QGIS's
+        # querySublayers() -- what actually backs the "select layers to add"
+        # dialog when a plain .gpkg is dragged in, with no custom project to
+        # apply explicit z-order -- returns sublayers in gpkg_contents order,
+        # not alphabetically; each newly-added layer stacks above the ones
+        # already added, so whichever sublayer is listed last ends up on top.
+        # The grid table was registered before any of the service views, so it
+        # needs to be moved to the end alongside the alphabet-defeating name
+        # (GRID_TABLE_NAME) in case some other GIS tool's import instead goes
+        # by name.
+        grid_contents_row = conn.execute(
+            "SELECT * FROM gpkg_contents WHERE table_name = ?", (GRID_TABLE_NAME,)
+        ).fetchone()
+        if grid_contents_row is not None:
+            columns = [d[0] for d in conn.execute("SELECT * FROM gpkg_contents LIMIT 0").description]
+            conn.execute("DELETE FROM gpkg_contents WHERE table_name = ?", (GRID_TABLE_NAME,))
+            placeholders = ", ".join("?" for _ in columns)
+            conn.execute(f"INSERT INTO gpkg_contents ({', '.join(columns)}) VALUES ({placeholders})", grid_contents_row)
+
+        conn.commit()
+    return created
 
 
 def _build_capability_grid(
@@ -401,6 +636,9 @@ def _build_capability_grid(
     fill_hull: bool = True,
     hull_buffer_m: float = 0.0,
     hull_ratio: float = 0.3,
+    grid_params_path: str | Path | None = None,
+    exclude_water: bool = True,
+    water_cache_path: str | Path | None = None,
 ) -> gpd.GeoDataFrame | None:
     """Build a regular hex grid in the same coordinate system as the sampling grid.
 
@@ -421,6 +659,11 @@ def _build_capability_grid(
     hull_ratio selects the boundary shape: >= 1.0 = convex hull; ~0.3 = concave hull that follows
     a real concave outline (coastlines/bays); lower gets tighter/jaggier. Falls back to the convex
     hull if concave_hull is unavailable or fails.
+
+    exclude_water drops hull-fill cells (has_data=0, no real sampled node) that lie entirely
+    within OSM water polygons (natural=water, riverbanks, basins/reservoirs). Cells with a real
+    node (has_data=1) are always kept, and hull-fill cells only partly over water (e.g. a
+    coastline cell) are also kept, since the "fully submerged" test uses cell.within(water).
     """
     from scipy.spatial import cKDTree
 
@@ -430,10 +673,16 @@ def _build_capability_grid(
     if capability_field not in capability_columns:
         capability_field = capability_columns[0]
 
+    # Carry the underlying per-service scores through to the grid as well, so each
+    # hexagon exposes both its capability values and the individual service values
+    # that feed them (grid_mean_service_*).
+    service_columns = [column for column in points_gdf.columns if str(column).startswith("service_")]
+    value_columns = capability_columns + service_columns
+
     _id_col = "node_id" if "node_id" in points_gdf.columns else None
     _extra = [_id_col] if _id_col else []
-    work = points_gdf[["geometry"] + _extra + capability_columns].copy()
-    for column in capability_columns:
+    work = points_gdf[["geometry"] + _extra + value_columns].copy()
+    for column in value_columns:
         work[column] = pd.to_numeric(work[column], errors="coerce")
     work = work.dropna(subset=["geometry"])
     if work.empty:
@@ -449,8 +698,12 @@ def _build_capability_grid(
 
     # Try to reuse the exact grid parameters written by _hex_grid_sample_nodes
     # so both grids share an identical tiling (same bbox, same m_per_deg_lon).
+    # Prefer the caller-provided (per-city) path; the shared "outputs/grid_params.json"
+    # is a legacy fallback for callers that don't pass one — that shared file is
+    # overwritten by whichever city ran most recently, so relying on it here would
+    # silently draw one city's capability grid using another city's tiling.
     import json as _json
-    _params_path = Path("outputs") / "grid_params.json"
+    _params_path = Path(grid_params_path) if grid_params_path is not None else Path("outputs") / "grid_params.json"
     _loaded_params: dict | None = None
     try:
         with open(_params_path, encoding="utf-8") as _f:
@@ -483,7 +736,7 @@ def _build_capability_grid(
     if work.empty:
         return None
 
-    cap_arr = work[capability_columns].to_numpy(dtype=float)
+    cap_arr = work[value_columns].to_numpy(dtype=float)
     node_ids = work[_id_col].to_numpy() if _id_col else None
 
     # ── Hex geometry parameters ───────────────────────────────────────────────
@@ -559,12 +812,37 @@ def _build_capability_grid(
             )
             keep_mask = near_mask | inside_hull
 
+    # ── Fetch OSM water polygons covering the grid bbox (best-effort) ─────────
+    # Used below to drop hull-fill cells that lie entirely in water. Cached per city
+    # so repeat runs don't re-hit Overpass; falls back to no exclusion on any failure.
+    water_union = None
+    if exclude_water:
+        from utils.water_mask import get_water_union
+
+        try:
+            cache_path = (
+                Path(water_cache_path) if water_cache_path is not None else Path("outputs") / "water_mask.gpkg"
+            )
+            water_union = get_water_union(
+                min_lon=min_x / m_per_deg_lon,
+                min_lat=min_y / M_LAT,
+                max_lon=max_x / m_per_deg_lon,
+                max_lat=max_y / M_LAT,
+                cache_path=cache_path,
+                probe_lons=node_xy[:, 0] / m_per_deg_lon,
+                probe_lats=node_xy[:, 1] / M_LAT,
+            )
+        except Exception as exc:
+            print(f"[Water] Water exclusion unavailable ({exc}); keeping all hull-fill cells.", flush=True)
+            water_union = None
+
     # ── Build hex geometries in lon/lat by inverting the projection ───────────
     # Each vertex (vx, vy) in approx-Cartesian maps back to
     #   lon = vx / m_per_deg_lon,  lat = vy / M_LAT
     # hex_id = "H{col:04d}_{row:04d}" — unique per cell, stable across rebuilds
     # as long as grid_params.json (bbox + cell_size) does not change.
-    rename_map = {col: f"grid_mean_{col.replace('capability_', '')}" for col in capability_columns}
+    # capability_care -> grid_mean_care ; service_food_access -> grid_mean_service_food_access
+    rename_map = {col: f"grid_mean_{col.replace('capability_', '')}" for col in value_columns}
     cells: list[dict[str, object]] = []
     for cell_idx, ((cx, cy, c_i, r_i), node_idx) in enumerate(zip(centroids, idxs)):
         if not keep_mask[cell_idx]:
@@ -588,13 +866,31 @@ def _build_capability_grid(
         cell["has_data"] = int(is_real)
         if node_ids is not None:
             cell["node_id"] = str(node_ids[node_idx]) if is_real else None
-        for j, col in enumerate(capability_columns):
+        for j, col in enumerate(value_columns):
             if is_real:
                 v = cap_arr[node_idx, j]
                 cell[rename_map[col]] = float(v) if np.isfinite(v) else None
             else:
                 cell[rename_map[col]] = None
         cells.append(cell)
+
+    if not cells:
+        return None
+
+    # ── Drop hull-fill cells (no real node) that lie entirely within water ────
+    # Only candidates with has_data=0 are checked; a cell with a real node is kept
+    # regardless. cell.within(water_union) requires the WHOLE hexagon to be submerged,
+    # so cells straddling a coastline (partly land) are kept.
+    if water_union is not None and not water_union.is_empty:
+        import shapely
+
+        fill_idx = [i for i, c in enumerate(cells) if c["has_data"] == 0]
+        if fill_idx:
+            fill_geoms = np.array([cells[i]["geometry"] for i in fill_idx], dtype=object)
+            submerged = shapely.within(fill_geoms, water_union)
+            drop_idx = {fill_idx[k] for k, sub in enumerate(submerged) if sub}
+            if drop_idx:
+                cells = [c for i, c in enumerate(cells) if i not in drop_idx]
 
     if not cells:
         return None

@@ -20,8 +20,47 @@ SAFE_MODE = False
 WORKER_COUNT = None
 
 
+def _reexec_under_run_safe_if_needed() -> None:
+    """Re-run this entrypoint through run_safe.sh when not already in a cgroup scope.
+
+    VS Code's play button launches `python main.py` directly. This function replaces
+    the current process with `run_safe.sh main.py` so every run gets the systemd
+    memory-cgroup protection regardless of how it was started.
+
+    Inside the VS Code Flatpak sandbox systemd-run lives on the host, not in the
+    sandbox — so we use `flatpak-spawn --host` to exec run_safe.sh there.
+    """
+    if os.environ.get("CAP_MEM_BUDGET_GB"):
+        return  # already inside a run_safe.sh cgroup scope
+    if os.environ.get("CAP_SKIP_RUN_SAFE"):
+        return
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    run_safe = os.path.join(root, "run_safe.sh")
+    if not os.path.isfile(run_safe):
+        print(f"[Safe mode] run_safe.sh not found at {run_safe}; continuing without cgroup.", flush=True)
+        return
+
+    entry = os.path.abspath(__file__)
+    print("[Safe mode] Re-launching under run_safe.sh for memory-cgroup protection.", flush=True)
+
+    in_flatpak = os.path.isfile("/.flatpak-info")
+    if in_flatpak:
+        import shutil as _shutil
+        spawn = _shutil.which("flatpak-spawn")
+        if spawn:
+            # Run bash + run_safe.sh on the host where systemd-run is available.
+            os.execv(spawn, [spawn, "--host", "bash", run_safe, entry, *sys.argv[1:]])
+        print("[Safe mode] flatpak-spawn not available; continuing without cgroup.", flush=True)
+        return
+
+    os.execv("/usr/bin/env", ["env", "bash", run_safe, entry, *sys.argv[1:]])
+
+
 def main():
     """Run the full capability pipeline end-to-end and print generated output paths."""
+    _reexec_under_run_safe_if_needed()
+
     # Translate the script knobs into the env vars the runtime/stages read. Must happen
     # before run_runtime_setup() so the math-thread caps take effect before numpy is imported
     # (and propagate to spawned workers via inherited environment).
@@ -112,6 +151,13 @@ def main():
         # Using the snapped pois, we compute bus routes and distances.
         print("[Stage] Bus Routing", flush=True)
         bus = run_public_transport_routing_stage(ctx, snap, transport_type="bus")
+
+        # Cities with a combined feed (e.g. France/IDFM) also route subway as a second,
+        # independent public-transport modality. Artifacts land under artifacts/<city>/subway/
+        # and are picked up by the accessibility stage via cfg.subway_* paths.
+        if cfg.enable_subway:
+            print("[Stage] Subway Routing", flush=True)
+            run_public_transport_routing_stage(ctx, snap, transport_type="metro")
 
         # Using the snapped pois, we compute walk, car and bike routes and distances (non-bus).
         print("[Stage] Non-Bus Routing", flush=True)

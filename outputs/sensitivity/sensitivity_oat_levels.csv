@@ -1,0 +1,136 @@
+parameter,value,capability,level,pct_nodes
+q_factor,0.2,restorativeness,Very Low,0.0
+q_factor,0.2,restorativeness,Low,0.0
+q_factor,0.2,restorativeness,Medium,12.67
+q_factor,0.2,restorativeness,High,19.9
+q_factor,0.2,restorativeness,Very High,67.43
+q_factor,0.2,nutrition,Very Low,1.09
+q_factor,0.2,nutrition,Low,17.08
+q_factor,0.2,nutrition,Medium,14.08
+q_factor,0.2,nutrition,High,28.28
+q_factor,0.2,nutrition,Very High,39.48
+q_factor,0.2,care,Very Low,0.96
+q_factor,0.2,care,Low,9.28
+q_factor,0.2,care,Medium,12.6
+q_factor,0.2,care,High,49.07
+q_factor,0.2,care,Very High,28.09
+q_factor,0.25,restorativeness,Very Low,0.0
+q_factor,0.25,restorativeness,Low,0.0
+q_factor,0.25,restorativeness,Medium,12.54
+q_factor,0.25,restorativeness,High,19.77
+q_factor,0.25,restorativeness,Very High,67.69
+q_factor,0.25,nutrition,Very Low,1.09
+q_factor,0.25,nutrition,Low,17.08
+q_factor,0.25,nutrition,Medium,13.82
+q_factor,0.25,nutrition,High,28.53
+q_factor,0.25,nutrition,Very High,39.48
+q_factor,0.25,care,Very Low,0.96
+q_factor,0.25,care,Low,8.51
+q_factor,0.25,care,Medium,12.99
+q_factor,0.25,care,High,47.41
+q_factor,0.25,care,Very High,30.13
+q_factor,0.3,restorativeness,Very Low,0.0
+q_factor,0.3,restorativeness,Low,0.0
+q_factor,0.3,restorativeness,Medium,12.41
+q_factor,0.3,restorativeness,High,19.71
+q_factor,0.3,restorativeness,Very High,67.88
+q_factor,0.3,nutrition,Very Low,1.09
+q_factor,0.3,nutrition,Low,17.08
+q_factor,0.3,nutrition,Medium,13.76
+q_factor,0.3,nutrition,High,28.6
+q_factor,0.3,nutrition,Very High,39.48
+q_factor,0.3,care,Very Low,0.9
+q_factor,0.3,care,Low,8.13
+q_factor,0.3,care,Medium,12.8
+q_factor,0.3,care,High,46.0
+q_factor,0.3,care,Very High,32.18
+p_factor,0.65,restorativeness,Very Low,0.0
+p_factor,0.65,restorativeness,Low,0.0
+p_factor,0.65,restorativeness,Medium,13.18
+p_factor,0.65,restorativeness,High,20.28
+p_factor,0.65,restorativeness,Very High,66.54
+p_factor,0.65,nutrition,Very Low,1.09
+p_factor,0.65,nutrition,Low,17.21
+p_factor,0.65,nutrition,Medium,14.4
+p_factor,0.65,nutrition,High,28.21
+p_factor,0.65,nutrition,Very High,39.09
+p_factor,0.65,care,Very Low,0.96
+p_factor,0.65,care,Low,9.21
+p_factor,0.65,care,Medium,12.86
+p_factor,0.65,care,High,49.58
+p_factor,0.65,care,Very High,27.38
+p_factor,0.75,restorativeness,Very Low,0.0
+p_factor,0.75,restorativeness,Low,0.0
+p_factor,0.75,restorativeness,Medium,12.54
+p_factor,0.75,restorativeness,High,19.77
+p_factor,0.75,restorativeness,Very High,67.69
+p_factor,0.75,nutrition,Very Low,1.09
+p_factor,0.75,nutrition,Low,17.08
+p_factor,0.75,nutrition,Medium,13.82
+p_factor,0.75,nutrition,High,28.53
+p_factor,0.75,nutrition,Very High,39.48
+p_factor,0.75,care,Very Low,0.96
+p_factor,0.75,care,Low,8.51
+p_factor,0.75,care,Medium,12.99
+p_factor,0.75,care,High,47.41
+p_factor,0.75,care,Very High,30.13
+p_factor,0.85,restorativeness,Very Low,0.0
+p_factor,0.85,restorativeness,Low,0.0
+p_factor,0.85,restorativeness,Medium,11.77
+p_factor,0.85,restorativeness,High,19.77
+p_factor,0.85,restorativeness,Very High,68.46
+p_factor,0.85,nutrition,Very Low,1.09
+p_factor,0.85,nutrition,Low,16.89
+p_factor,0.85,nutrition,Medium,13.44
+p_factor,0.85,nutrition,High,28.66
+p_factor,0.85,nutrition,Very High,39.92
+p_factor,0.85,care,Very Low,0.9
+p_factor,0.85,care,Low,7.93
+p_factor,0.85,care,Medium,13.12
+p_factor,0.85,care,High,44.85
+p_factor,0.85,care,Very High,33.21
+lambda,0.6,restorativeness,Very Low,0.0
+lambda,0.6,restorativeness,Low,0.0
+lambda,0.6,restorativeness,Medium,2.75
+lambda,0.6,restorativeness,High,20.79
+lambda,0.6,restorativeness,Very High,76.46
+lambda,0.6,nutrition,Very Low,1.09
+lambda,0.6,nutrition,Low,16.89
+lambda,0.6,nutrition,Medium,13.63
+lambda,0.6,nutrition,High,28.53
+lambda,0.6,nutrition,Very High,39.86
+lambda,0.6,care,Very Low,0.9
+lambda,0.6,care,Low,7.49
+lambda,0.6,care,Medium,12.86
+lambda,0.6,care,High,42.1
+lambda,0.6,care,Very High,36.66
+lambda,0.65,restorativeness,Very Low,0.0
+lambda,0.65,restorativeness,Low,0.0
+lambda,0.65,restorativeness,Medium,12.54
+lambda,0.65,restorativeness,High,19.77
+lambda,0.65,restorativeness,Very High,67.69
+lambda,0.65,nutrition,Very Low,1.09
+lambda,0.65,nutrition,Low,17.08
+lambda,0.65,nutrition,Medium,13.82
+lambda,0.65,nutrition,High,28.53
+lambda,0.65,nutrition,Very High,39.48
+lambda,0.65,care,Very Low,0.96
+lambda,0.65,care,Low,8.51
+lambda,0.65,care,Medium,12.99
+lambda,0.65,care,High,47.41
+lambda,0.65,care,Very High,30.13
+lambda,0.7,restorativeness,Very Low,0.0
+lambda,0.7,restorativeness,Low,0.0
+lambda,0.7,restorativeness,Medium,13.5
+lambda,0.7,restorativeness,High,20.41
+lambda,0.7,restorativeness,Very High,66.09
+lambda,0.7,nutrition,Very Low,1.09
+lambda,0.7,nutrition,Low,17.21
+lambda,0.7,nutrition,Medium,14.14
+lambda,0.7,nutrition,High,28.41
+lambda,0.7,nutrition,Very High,39.16
+lambda,0.7,care,Very Low,1.02
+lambda,0.7,care,Low,9.53
+lambda,0.7,care,Medium,14.14
+lambda,0.7,care,High,52.14
+lambda,0.7,care,Very High,23.16

@@ -3,6 +3,7 @@ import pickle
 import random
 import hashlib
 import math
+import time
 from typing import cast
 
 import osmnx as ox
@@ -12,10 +13,12 @@ from tqdm import tqdm
 from context import PipelineContext
 from pipeline_types import SnappingStageResult
 from utils import graphml, services as serv, delta_g
-from osmnx.distance import nearest_nodes
 import numpy as np
 
-_SNAP_CACHE_SCHEMA_VERSION = 2
+_SNAP_CACHE_SCHEMA_VERSION = 3
+# Bump when the checkpoint payload layout or the set of inputs folded into its signature
+# changes, so old checkpoints are treated as stale instead of silently reused.
+_SNAP_CHECKPOINT_SCHEMA_VERSION = 1
 
 # Computes the haversine distance in meters between two points (lat1, lon1) and (lat2, lon2)
 def _haversine_m(lat1, lon1, lat2, lon2):
@@ -90,13 +93,19 @@ def _extract_geom_vertices(geom):
     rep = geom.representative_point()
     return [(rep.y, rep.x)]
 
-# In a single pass, all coordinates are snapped to the closest node of the graph 
-def _snap_coords_batch(graph, coords):
-    """Snap many coordinates to nearest graph nodes in one vectorized call.
+# In a single pass, all coordinates are snapped to the closest node of the graph
+def _snap_coords_batch(mode, coords, cfg=None):
+    """Snap many coordinates to nearest mode-graph nodes in one vectorized call.
+
+    Uses the compact CSR bundle's KD-tree (via delta_g.snap_coords_to_mode_nodes) rather
+    than a full NetworkX graph, so the multi-GB graph never has to be resident. The KD-tree
+    is built over the same full-graph node coordinates, so results are identical to the old
+    nearest_nodes(graph, ...) path.
 
     Inputs:
-    - graph: network graph used for nearest-node queries.
+    - mode: network mode string ("walk", "bike", "drive").
     - coords: list of source coordinates `(lat, lon)`.
+    - cfg: optional PipelineConfig.
 
     Outputs:
     - dict: `coord_key -> (snapped_coord, snap_distance_m)`.
@@ -110,21 +119,11 @@ def _snap_coords_batch(graph, coords):
         if key not in unique:
             unique[key] = (coord[0], coord[1])
             ordered.append(key)
-    lons = [unique[k][1] for k in ordered]
-    lats = [unique[k][0] for k in ordered]
-    nodes = nearest_nodes(graph, lons, lats)
-
-    if isinstance(nodes, np.ndarray):
-        nodes = nodes.tolist()
-    elif isinstance(nodes, tuple):
-        nodes = list(nodes)
-    elif not isinstance(nodes, list):
-        nodes = [nodes]
+    ordered_coords = [unique[k] for k in ordered]
+    snapped_coords = delta_g.snap_coords_to_mode_nodes(mode, ordered_coords, cfg)
     out = {}
     for idx, key in enumerate(ordered):
-        node_id = nodes[idx]
-        node_data = graph.nodes[node_id]
-        snapped = (node_data["y"], node_data["x"])
+        snapped = snapped_coords[idx]
         src = unique[key]
         dist_m = _haversine_m(src[0], src[1], snapped[0], snapped[1])
         out[key] = (snapped, dist_m)
@@ -263,6 +262,8 @@ def _load_poi_snap_cache(cache_dir, poi_key, cache_ns):
     Outputs:
     - cached payload object or None when file is missing/invalid.
     """
+    if os.environ.get("CAP_IGNORE_SNAP_CACHE"):
+        return None
     path = _poi_snap_cache_path(cache_dir, poi_key, cache_ns)
     if not os.path.exists(path):
         return None
@@ -293,11 +294,11 @@ def _save_poi_snap_cache(cache_dir, poi_key, payload, cache_ns):
 
 # This function builds the poi_snap_map. For each poi type, we have a list of snapped POIs. If the POI is a geometry or so, then that POI is represented with a list
 # containing the snapped node for each vertex. The selection of the node will be dependent to the origin of the routing.
-def _build_poi_snap_map(graph, query_by_key, enable_progress, cache_dir, cache_ns, max_pois=None, seed=42):
+def _build_poi_snap_map(mode, query_by_key, enable_progress, cache_dir, cache_ns, max_pois=None, seed=42, cfg=None):
     """Build POI-to-snap-candidates map, reusing cache when possible.
 
     Inputs:
-    - graph: target transport graph for snapping.
+    - mode: target transport mode ("walk", "bike", "drive") for CSR-based snapping.
     - query_by_key: mapping of query key to POI query definition.
     - enable_progress: whether to show progress bars.
     - cache_dir: snap cache directory.
@@ -315,6 +316,9 @@ def _build_poi_snap_map(graph, query_by_key, enable_progress, cache_dir, cache_n
     geom_vertex_map = {}
     pending_coords = {}
 
+    n_cache_hit = 0
+    n_cache_miss = 0
+    geom_fetch_s = 0.0
     for poi_key, query in query_by_key.items():
         cached = _load_poi_snap_cache(cache_dir, poi_key, cache_ns)
         normalized = _normalize_cached_snap_entries(cached)
@@ -322,17 +326,48 @@ def _build_poi_snap_map(graph, query_by_key, enable_progress, cache_dir, cache_n
         # treat them as stale so we retry POI extraction/snapping.
         if normalized is not None and len(normalized) > 0:
             poi_snap_map[poi_key] = normalized
+            n_cache_hit += 1
             continue
 
+        n_cache_miss += 1
+        _t_geom = time.monotonic()
         geometries = _get_query_geometries(query)
+        geom_fetch_s += time.monotonic() - _t_geom
+        if geom_fetch_s > 30 and n_cache_miss <= 5:
+            # First few misses are the likely explanation for a slow run overall, so
+            # surface per-key cost immediately instead of only a final summary.
+            print(
+                f"[Snap] {cache_ns}: poi_key={poi_key} took {time.monotonic() - _t_geom:.1f}s "
+                f"to fetch geometries (cache miss)",
+                flush=True,
+            )
         coords = []
         geom_vertices_list = []
         for item in geometries:
             geom, _poi_name, source_key = item
+            if isinstance(geom, dict) and "snap_coord" in geom:
+                try:
+                    coord_raw = geom.get("snap_coord")
+                    coord = (float(coord_raw[0]), float(coord_raw[1]))
+                    vertices_raw = geom.get("snap_vertices")
+                    geom_vertices = (
+                        [(float(v[0]), float(v[1])) for v in vertices_raw]
+                        if isinstance(vertices_raw, list) and vertices_raw
+                        else None
+                    )
+                except Exception:
+                    continue
+                coords.append((coord, source_key))
+                geom_vertices_list.append(geom_vertices)
+                continue
+
             if not delta_g._is_geometry(geom):
                 continue
             try:
                 if geom.geom_type == "Point":
+                    # Accessing Point.x/Point.y has segfaulted in this environment for
+                    # cached Paris geometries. Cached GeoJSON now uses the plain dict
+                    # path above; keep this fallback only for non-cached shapefile data.
                     g_point = cast(Point, geom)
                     coord = (float(g_point.y), float(g_point.x))
                     geom_vertices = None
@@ -362,8 +397,20 @@ def _build_poi_snap_map(graph, query_by_key, enable_progress, cache_dir, cache_n
                     continue
             point_coords.append(coord)
 
+    print(
+        f"[Snap] {cache_ns}: poi cache {n_cache_hit}/{n_cache_hit + n_cache_miss} hit "
+        f"({n_cache_miss} miss, {geom_fetch_s:.1f}s spent fetching their geometries)",
+        flush=True,
+    )
     snap_pbar = tqdm(total=len(point_coords), desc=f"Snapping stage: snap POIs ({cache_ns})", mininterval=0) if enable_progress else None
-    snapped_points = _snap_coords_batch(graph, point_coords)
+    print(f"[DIAG] {cache_ns}: calling _snap_coords_batch with {len(point_coords)} points", flush=True)
+    _t_snap = time.monotonic()
+    snapped_points = _snap_coords_batch(mode, point_coords, cfg)
+    print(
+        f"[DIAG] {cache_ns}: _snap_coords_batch done, {len(snapped_points)} results "
+        f"in {time.monotonic() - _t_snap:.1f}s",
+        flush=True,
+    )
 
     for poi_key, coords in pending_coords.items():
         snapped_list = []
@@ -403,8 +450,10 @@ def _build_poi_snap_map(graph, query_by_key, enable_progress, cache_dir, cache_n
     if snap_pbar:
         snap_pbar.update(len(point_coords))
         snap_pbar.close()
+    print(f"[DIAG] {cache_ns}: assignment loop done, {len(poi_snap_map)} keys", flush=True)
     for poi_key in query_by_key:
         poi_snap_map.setdefault(poi_key, [])
+    print(f"[DIAG] {cache_ns}: returning snap map", flush=True)
     return poi_snap_map
 
 # The snap map is then converted to a dictionary for faster lookup.
@@ -513,7 +562,7 @@ def _build_selected_routing_destinations(nodes_with_coords, poi_bus_snap_info_by
             single_candidate_selected.add(snapped_coord)
 
     total_pairs = len(multi_candidate_items) * len(nodes_with_coords)
-    pbar = tqdm(total=total_pairs, desc="Snapping stage: select bus D", mininterval=1) if (enable_progress and total_pairs > 0) else None
+    pbar = tqdm(total=total_pairs, desc="Bus routing: select destinations", mininterval=1) if (enable_progress and total_pairs > 0) else None
     last_refresh = 0.0
     selected = set()
     try:
@@ -573,6 +622,131 @@ def _filter_snap_map_by_radius(snap_map, poi_type_for_key, origin_coords, cfg):
     return filtered
 
 
+def _filter_snap_map_by_drop_map(snap_map, poi_type_for_key, drop_map):
+    """Remove snap entries owned by another poi_type of the same service (see utils.poi_dedup).
+
+    A physical OSM POI can match several poi_types of one service (overlapping tag
+    clauses); without this filter each one gets its own snap entry and is routed to
+    independently, inflating the bus destination set with duplicates of the same
+    physical location. `drop_map` (built once by `utils.poi_dedup.build_drop_map`)
+    says which poi_type/source_key pairs are non-owning duplicates to drop here,
+    before routing destinations are ever built from these candidates.
+
+    Inputs:
+    - snap_map: dict poi_key -> list of (source_coord, source_key, candidates).
+    - poi_type_for_key: dict poi_key -> poi_type string.
+    - drop_map: dict poi_type -> set of source_keys to drop (empty/absent = no-op).
+
+    Outputs:
+    - Filtered snap_map with the same structure.
+    """
+    if not drop_map:
+        return snap_map
+
+    filtered = {}
+    for poi_key, snap_entries in snap_map.items():
+        drop_keys = drop_map.get(poi_type_for_key.get(poi_key, poi_key))
+        if not drop_keys:
+            filtered[poi_key] = snap_entries
+            continue
+        kept = [entry for entry in snap_entries if str(entry[1]) not in drop_keys]
+        filtered[poi_key] = kept
+        if len(snap_entries) != len(kept):
+            poi_type = poi_type_for_key.get(poi_key, poi_key)
+            print(
+                f"[Snap] {poi_type:<35}  kept={len(kept)}/{len(snap_entries)} POIs after service-ownership dedup",
+                flush=True,
+            )
+    return filtered
+
+
+def _snap_checkpoint_signature(ctx: PipelineContext) -> str:
+    """Fingerprint the inputs that determine the snapping result.
+
+    Any change to the POI query set, the global radius, the dedup setting, the debug
+    sampling caps, or the origin coordinates changes the filtered snap map, so the
+    checkpoint must be invalidated. Rounded to the same 6-decimal precision snapping
+    itself uses so cosmetically-different but identical inputs still match.
+    """
+    cfg = ctx.config
+    h = hashlib.sha1()
+    h.update(
+        f"schema={_SNAP_CHECKPOINT_SCHEMA_VERSION}|snap={_SNAP_CACHE_SCHEMA_VERSION}|"
+        f"slug={cfg.artifact_slug}|".encode("utf-8")
+    )
+    for key in sorted(repr(serv.query_key(q)) for q in serv.unique_query_keys()):
+        h.update(key.encode("utf-8"))
+        h.update(b";")
+    radius_m = serv.get_global_radius_m(cfg)
+    h.update(
+        f"|radius={radius_m}|dedup={cfg.poi_service_dedup_enabled}"
+        f"|maxpois={cfg.debug_max_pois}|seed={cfg.seed}".encode("utf-8")
+    )
+    for _, data in ctx.nodes_with_coords:
+        h.update(f"{round(float(data['y']), 6)},{round(float(data['x']), 6)};".encode("ascii"))
+    return h.hexdigest()
+
+
+def write_snap_checkpoint(ctx: PipelineContext, result: SnappingStageResult) -> None:
+    """Persist the snapping result so a restart can skip re-running the stage.
+
+    Only `poi_mode_snap_info_by_type` is stored: it is pure coordinate data (a few MB,
+    no graphs — `shared_mode_graphs` is already empty). The bus view and query map are
+    reconstructed on load, so nothing is duplicated on disk.
+    """
+    path = ctx.config.snap_checkpoint_path
+    payload = {
+        "signature": _snap_checkpoint_signature(ctx),
+        "poi_mode_snap_info_by_type": result.poi_mode_snap_info_by_type,
+    }
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp_path, path)
+    print(f"[Snap] Wrote snapping checkpoint: {path}", flush=True)
+
+
+def load_snap_checkpoint(ctx: PipelineContext) -> SnappingStageResult | None:
+    """Load a previously written snapping checkpoint when it matches current inputs.
+
+    Returns None (so the caller recomputes) when the file is missing, unreadable, or its
+    signature no longer matches the current POI set / radius / origins. Honours
+    CAP_IGNORE_SNAP_CACHE, the same bypass switch used by the per-POI snap cache.
+    """
+    if os.environ.get("CAP_IGNORE_SNAP_CACHE"):
+        return None
+    path = ctx.config.snap_checkpoint_path
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("signature") != _snap_checkpoint_signature(ctx):
+        print("[Snap] Snapping checkpoint is stale (inputs changed); will recompute.", flush=True)
+        return None
+    poi_mode_snap_info_by_type = payload.get("poi_mode_snap_info_by_type")
+    if not isinstance(poi_mode_snap_info_by_type, dict):
+        return None
+
+    # Rebuild the two cheap, derivable fields rather than persisting them.
+    query_by_key = {serv.query_key(q): q for q in serv.unique_query_keys()}
+    poi_bus_snap_info_by_type = {
+        poi_key: mode_infos.get("walk", {})
+        for poi_key, mode_infos in poi_mode_snap_info_by_type.items()
+    }
+    return SnappingStageResult(
+        query_by_key=query_by_key,
+        poi_bus_snap_info_by_type=poi_bus_snap_info_by_type,
+        poi_mode_snap_info_by_type=poi_mode_snap_info_by_type,
+        shared_mode_graphs={},
+    )
+
+
 def run_snapping_stage(ctx: PipelineContext) -> SnappingStageResult:
     """Run snapping stage for walk/bike/drive and derive bus snap candidates.
 
@@ -589,30 +763,54 @@ def run_snapping_stage(ctx: PipelineContext) -> SnappingStageResult:
     poi_type_for_key = {serv.query_key(q): q.poi_type for q in unique_queries}
     origin_coords = [(data["y"], data["x"]) for _, data in ctx.nodes_with_coords]
 
-    # For each mode, gets the corresponding graph
-    shared_mode_graphs = {
-        "walk": graphml.get_mode_graph("walk", ctx.config),
-        "bike": graphml.get_mode_graph("bike", ctx.config),
-        "drive": graphml.get_mode_graph("drive", ctx.config),
-    }
+    # Resolve per-service POI ownership BEFORE snapping so duplicate tag-clause matches
+    # of the same physical POI (see utils.poi_dedup) never reach the bus destination
+    # set in the first place, instead of being routed and only zeroed out later in
+    # accessibility_stage. Persisting here also means accessibility_stage's own rebuild
+    # of the same map (used for its cache signature) is deterministic/idempotent.
+    from utils import poi_dedup
+    drop_map: dict[str, set] = {}
+    _t_dedup = time.monotonic()
+    if cfg.poi_service_dedup_enabled and poi_dedup.is_osm_mode(cfg):
+        try:
+            drop_map = {pt: set(keys) for pt, keys in poi_dedup.build_drop_map(cfg).items()}
+            poi_dedup.write_drop_map(cfg, drop_map=drop_map)
+            n_dropped = sum(len(v) for v in drop_map.values())
+            print(
+                f"[Snap] POI service dedup: {n_dropped} duplicate POI assignments "
+                f"removed across {len(drop_map)} poi_types before snapping "
+                f"({time.monotonic() - _t_dedup:.1f}s).",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[Snap] POI dedup drop-map build failed ({exc}); proceeding without dedup.", flush=True)
+            poi_dedup.write_drop_map(cfg, drop_map={})
+    else:
+        poi_dedup.write_drop_map(cfg, drop_map={})
 
-    # Snap POIs for walk, bike and drive networks.
-    # Bus will reuse walk snaps to avoid duplicate work/caches.
+    # Snap POIs for walk, bike and drive networks using the compact CSR/KD-tree bundles
+    # (built lazily per mode, ~few MB each) instead of loading the full multi-GB NetworkX
+    # graphs. Bus will reuse walk snaps to avoid duplicate work/caches.
+    routing_modes = ("walk", "bike", "drive")
     poi_mode_snap_info_by_type = {}
-    for mode, mode_graph in shared_mode_graphs.items():
+    for mode in routing_modes:
+        _t_mode = time.monotonic()
         mode_snap_map = _build_poi_snap_map(
-            mode_graph,
+            mode,
             query_by_key,
             cfg.enable_progress,
             cfg.poi_snap_cache_dir,
             cache_ns=f"{cfg.city_slug}|mode_{mode}",
             max_pois=cfg.debug_max_pois,
             seed=cfg.seed,
+            cfg=ctx.config,
         )
+        mode_snap_map = _filter_snap_map_by_drop_map(mode_snap_map, poi_type_for_key, drop_map)
         mode_snap_map = _filter_snap_map_by_radius(mode_snap_map, poi_type_for_key, origin_coords, cfg)
         mode_snap_info = _snap_map_to_info(mode_snap_map)
         for poi_key, info in mode_snap_info.items():
             poi_mode_snap_info_by_type.setdefault(poi_key, {})[mode] = info
+        print(f"[Snap] mode={mode} done in {time.monotonic() - _t_mode:.1f}s total", flush=True)
 
     # Set default empty values to fields
     for poi_key in query_by_key:
@@ -626,11 +824,14 @@ def run_snapping_stage(ctx: PipelineContext) -> SnappingStageResult:
         for poi_key, mode_infos in poi_mode_snap_info_by_type.items()
     }
 
+    # POI snapping no longer materializes full NetworkX graphs (it uses the CSR KD-tree),
+    # so there are no shared mode graphs to carry forward. Kept as an empty dict for
+    # backward compatibility with the SnappingStageResult schema.
     return SnappingStageResult(
         query_by_key=query_by_key,
         poi_bus_snap_info_by_type=poi_bus_snap_info_by_type,
         poi_mode_snap_info_by_type=poi_mode_snap_info_by_type,
-        shared_mode_graphs=shared_mode_graphs,
+        shared_mode_graphs={},
     )
 
 

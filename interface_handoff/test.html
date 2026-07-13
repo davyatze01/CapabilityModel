@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>hex_shard_loader test</title>
+  <style>
+    body { font-family: monospace; margin: 20px; }
+    input, button { font: inherit; padding: 4px 8px; }
+    pre { background: #f4f4f4; padding: 10px; overflow-x: auto; }
+  </style>
+  <script>
+    // Point at the shard directory relative to this file. Adjust if you moved
+    // the export elsewhere (must end with a slash).
+    window.HEX_POIS_BASE = "../outputs/poi_exports/Cagliari/hex_pois/";
+  </script>
+  <script src="hex_shard_loader.js"></script>
+</head>
+<body>
+  <h1>hex_shard_loader test</h1>
+  <p>Base: <code id="base"></code></p>
+  <p>
+    <input id="hex" placeholder="H0001_0047" value="">
+    <button onclick="run(document.getElementById('hex').value.trim())">Load hexagon</button>
+    <button onclick="loadFirstFew()">Load first 3 from manifest</button>
+  </p>
+  <pre id="out">—</pre>
+  <script>
+    document.getElementById("base").textContent = window.HEX_POIS_BASE;
+    var out = document.getElementById("out");
+
+    function show(text) { out.textContent = text; }
+
+    function run(hexId) {
+      if (!hexId) { show("Enter a hex id."); return; }
+      var t0 = performance.now();
+      loadHexPoiRecords(hexId).then(function (records) {
+        var ms = (performance.now() - t0).toFixed(0);
+        var head = records.slice(0, 5).map(function (r) { return JSON.stringify(r); }).join("\n  ");
+        show(hexId + ": " + records.length + " records in " + ms + " ms\nfirst records:\n  " + head);
+      }).catch(function (e) { show("ERROR for " + hexId + ": " + e.message); });
+    }
+
+    function loadFirstFew() {
+      loadHexPoisManifest().then(function (mf) {
+        show("manifest ok: schema=" + mf.schema + " count=" + mf.count +
+             " block=" + mf.shard.block + " scale=" + mf.scale);
+        mf.hex_ids.slice(0, 3).forEach(function (hexId, i) {
+          setTimeout(function () { run(hexId); }, (i + 1) * 800);
+        });
+      }).catch(function (e) { show("MANIFEST ERROR: " + e.message); });
+    }
+  </script>
+</body>
+</html>

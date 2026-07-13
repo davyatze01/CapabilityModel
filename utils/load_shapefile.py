@@ -11,6 +11,14 @@ from config import PipelineConfig
 
 _UNUSED_POI_TYPES_WARNED: set[tuple[str, tuple[str, ...]]] = set()
 
+# Module-level cache: keyed by the tuple of shapefile paths so the cache is
+# invalidated automatically if cfg.poi_shapefile_paths changes between runs.
+_POI_SHP_CACHE: dict[tuple[str, ...], gpd.GeoDataFrame] = {}
+
+# Boundary shapefile + its precomputed union polygon (read/computed once per shp_name).
+_BOUNDARY_SHP_CACHE: dict[str, gpd.GeoDataFrame] = {}
+_BOUNDARY_UNION_CACHE: dict[str, BaseGeometry] = {}
+
 
 def graph_from_shapefile(
     shp_name: str,
@@ -53,18 +61,20 @@ def graph_from_shapefile(
 def feature_from_shapefile(shp_name : str, query_tags: dict, poi_type: str | None = None):
     cfg = PipelineConfig()
 
-    gdf = gpd.read_file(f"shapefile_base/{shp_name}")
+    if shp_name not in _BOUNDARY_SHP_CACHE:
+        raw = gpd.read_file(f"shapefile_base/{shp_name}")
+        if raw.empty:
+            raise ValueError("Shapefile is empty")
+        if raw.crs is None:
+            raise ValueError("Missing CRS")
+        if raw.crs.to_epsg() != 4326:
+            raw = raw.to_crs(epsg=4326)
+        _BOUNDARY_SHP_CACHE[shp_name] = raw
 
-    if gdf.empty:
-        raise ValueError("Shapefile is empty")
-    
-    if gdf.crs is None:
-        raise ValueError("Missing CRS")
-    
-    if gdf.crs.to_epsg() != 4326:
-        gdf = gdf.to_crs(epsg=4326)
+    if shp_name not in _BOUNDARY_UNION_CACHE:
+        _BOUNDARY_UNION_CACHE[shp_name] = _BOUNDARY_SHP_CACHE[shp_name].unary_union
 
-    geometry: BaseGeometry = gdf.unary_union
+    geometry: BaseGeometry = _BOUNDARY_UNION_CACHE[shp_name]
 
     if not isinstance(geometry, (Polygon, MultiPolygon)):
         raise TypeError(f"Unsupported geometry type: {type(geometry)}")
@@ -81,32 +91,49 @@ def poi_from_shp(poi_type: str | None = None):
     from utils import services as serv
     cfg = PipelineConfig()
     paths = list(cfg.poi_shapefile_paths)
+    cache_key = tuple(paths)
 
-    frames = []
-    for path in paths:
-        if not os.path.exists(path):
-            continue
+    if cache_key not in _POI_SHP_CACHE:
+        frames = []
+        for path in paths:
+            if not os.path.exists(path):
+                continue
+            gdf = gpd.read_file(path)
+            if gdf.crs is not None and gdf.crs.to_epsg() != 4326:
+                gdf = gdf.to_crs(epsg=4326)
+            frames.append(gdf)
 
-        gdf = gpd.read_file(path)
+        if not frames:
+            _POI_SHP_CACHE[cache_key] = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        else:
+            merged = gpd.GeoDataFrame(
+                pd.concat(frames, ignore_index=True),
+                crs=frames[0].crs,
+            )
+            # Normalise poi_type column name once on load.
+            if "poi_type" not in merged.columns and "poiType" in merged.columns:
+                merged = merged.rename(columns={"poiType": "poi_type"})
+            if "poi_type" not in merged.columns and "TYPEQU" in merged.columns:
+                merged = merged.rename(columns={"TYPEQU": "poi_type"})
 
-        if gdf.crs is not None and gdf.crs.to_epsg() != 4326:
-            gdf = gdf.to_crs(epsg=4326)
+            # Shapefiles (esp. Paris' MGP layers) carry many attribute columns that
+            # nothing downstream reads — graphml.get_poi_geometries only pulls
+            # SOURCE_KEY_COLUMNS + geometry, and poi_exports._compose_address reads the
+            # same address-ish subset of them. This cache is held for the entire process
+            # lifetime and gets .copy()'d in full for every poi_type query below, so on a
+            # 290k+ POI city (Paris) the unused columns are pure multiplied-up memory
+            # cost. Drop them once, right after load, instead of paying for them on
+            # every subsequent filter/copy.
+            from utils.poi_identity import SOURCE_KEY_COLUMNS
+            keep_cols = ["geometry", "poi_type"] + [
+                c for c in SOURCE_KEY_COLUMNS if c in merged.columns
+            ]
+            merged = merged[[c for c in keep_cols if c in merged.columns]].copy()
+            _POI_SHP_CACHE[cache_key] = merged
 
-        frames.append(gdf)
-
-    if not frames:
+    pois = _POI_SHP_CACHE[cache_key]
+    if pois.empty:
         return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-
-    pois = gpd.GeoDataFrame(
-        pd.concat(frames, ignore_index=True),
-        crs=frames[0].crs,
-    )
-
-    # Support both poi_type (new) and poiType (legacy) column names
-    if "poi_type" not in pois.columns and "poiType" in pois.columns:
-        pois = pois.rename(columns={"poiType": "poi_type"})
-    if "poi_type" not in pois.columns and "TYPEQU" in pois.columns:
-        pois = pois.rename(columns={"TYPEQU": "poi_type"})
 
     if "poi_type" not in pois.columns:
         return gpd.GeoDataFrame(geometry=[], crs=pois.crs)
@@ -158,3 +185,17 @@ def poi_from_shp(poi_type: str | None = None):
             flush=True,
         )
     return out
+
+
+def clear_poi_shp_cache() -> None:
+    """Release the cached merged POI shapefile(s) and boundary geometry.
+
+    Callers that only need one pass over the shapefile POIs (e.g. poi_exports'
+    _collect_poi_records, which extracts everything it needs into plain dicts) should
+    call this once done. On a large shapefile source (Paris' MGP layers, 290k+ POIs)
+    this cache is otherwise held for the rest of the process's lifetime, adding up on
+    top of whatever the caller itself is holding.
+    """
+    _POI_SHP_CACHE.clear()
+    _BOUNDARY_SHP_CACHE.clear()
+    _BOUNDARY_UNION_CACHE.clear()

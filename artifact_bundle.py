@@ -19,9 +19,23 @@ def load_impedance_bundle(
         return None
 
     cfg = ctx.config
+
+    # If subway is enabled for this city but the cached bundle predates subway support, treat
+    # it as a miss so the pipeline re-routes both modes and rewrites a subway-aware bundle.
+    if cfg.enable_subway:
+        with np.load(path, allow_pickle=True) as z_probe:
+            if "subway_impedance_matrix" not in z_probe.files:
+                print(
+                    "[Artifact] Bundle has no subway data but subway is enabled; recomputing.",
+                    flush=True,
+                )
+                return None
+
     Path(cfg.non_bus_cache_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.bus_impedance_matrix_path).parent.mkdir(parents=True, exist_ok=True)
     Path(cfg.bus_source_id_to_row_path).parent.mkdir(parents=True, exist_ok=True)
+    if cfg.enable_subway:
+        Path(cfg.subway_impedance_matrix_path).parent.mkdir(parents=True, exist_ok=True)
 
     # ── Pass 1: load everything except blobs, write bus matrix, then free RAM ──
     # Loading all npz keys at once (bus matrix + blobs) can exhaust RAM for large
@@ -68,6 +82,41 @@ def load_impedance_bundle(
     )
     del mat, bus_matrix
     gc.collect()
+
+    # ── Pass 1b: restore the optional subway matrix (kept separate to bound peak RSS) ──
+    if cfg.enable_subway:
+        with np.load(path, allow_pickle=True) as z:
+            subway_dest_coords = np.array(z["subway_dest_coords"], dtype=np.float64)
+            subway_matrix = np.array(z["subway_impedance_matrix"], dtype=np.float32)
+
+        # Origins are the same graph nodes as bus, so the source index mirrors node_ids.
+        with open(cfg.subway_source_id_to_row_path, "w", encoding="utf-8") as f:
+            json.dump(source_id_to_row, f)
+
+        subway_dest_id_to_col = {f"d{idx}": idx for idx in range(subway_dest_coords.shape[0])}
+        with open(cfg.subway_dest_id_to_col_path, "w", encoding="utf-8") as f:
+            json.dump(subway_dest_id_to_col, f)
+
+        with open(cfg.subway_routing_destinations_input_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["id", "lon", "lat"])
+            for idx, (lat, lon) in enumerate(subway_dest_coords.tolist()):
+                writer.writerow([f"d{idx}", float(lon), float(lat)])
+        del subway_dest_coords
+
+        sub_mem = np.memmap(
+            cfg.subway_impedance_matrix_path, dtype=np.float32, mode="w+", shape=subway_matrix.shape,
+        )
+        sub_mem[:] = subway_matrix
+        sub_mem.flush()
+        sub_nonzero = int(np.count_nonzero(subway_matrix))
+        print(
+            f"[Artifact] Loaded subway impedance: nonzero={sub_nonzero}/{subway_matrix.size} "
+            f"zero={subway_matrix.size - sub_nonzero}",
+            flush=True,
+        )
+        del sub_mem, subway_matrix
+        gc.collect()
 
     # ── Pass 2: load blobs (now the only large allocation) and write pkl files ──
     cache_paths: dict[str, str] = {}
@@ -161,9 +210,7 @@ def write_impedance_bundle(
         with open(cache_path, "rb") as f:
             blobs[idx] = f.read()
 
-    Path(cfg.impedance_artifact_path).parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        cfg.impedance_artifact_path,
+    save_kwargs = dict(
         schema_version=np.array(ARTIFACT_SCHEMA_VERSION, dtype=np.int32),
         node_ids=node_ids,
         bus_impedance_matrix=matrix,
@@ -173,3 +220,48 @@ def write_impedance_bundle(
         origins_sig=np.array(bus.origins_sig, dtype=object),
         destinations_sig=np.array(bus.destinations_sig, dtype=object),
     )
+
+    # Optional subway modality: stored additively (no schema bump) so existing bundles
+    # without these keys keep loading unchanged.
+    if cfg.enable_subway:
+        subway_matrix, subway_dest_coords = _read_mode_matrix(
+            cfg.subway_impedance_matrix_path,
+            cfg.subway_source_id_to_row_path,
+            cfg.subway_dest_id_to_col_path,
+            cfg.subway_routing_destinations_input_path,
+        )
+        save_kwargs["subway_impedance_matrix"] = subway_matrix
+        save_kwargs["subway_dest_coords"] = subway_dest_coords
+        sub_nonzero = int(np.count_nonzero(subway_matrix))
+        print(
+            f"[Artifact] Restored subway impedance matrix: nonzero={sub_nonzero}/{subway_matrix.size} "
+            f"zero={subway_matrix.size - sub_nonzero}",
+            flush=True,
+        )
+
+    Path(cfg.impedance_artifact_path).parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(cfg.impedance_artifact_path, **save_kwargs)
+
+
+def _read_mode_matrix(matrix_path, source_id_to_row_path, dest_id_to_col_path, dest_csv_path):
+    """Load a public-transport impedance matrix + its destination coords from disk.
+
+    Returns (matrix: float32 [n_rows, n_dest], dest_coords: float64 [n_dest, 2] (lat, lon)).
+    """
+    with open(dest_id_to_col_path, encoding="utf-8") as f:
+        dest_id_to_col = {str(k): int(v) for k, v in json.load(f).items()}
+    n_dest = len(dest_id_to_col)
+    dest_coords = np.zeros((n_dest, 2), dtype=np.float64)
+    with open(dest_csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            idx = dest_id_to_col.get(str(row["id"]))
+            if idx is None:
+                continue
+            dest_coords[idx, 0] = float(row["lat"])
+            dest_coords[idx, 1] = float(row["lon"])
+
+    with open(source_id_to_row_path, encoding="utf-8") as f:
+        n_rows = len(json.load(f))
+
+    matrix_mem = np.memmap(matrix_path, dtype=np.float32, mode="r", shape=(n_rows, n_dest))
+    return np.array(matrix_mem, dtype=np.float32), dest_coords

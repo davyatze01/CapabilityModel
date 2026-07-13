@@ -265,3 +265,8 @@ _geom_probe.py
 
 # Paris data folder (large POI/boundary shapefiles)
 Paris/
+
+# Oversized inputs/derived caches that must never be pushed (>100MB GitHub limit)
+gtfs/_extracts/
+outputs/sensitivity/upstream/
+interfaccia/resources/hexagon_service_pois.json

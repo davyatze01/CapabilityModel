@@ -7,10 +7,18 @@ HTML report that walks through the full computation chain:
   raw impedances → accessibility decay → Choquet service aggregation → ELECTRE TRI
 
 Usage:
-    python debug_pipeline.py [--study-city cagliari] [--output outputs/debug_pipeline.html]
+    # Pick the city by editing STUDY_CITY below, then just run:
+    python debug_pipeline.py
+    # (--study-city / --output remain as optional overrides.)
 """
 
 from __future__ import annotations
+
+# ── Edit here to switch the whole debug report to another city ────────────────────────
+# Mirrors main.py's `study_city` knob. Must match a key in config.CITY_PRESETS
+# (e.g. "cagliari", "paris"). The config and every artifact path are derived from this,
+# so the report always reads the right city's artifacts.
+STUDY_CITY = "cagliari"
 
 import argparse
 import csv
@@ -28,7 +36,7 @@ from utils import services as serv
 from utils.capabilities import electre_tri_details, CAPABILITY_SERVICES
 from utils.services import choquet_integral_details, get_decay_coefficient
 from utils.decay import calculate_rra
-from utils.delta_g import accessibility_from_rra, merge_rra_and_accessibility
+from utils.delta_g import accessibility_from_rra
 
 # Re-use geometry helpers already implemented in inspect_hex_pois.
 from inspect_hex_pois import (
@@ -40,12 +48,42 @@ from inspect_hex_pois import (
     _load_grid_params,
     _default_paths,
     _fetch_capability_points,
+    _load_hex_items,
+    _fetch_poi_rows,
 )
 
 
 # ---------------------------------------------------------------------------
 # Hexagon selection
 # ---------------------------------------------------------------------------
+
+def _load_poi_names_by_source_key(cfg: PipelineConfig) -> dict[str, str]:
+    """Build source_key -> name for every raw POI, so the debug UI can show a human
+    name instead of the opaque source_key JSON blob. Reuses get_poi_geometries so the
+    source_key is computed identically to how the pipeline built it originally, and
+    reads from the same on-disk POI cache the pipeline itself uses (shapefile for
+    cities configured with poi_from_shp, otherwise the cached OSMnx city-universe
+    GeoJSON) so this never triggers a live network download."""
+    from utils import graphml
+    from utils.services import get_global_radius_m
+
+    if cfg.poi_from_shp:
+        from utils.load_shapefile import poi_from_shp
+        pois = poi_from_shp(None)
+    else:
+        poi_cache_slug = cfg.artifact_slug if cfg.use_shapefile else cfg.city_slug
+        city_poi_dir = graphml._city_poi_cache_dir(poi_cache_slug)
+        buffer_m = get_global_radius_m(cfg) or 0.0
+        pois = graphml._get_city_poi_universe(cfg.city_name, poi_cache_slug, city_poi_dir, buffer_m=buffer_m)
+
+    if pois is None or pois.empty:
+        return {}
+    names: dict[str, str] = {}
+    for _geom, name, source_key in graphml.get_poi_geometries(pois):
+        if name:
+            names[str(source_key)] = str(name)
+    return names
+
 
 def _grid_extent(grid_params: dict) -> tuple[float, float, float, float]:
     """Return (min_lon, min_lat, max_lon, max_lat) of the grid bounding box."""
@@ -240,7 +278,7 @@ def _bus_time(poi_coord: tuple, source_row: int | None, bus_ctx: dict | None) ->
     return v if v > 0 else None
 
 
-def _build_step1(non_bus: dict, source_row: int | None, bus_ctx: dict | None) -> dict:
+def _build_step1(non_bus: dict, source_row: int | None, bus_ctx: dict | None, poi_names: dict[str, str] | None = None) -> dict:
     """Step 1 — raw impedances from the non-bus pickle."""
     services_out = []
     for svc in serv.SERVICE_KEYS:
@@ -265,8 +303,10 @@ def _build_step1(non_bus: dict, source_row: int | None, bus_ctx: dict | None) ->
             for i in range(n):
                 src_coord = source_coords[i] if i < len(source_coords) else (None, None)
                 poi_coord = poi_coords[i] if i < len(poi_coords) else (None, None)
+                src_key = str(source_keys[i]) if i < len(source_keys) else ""
                 pois_out.append({
-                    "source_key": str(source_keys[i]) if i < len(source_keys) else "",
+                    "source_key": src_key,
+                    "name": (poi_names or {}).get(src_key),
                     "src_lat": float(src_coord[0]) if src_coord[0] is not None else None,
                     "src_lon": float(src_coord[1]) if src_coord[1] is not None else None,
                     "walk_min": float(imp_walk_list[i]) if i < len(imp_walk_list) and imp_walk_list[i] is not None else None,
@@ -282,6 +322,54 @@ def _build_step1(non_bus: dict, source_row: int | None, bus_ctx: dict | None) ->
     return {"services": services_out}
 
 
+def _delta_g_details(rra: list[float], poi_type: str) -> dict:
+    """Step-by-step breakdown of the Delta-g POI aggregation for one poi_type.
+
+    Mirrors ``accessibility_from_rra``: per-POI RRAs are sorted descending and each
+    is weighted by the marginal saturation increment Delta g_k(j) = g(j+1) − g(j),
+    with g(x) = 1 − exp(c·x). Returns the inputs, the resolved contribution
+    coefficient/c, and a per-rank step list (value, g, delta_g, term, running total).
+    """
+    try:
+        contribution_coefficient = float(serv.get_contribution_coefficient(poi_type))
+    except Exception:
+        contribution_coefficient = 2.0
+
+    y_target = 0.9
+    c = round(math.log(1.0 - y_target) / contribution_coefficient, 2) if contribution_coefficient > 0 else 0.0
+
+    def g(x: int) -> float:
+        return 1.0 - math.exp(c * x)
+
+    rra_desc = sorted((float(v) for v in rra), reverse=True)
+    steps = []
+    total = 0.0
+    prev_g = 0.0
+    for i, element in enumerate(rra_desc):
+        g_cur = g(i + 1)
+        delta_g = g_cur - prev_g  # g(1) - g(0)=0 for i==0, so this matches element*g(1)
+        term = element * delta_g
+        total += term
+        steps.append({
+            "rank": i + 1,
+            "value": round(element, 4),
+            "g": round(g_cur, 4),
+            "delta_g": round(delta_g, 4),
+            "term": round(term, 4),
+            "running_total": round(total, 4),
+        })
+        prev_g = g_cur
+
+    return {
+        "contribution_coefficient": contribution_coefficient,
+        "c": c,
+        "y_target": y_target,
+        "n_pois": len(rra_desc),
+        "steps": steps,
+        "total": round(total, 4),
+    }
+
+
 def _build_step2(
     non_bus: dict,
     source_row: int | None,
@@ -289,6 +377,8 @@ def _build_step2(
     acc_ctx: dict | None,
     acc_node_row: int | None,
     cfg: PipelineConfig,
+    drop_map: dict[str, set[str]] | None = None,
+    poi_names: dict[str, str] | None = None,
 ) -> dict:
     """Step 2 — accessibility decay applied per mode and merged into poi_type scores."""
     # Deduplicate POI entries by poi_type across services.
@@ -302,6 +392,10 @@ def _build_step2(
     poi_types_out = []
     poi_to_col = acc_ctx["poi_to_col"] if acc_ctx else {}
     acc_mat = acc_ctx["mat"] if acc_ctx else None
+    # Recomputed per-POI accessibility keyed by source_key, mirroring how the pipeline
+    # stores accessibility_by_poi (last non-zero value wins across poi_types). Used by the
+    # export-verification step.
+    acc_by_source_key: dict[str, float] = {}
 
     for pt, entry in entry_by_poi_type.items():
         try:
@@ -315,6 +409,7 @@ def _build_step2(
         imp_drive_list = entry.get("imp_drive", []) or []
         poi_coords = entry.get("poi_coords", []) or []
         source_coords = entry.get("source_coords", []) or []
+        source_keys = entry.get("source_keys", []) or []
         n = len(poi_coords)
 
         pois_out = []
@@ -326,19 +421,22 @@ def _build_step2(
             poi_coord = poi_coords[i] if i < len(poi_coords) else (None, None)
             bus_m = _bus_time(poi_coord, source_row, bus_ctx) if poi_coord[0] is not None else None
             src_coord = source_coords[i] if i < len(source_coords) else (None, None)
+            src_key = str(source_keys[i]) if i < len(source_keys) else ""
 
             dw = math.exp(-beta * wm) if wm is not None else 0.0
             db = math.exp(-beta * bm) if bm is not None else 0.0
             dd = math.exp(-beta * dm) if dm is not None else 0.0
             dbus = math.exp(-beta * bus_m) if bus_m is not None else 0.0
 
+            # Per-POI accessibility A^i_k(x, y) is exactly the RRA over modes; the
+            # Delta-g aggregation happens only at the POI-type level downstream.
             rra = calculate_rra(dw, db, dd, dbus)
-            # Pipeline applies accessibility_from_rra to a single-element list per POI
-            # before aggregating, matching merge_rra_and_accessibility([dw],[db],[dd],[dbus]).
-            poi_acc = float(merge_rra_and_accessibility([dw], [db], [dd], [dbus], poi_type=pt)[1])
+            poi_acc = rra
             poi_accs.append(poi_acc)
 
             pois_out.append({
+                "source_key": src_key,
+                "name": (poi_names or {}).get(src_key),
                 "src_lat": float(src_coord[0]) if src_coord[0] is not None else None,
                 "src_lon": float(src_coord[1]) if src_coord[1] is not None else None,
                 "walk_min": round(wm, 2) if wm is not None else None,
@@ -364,6 +462,18 @@ def _build_step2(
                 v = float(acc_mat[acc_node_row, col])
                 from_matrix = None if math.isnan(v) else v
 
+        # Map source_key -> per-POI accessibility (same overwrite/>0 rule the pipeline
+        # uses when building accessibility_by_poi). source_keys are aligned to poi_coords.
+        # Apply the same per-service ownership drop so a non-owning poi_type does not
+        # overwrite the owning value (mirrors accessibility_stage zeroing dropped pairs).
+        drop_for_pt = (drop_map or {}).get(pt, ())
+        src_keys = entry.get("source_keys", []) or []
+        for i, a in enumerate(poi_accs):
+            if i < len(src_keys) and src_keys[i] and a > 0.0:
+                if str(src_keys[i]) in drop_for_pt:
+                    continue
+                acc_by_source_key[str(src_keys[i])] = float(a)
+
         pois_out.sort(key=lambda p: p.get("poi_acc", 0), reverse=True)
         poi_types_out.append({
             "poi_type": pt,
@@ -372,9 +482,10 @@ def _build_step2(
             "pois": pois_out,
             "poi_type_acc_computed": round(computed, 4),
             "poi_type_acc_matrix": round(from_matrix, 4) if from_matrix is not None else None,
+            "aggregation": _delta_g_details(poi_accs, pt),
         })
 
-    return {"poi_types": poi_types_out}
+    return {"poi_types": poi_types_out}, acc_by_source_key
 
 
 def _build_step3(
@@ -425,6 +536,154 @@ def _build_step3(
     return {"services": services_out}
 
 
+def _build_step_verify(
+    hex_id: str,
+    acc_by_source_key: dict[str, float],
+    node_scores: dict[str, dict[str, float]],
+    hex_source: Path,
+    gpkg_path: Path | None,
+    drop_map: dict[str, set[str]] | None = None,
+    poi_names: dict[str, str] | None = None,
+) -> dict | None:
+    """Cross-check recomputed per-POI accessibility against the pipeline's EXPORTED values.
+
+    For each POI the pipeline exported under this hexagon (hex_pois files → {id, sp, cp}):
+      • recover the pipeline's stored per-POI accessibility by inverting
+        service_power = poi_acc × Σ_pt SERVICE_SINGLETON_M[service][pt]  (so
+        poi_acc_exported = sp[service] / Σ_pt singleton), and
+      • recompute service_power/capability_power from our own recomputed poi_acc using the
+        exact pipeline routine (poi_exports._poi_powers),
+    then flag any mismatch. This is the end-to-end check that "accessibility to the POI" is
+    both computed and exported consistently.
+    """
+    if gpkg_path is None or not Path(gpkg_path).exists():
+        return {"available": False, "reason": "pois_used.gpkg not found — run spatial export."}
+    try:
+        hex_items = _load_hex_items(hex_id, hex_source)
+    except FileNotFoundError:
+        return {"available": False, "reason": f"No exported POIs for hex {hex_id} (hex_pois missing)."}
+    except Exception as exc:
+        return {"available": False, "reason": f"Could not read hex export: {exc}"}
+
+    # hex_pois objects use compact keys: "i" = POI id, "sp"/"cp" = power maps.
+    poi_ids = [int(it["i"]) for it in hex_items if "i" in it]
+    try:
+        poi_rows = _fetch_poi_rows(Path(gpkg_path), poi_ids)
+    except Exception as exc:
+        return {"available": False, "reason": f"Could not read pois_used.gpkg: {exc}"}
+
+    from poi_exports import _poi_powers  # exact pipeline power formula (lazy import)
+
+    def _back_out_acc(sp: dict, poi_types: list[str], source_key: str) -> float | None:
+        """Invert service_power = acc × Σ_pt singleton to recover the exported poi_acc.
+
+        Must apply the same per-service ownership drop as _poi_powers: a poi_type that
+        does not own this source_key is excluded from the divisor, otherwise the
+        back-computed accessibility is wrong for any POI carrying multiple poi_types
+        where only one owns it (inflates the divisor, deflating exported_acc)."""
+        dm = drop_map or {}
+        for service, power in sp.items():
+            singletons = serv.SERVICE_SINGLETON_M.get(service, {})
+            divisor = sum(
+                float(singletons[pt]) for pt in poi_types
+                if pt in singletons and source_key not in dm.get(pt, ())
+            )
+            if divisor > 0:
+                return float(power) / divisor
+        return None
+
+    rows = []
+    mism = 0
+    for it in hex_items:
+        pid = int(it.get("i", -1))
+        row_info = poi_rows.get(pid)
+        if row_info is None:
+            continue
+        source_key = row_info["source_key"]
+        try:
+            poi_types = json.loads(row_info.get("poi_types", "[]")) or []
+        except Exception:
+            poi_types = []
+        poi_types = [str(p) for p in poi_types]
+
+        exp_sp = it.get("sp", {}) or {}
+        exp_cp = it.get("cp", {}) or {}
+        recomputed_acc = acc_by_source_key.get(source_key)
+
+        # Recompute powers with the exact pipeline routine from our recomputed accessibility.
+        rec_sp, rec_cp = ({}, {})
+        if recomputed_acc is not None:
+            rec_sp, rec_cp = _poi_powers(source_key, poi_types, {source_key: recomputed_acc}, node_scores, drop_map)
+
+        exported_acc = _back_out_acc(exp_sp, poi_types, source_key)
+        acc_match = (
+            recomputed_acc is not None
+            and exported_acc is not None
+            and abs(recomputed_acc - exported_acc) < 1e-4
+        )
+        sp_match = all(
+            abs(float(rec_sp.get(s, 0.0)) - float(exp_sp.get(s, 0.0))) < 1e-4
+            for s in set(rec_sp) | set(exp_sp)
+        )
+        cp_match = all(
+            abs(float(rec_cp.get(c, 0.0)) - float(exp_cp.get(c, 0.0))) < 1e-4
+            for c in set(rec_cp) | set(exp_cp)
+        )
+        ok = bool(acc_match and sp_match and cp_match)
+        if not ok:
+            mism += 1
+        rows.append({
+            "id": pid,
+            "source_key": source_key[:28],
+            "name": (poi_names or {}).get(source_key),
+            "poi_types": poi_types,
+            "recomputed_acc": round(recomputed_acc, 4) if recomputed_acc is not None else None,
+            "exported_acc": round(exported_acc, 4) if exported_acc is not None else None,
+            "acc_match": acc_match,
+            "sp_recomputed": {s: round(v, 4) for s, v in rec_sp.items()},
+            "sp_exported": {s: round(float(v), 4) for s, v in exp_sp.items()},
+            "cp_recomputed": {c: round(v, 4) for c, v in rec_cp.items()},
+            "cp_exported": {c: round(float(v), 4) for c, v in exp_cp.items()},
+            "match": ok,
+        })
+
+    # Mismatches first, then by recomputed accessibility. Cap the rows carried into the
+    # HTML (a hexagon can see thousands of POIs); the totals below stay exact.
+    rows.sort(key=lambda r: (r["match"], -(r["recomputed_acc"] or 0)))
+    MAX_ROWS = 150
+    return {
+        "available": True,
+        "n_pois": len(rows),
+        "n_mismatch": mism,
+        "rows": rows[:MAX_ROWS],
+        "truncated": len(rows) > MAX_ROWS,
+    }
+
+
+def _build_node_scores(acc_ctx: dict | None, acc_node_row: int | None) -> dict[str, dict[str, float]]:
+    """Build {service: {poi_type: accessibility}} for one node from the accessibility matrix.
+
+    Used as the fallback table inside poi_exports._poi_powers (only consulted when a POI has
+    no per-POI accessibility); recomputation here passes an explicit per-POI value, so this is
+    mostly a safety net kept faithful to the pipeline.
+    """
+    if acc_ctx is None or acc_node_row is None:
+        return {}
+    acc_mat = acc_ctx["mat"]
+    poi_to_col = acc_ctx["poi_to_col"]
+    out: dict[str, dict[str, float]] = {}
+    for service in serv.SERVICE_KEYS:
+        type_scores: dict[str, float] = {}
+        for query in serv.get_service_queries(service):
+            pt = str(query.poi_type)
+            col = poi_to_col.get(pt)
+            if col is not None:
+                v = float(acc_mat[acc_node_row, col])
+                type_scores[pt] = 0.0 if math.isnan(v) else v
+        out[service] = type_scores
+    return out
+
+
 def _nan_safe(v: Any) -> Any:
     """Replace float inf/nan with None for JSON serialisation."""
     if isinstance(v, float):
@@ -470,6 +729,10 @@ def _build_chain(
     bus_ctx: dict | None,
     acc_ctx: dict | None,
     svc_ctx: dict | None,
+    hex_source: Path,
+    gpkg_path: Path | None,
+    drop_map: dict[str, set[str]] | None = None,
+    poi_names: dict[str, str] | None = None,
 ) -> dict:
     node_id = hex_entry.get("node_id")
     vertices_latlng = [[lat, lon] for lon, lat in hex_entry["hex_vertices"]]
@@ -490,6 +753,7 @@ def _build_chain(
         "step2": None,
         "step3": None,
         "step4": None,
+        "verify": None,
     }
 
     if not node_id:
@@ -520,10 +784,19 @@ def _build_chain(
         svc_node_row = svc_ctx["node_to_row"].get(str(node_id))
 
     chain["has_data"] = True
-    chain["step1"] = _build_step1(non_bus, bus_source_row, bus_ctx)
-    chain["step2"] = _build_step2(non_bus, bus_source_row, bus_ctx, acc_ctx, acc_node_row, cfg)
+    chain["step1"] = _build_step1(non_bus, bus_source_row, bus_ctx, poi_names)
+    chain["step2"], acc_by_source_key = _build_step2(non_bus, bus_source_row, bus_ctx, acc_ctx, acc_node_row, cfg, drop_map, poi_names)
     chain["step3"] = _build_step3(acc_ctx, acc_node_row, svc_ctx, svc_node_row)
     chain["step4"] = _build_step4(svc_ctx, svc_node_row)
+    chain["verify"] = _build_step_verify(
+        hex_entry["hex_id"],
+        acc_by_source_key,
+        _build_node_scores(acc_ctx, acc_node_row),
+        hex_source,
+        gpkg_path,
+        drop_map,
+        poi_names,
+    )
     return chain
 
 
@@ -686,7 +959,7 @@ function selectHex(hexId){
     chain.step1.services.forEach(s => s.entries.forEach(e => e.pois.forEach(p => {
       if(p.src_lat != null)
         markers.push(L.circleMarker([p.src_lat, p.src_lon],{radius:4,color:"#0f766e",weight:1,fillColor:"#14b8a6",fillOpacity:0.9})
-          .bindTooltip(`${e.poi_type}<br>${p.source_key}`));
+          .bindTooltip(`${e.poi_type}<br>${poiLabel(p)}`));
     })));
     if(markers.length){ poiLayer = L.layerGroup(markers).addTo(map); }
   }
@@ -729,7 +1002,7 @@ function renderChain(chain){
         p1.body.insertAdjacentHTML("beforeend",`<div class="poi-type-label">${e.poi_type} <span class="muted">(T½ = ${e.decay_coeff} min, ${e.pois.length} POIs)</span></div>`);
         const rows = e.pois.map(p => `
           <tr>
-            <td>${p.source_key ? p.source_key.slice(0,24) : "—"}${gMapsLink(chain.node_lat, chain.node_lon, p.src_lat, p.src_lon)}</td>
+            <td>${poiLabel(p)}${gMapsLink(chain.node_lat, chain.node_lon, p.src_lat, p.src_lon)}</td>
             <td class="${timeClass(p.walk_min)}">${fmt(p.walk_min)} ${p.walk_score != null ? '<span class="muted">ws='+p.walk_score.toFixed(1)+'</span>' : ''}</td>
             <td class="${timeClass(p.bike_min)}">${fmt(p.bike_min)}</td>
             <td class="${timeClass(p.drive_min)}">${fmt(p.drive_min)}</td>
@@ -744,8 +1017,10 @@ function renderChain(chain){
   el.appendChild(p1.panel);
 
   // Step 2
-  const p2 = makePanel("2","Accessibility","Decay d = exp(−β×t) per mode → RRA merge → poi_type score");
+  const p2 = makePanel("2","Accessibility","Decay d = exp(−β×t) per mode → RRA merge → Δg POI aggregation → poi_type score");
   if(chain.step2){
+    const aggSummaryRows = [];
+    let aggMaxRanks = 0;
     chain.step2.poi_types.forEach(pt => {
       const match = pt.poi_type_acc_matrix != null
         ? (Math.abs(pt.poi_type_acc_computed - pt.poi_type_acc_matrix) < 0.01
@@ -761,7 +1036,7 @@ function renderChain(chain){
       const rows = pt.pois.map(p => {
         const acc = p.poi_acc ?? 0;
         return `<tr>
-          <td>${fmtLatLon(p.src_lat, p.src_lon)}${gMapsLink(chain.node_lat, chain.node_lon, p.src_lat, p.src_lon)}</td>
+          <td>${poiLabel(p)}${gMapsLink(chain.node_lat, chain.node_lon, p.src_lat, p.src_lon)}</td>
           <td>${fmtD(p.d_walk)}</td>
           <td>${fmtD(p.d_bike)}</td>
           <td>${fmtD(p.d_drive)}</td>
@@ -774,11 +1049,43 @@ function renderChain(chain){
         `<thead><tr><th>POI</th><th>d_walk</th><th>d_bike</th><th>d_drive</th><th>d_bus</th><th>RRA</th><th>poi_acc</th></tr></thead>`,
         rows, 10));
       p2.body.insertAdjacentHTML("beforeend",`
-        <div class="muted" style="margin:2px 0 8px">
-          poi_type score (RRA over ${pt.pois.length} POIs): <b>${pt.poi_type_acc_computed.toFixed(4)}</b>
-          &nbsp;|&nbsp; <span class="formula">RRA = 1−∏(1−λ_i·d_i), λ=[1,½,⅓,¼]</span>
+        <div class="muted" style="margin:2px 0 4px">
+          <span class="formula">RRA = 1−∏(1−λ_i·d_i), λ=[1,½,⅓,¼]</span>
         </div>`);
+
+      // --- POI aggregation (Delta-g marginal saturation): collect one summary row per poi_type ---
+      const agg = pt.aggregation;
+      if(agg){
+        const match2 = pt.poi_type_acc_matrix != null
+          ? (Math.abs(pt.poi_type_acc_computed - pt.poi_type_acc_matrix) < 0.01
+             ? `<span class="match-ok">✓</span>`
+             : `<span class="match-warn">⚠ matrix=${pt.poi_type_acc_matrix.toFixed(3)}</span>`)
+          : `<span class="muted">N/A</span>`;
+        const top = agg.steps.slice(0, 10);
+        aggMaxRanks = Math.max(aggMaxRanks, top.length);
+        const rankCells = top.map(st => `<td>${st.value.toFixed(3)}<div class="muted" style="font-size:10px">+${st.term.toFixed(3)}</div></td>`);
+        aggSummaryRows.push({
+          label: `<td>${pt.poi_type}<div class="muted" style="font-size:10px">${agg.n_pois} POIs, cc=${agg.contribution_coefficient}</div></td>`,
+          cells: rankCells,
+          output: `<td><b>${pt.poi_type_acc_computed.toFixed(4)}</b> ${match2}</td>`,
+        });
+      }
     });
+    if(aggSummaryRows.length){
+      p2.body.insertAdjacentHTML("beforeend",`
+        <div class="section-label" style="margin-top:6px">POI aggregation (Δg) — per poi_type</div>
+        <div class="muted" style="margin:0 0 4px">
+          Sort per-POI RRAs descending, weight each by marginal increment Δg: <span class="formula">g(x)=1−exp(c·x)</span>.
+          Each cell = RRA at that rank, with its term contribution (+RRA·Δg) below it.
+        </div>`);
+      const rankHeaders = Array.from({length: aggMaxRanks}, (_, i) => `<th>#${i+1}</th>`).join("");
+      const bodyRows = aggSummaryRows.map(r => {
+        const padded = r.cells.concat(Array.from({length: aggMaxRanks - r.cells.length}, () => `<td class="muted">—</td>`));
+        return `<tr>${r.label}${padded.join("")}${r.output}</tr>`;
+      });
+      p2.body.insertAdjacentHTML("beforeend",
+        `<table><thead><tr><th>POI type</th>${rankHeaders}<th>Output (Σ terms)</th></tr></thead><tbody>${bodyRows.join("")}</tbody></table>`);
+    }
   }
   el.appendChild(p2.panel);
 
@@ -818,7 +1125,7 @@ function renderChain(chain){
   el.appendChild(p3.panel);
 
   // Step 4
-  const p4 = makePanel("4","Capability Scores","ELECTRE TRI-B: outranking against boundary profiles");
+  const p4 = makePanel("4","Capability Scores","ELECTRE TRI — pessimistic (descending) rule: assign to the highest category whose lower profile is outranked. Profiles are listed low→high for readability; the rule itself is descending.");
   if(chain.step4){
     chain.step4.capabilities.forEach(c => {
       const e = c.electre;
@@ -860,7 +1167,9 @@ function renderChain(chain){
         </div>`);
 
       // --- Per-boundary blocks ---
-      (e.boundaries||[]).forEach(b => {
+      // Render high→low to follow the pessimistic/descending procedure: check the
+      // top profile first and walk down. (The stored array is low→high.)
+      (e.boundaries||[]).slice().reverse().forEach(b => {
         const bv = b.boundary_value;
         const terms = b.concordance_terms || [];
         const C = b.global_concordance;
@@ -930,8 +1239,8 @@ function renderChain(chain){
       const ob = (e.boundaries||[]).filter(b=>b.outranks_boundary).map(b=>b.boundary_value);
       const nb2 = (e.boundaries||[]).filter(b=>!b.outranks_boundary).map(b=>b.boundary_value);
       const summaryParts = ob.length
-        ? `Outranks [${ob.join(", ")}] — stopped at [${nb2.join(", ")}]`
-        : `Does not outrank any boundary`;
+        ? `Outranks [${ob.join(", ")}] — stopped at [${nb2.join(", ")}]. Pessimistic/descending: take the highest outranked profile (${Math.max(...ob)}) → category just above it`
+        : `Does not outrank any boundary → lowest category`;
       p4.body.insertAdjacentHTML("beforeend",`
         <div class="elec-summary">
           <b>Assignment:</b> ${summaryParts}
@@ -941,6 +1250,93 @@ function renderChain(chain){
     });
   }
   el.appendChild(p4.panel);
+
+  // Step 5 — Per-POI export verification
+  const p5 = makePanel("5","Per-POI Export Check","Recomputed per-POI accessibility & powers vs the pipeline's EXPORTED values (pois_used.gpkg + hex_pois). Confirms accessibility-to-POI is computed and exported consistently.");
+  const vr = chain.verify;
+  if(!vr || !vr.available){
+    p5.body.insertAdjacentHTML("beforeend",
+      `<div class="muted">${vr && vr.reason ? vr.reason : "No export available for this hexagon."}</div>`);
+  } else {
+    const summaryCls = vr.n_mismatch === 0 ? "match-ok" : "match-warn";
+    const summaryTxt = vr.n_mismatch === 0
+      ? `✓ all ${vr.n_pois} exported POIs match the recomputation`
+      : `⚠ ${vr.n_mismatch} of ${vr.n_pois} POIs differ`;
+    const staleHint = vr.n_mismatch > 0
+      ? `<div class="muted" style="margin-top:4px">Widespread differences usually mean the stored export/matrix are <b>stale</b> — generated by an earlier version of the accessibility/decay code. Re-run the accessibility + POI-export stages to refresh, then this should turn green.</div>`
+      : "";
+    p5.body.insertAdjacentHTML("beforeend",
+      `<div class="elec-summary"><b class="${summaryCls}">${summaryTxt}</b>
+       <div class="muted" style="margin-top:4px">exported acc is recovered from service_power ÷ Σ singleton; powers recomputed via the exact pipeline routine (poi_exports._poi_powers).</div>${staleHint}
+       <div class="muted" style="margin-top:6px">
+         <b>How the powers are calculated</b> (per POI, per hexagon):<br>
+         <span class="formula">service_power[svc] = Σ_poi_type acc(POI) × SERVICE_SINGLETON_M[svc][poi_type]</span><br>
+         — summed over every poi_type this POI belongs to that contributes to that service (a poi_type owned by a
+         different POI for dedup purposes is skipped).<br>
+         <span class="formula">capability_power[cap] = Σ_svc service_power[svc] × CAP_ELECTRE_W[cap][svc]</span><br>
+         — each capability's power is its member services' powers, weighted by that capability's ELECTRE weights.
+         A POI can contribute to several services/capabilities at once; each cell above shows recomputed/exported.
+       </div></div>`);
+    // Each POI's service_power / capability_power is a dict keyed by service/capability —
+    // there's no single combined "power" per POI, so sorting offers one option per
+    // service/capability actually present among these POIs, not a summed total.
+    const svcKeys = Array.from(new Set(vr.rows.flatMap(r => Object.keys(r.sp_exported)))).sort();
+    const capKeys = Array.from(new Set(vr.rows.flatMap(r => Object.keys(r.cp_exported)))).sort();
+    const sortWrap = document.createElement("div");
+    sortWrap.style.margin = "6px 0";
+    sortWrap.style.fontSize = "12px";
+    const svcOpts = svcKeys.map(s => `<option value="svc:${s}">${s} ↓</option>`).join("");
+    const capOpts = capKeys.map(c => `<option value="cap:${c}">${c} ↓</option>`).join("");
+    sortWrap.innerHTML = `<label class="muted">Sort by:
+      <select>
+        <option value="default">Mismatches first (default)</option>
+        <option value="acc_desc">Accessibility ↓</option>
+        <optgroup label="Service power">${svcOpts}</optgroup>
+        <optgroup label="Capability power">${capOpts}</optgroup>
+      </select></label>`;
+    p5.body.appendChild(sortWrap);
+    const tableContainer = document.createElement("div");
+    p5.body.appendChild(tableContainer);
+
+    const rowHtml = (r) => {
+      const accCls = r.acc_match ? "match-ok" : "match-warn";
+      const rowCls = r.match ? "" : "match-warn";
+      const spStr = Object.keys(r.sp_exported).length
+        ? Object.keys(r.sp_exported).map(s => `${s}: ${(r.sp_recomputed[s]??0).toFixed(3)}/${(r.sp_exported[s]??0).toFixed(3)}`).join("<br>")
+        : "—";
+      const cpStr = Object.keys(r.cp_exported).length
+        ? Object.keys(r.cp_exported).map(c => `${c}: ${(r.cp_recomputed[c]??0).toFixed(3)}/${(r.cp_exported[c]??0).toFixed(3)}`).join("<br>")
+        : "—";
+      return `<tr class="${rowCls}">
+        <td>${r.name || r.source_key || "—"}<div class="muted">${(r.poi_types||[]).join(", ")}</div></td>
+        <td>${r.recomputed_acc==null?'<span class="null">—</span>':r.recomputed_acc.toFixed(4)}</td>
+        <td>${r.exported_acc==null?'<span class="null">—</span>':r.exported_acc.toFixed(4)}</td>
+        <td class="${accCls}">${r.acc_match?"✓":"⚠"}</td>
+        <td style="font-size:11px">${spStr}</td>
+        <td style="font-size:11px">${cpStr}</td>
+      </tr>`;
+    };
+    const sortRows = (rows, key) => {
+      const out = rows.slice();
+      if(key === "acc_desc") out.sort((a,b) => (b.exported_acc??-Infinity) - (a.exported_acc??-Infinity));
+      else if(key.startsWith("svc:")) { const s = key.slice(4); out.sort((a,b) => (b.sp_exported[s]??0) - (a.sp_exported[s]??0)); }
+      else if(key.startsWith("cap:")) { const c = key.slice(4); out.sort((a,b) => (b.cp_exported[c]??0) - (a.cp_exported[c]??0)); }
+      else out.sort((a,b) => (Number(a.match) - Number(b.match)) || ((b.recomputed_acc??0) - (a.recomputed_acc??0)));
+      return out;
+    };
+    const renderTable = (key) => {
+      const vrows = sortRows(vr.rows, key).map(rowHtml);
+      tableContainer.innerHTML = makeToggleTable(
+        `<thead><tr><th>POI (source_key / types)</th><th>acc (recomputed)</th><th>acc (exported)</th><th>✓</th><th>service_power<br><span class="muted">recomp/export</span></th><th>capability_power<br><span class="muted">recomp/export</span></th></tr></thead>`,
+        vrows, 12);
+    };
+    renderTable("default");
+    sortWrap.querySelector("select").addEventListener("change", (ev) => renderTable(ev.target.value));
+    if(vr.truncated)
+      p5.body.insertAdjacentHTML("beforeend",
+        `<div class="muted" style="margin-top:4px">Showing ${vr.rows.length} of ${vr.n_pois} POIs.</div>`);
+  }
+  el.appendChild(p5.panel);
 }
 
 let _tgSeq = 0;
@@ -980,6 +1376,11 @@ function makePanel(num, title, subtitle){
 function fmt(v){ return v == null ? '<span class="null">—</span>' : v.toFixed(1)+" min"; }
 function fmtD(v){ return v == null ? '<span class="null">—</span>' : v.toFixed(3); }
 function fmtLatLon(lat, lon){ return lat == null ? "—" : lat.toFixed(4)+", "+lon.toFixed(4); }
+function poiLabel(p){
+  if(p.name) return p.name;
+  if(p.source_key) return p.source_key.slice(0,24);
+  return fmtLatLon(p.src_lat, p.src_lon);
+}
 function timeClass(v){
   if(v == null) return "null";
   if(v < 5) return "fast";
@@ -1004,17 +1405,28 @@ def _build_html(chain_data: dict, slug: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate capability debug pipeline HTML.")
-    parser.add_argument("--study-city", default=None, help="Study city (e.g. cagliari)")
+    parser.add_argument("--study-city", default=None, help=f"Override the script's STUDY_CITY (default: {STUDY_CITY})")
     parser.add_argument("--output", default=None, help="Output HTML path (default: outputs/debug_pipeline_{slug}.html)")
     args = parser.parse_args()
 
-    cfg = PipelineConfig()
-    if args.study_city:
-        from config import apply_study_city
-        apply_study_city(cfg, args.study_city)
+    # Build the config straight from the chosen city so __post_init__ derives the city_slug,
+    # artifact_slug and every *_path consistently. (Constructing a default config and then
+    # calling apply_study_city() afterwards does NOT re-derive those paths, which is why the
+    # report used to load the wrong city's artifacts.)
+    study_city = args.study_city or STUDY_CITY
+    # Several lower-level functions (utils/graphml.py, utils/poi_dedup.py,
+    # utils/load_shapefile.py) construct their own bare PipelineConfig() instead of using
+    # the cfg built here, which falls back to CAP_STUDY_CITY from the environment. If a
+    # previous run (e.g. main.py for Paris) already set that env var in this shell, it
+    # persists and those functions silently resolve the *other* city even though this
+    # script's own cfg correctly says `study_city`, causing a Frankenstein mix of this
+    # city's paths/slug with the other city's data. Set it explicitly here too (mirroring
+    # main.py) so every bare PipelineConfig() reconstruction agrees with this one.
+    os.environ["CAP_STUDY_CITY"] = study_city
+    cfg = PipelineConfig(study_city=study_city)
 
     slug = cfg.artifact_slug
-    print(f"[Debug] city={cfg.city_name} slug={slug}")
+    print(f"[Debug] study_city={cfg.study_city} city={cfg.city_name} slug={slug}")
 
     export_dir, gpkg_path, hex_source = _default_paths(None)
     grid_params = _load_grid_params(export_dir)
@@ -1046,11 +1458,21 @@ def main() -> None:
     svc_ctx = _load_service_context(cfg)
     print(f"[Debug] bus={'ok' if bus_ctx else 'missing'} acc={'ok' if acc_ctx else 'missing'} svc={'ok' if svc_ctx else 'missing'}")
 
+    # Same per-service ownership drop map the accessibility + export stages apply, so the
+    # debug recomputation/verification matches the pipeline's deduplicated values.
+    from utils import poi_dedup
+    poi_drop_map = poi_dedup.load_drop_map(cfg.poi_ownership_drop_path)
+    print(f"[Debug] poi_drop_map: {len(poi_drop_map)} poi_types with drops"
+          + ("" if poi_drop_map else " (none — file absent or dedup off)"))
+
+    poi_names = _load_poi_names_by_source_key(cfg)
+    print(f"[Debug] poi_names: {len(poi_names)} named POIs")
+
     chain_data: dict[str, Any] = {}
     for hex_entry in selected:
         hid = hex_entry["hex_id"]
         print(f"[Debug] Building chain for {hid} ({hex_entry['group']}) node={hex_entry['node_id']}")
-        chain_data[hid] = _build_chain(hex_entry, cfg, bus_ctx, acc_ctx, svc_ctx)
+        chain_data[hid] = _build_chain(hex_entry, cfg, bus_ctx, acc_ctx, svc_ctx, hex_source, gpkg_path, poi_drop_map, poi_names)
 
     html = _build_html(chain_data, slug)
 

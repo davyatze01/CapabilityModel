@@ -179,7 +179,7 @@ def electre_tri_details(x, capability):
         "q_factor": float(ELECTRE_Q_FACTOR),
         "p_factor": float(ELECTRE_P_FACTOR),
         "veto_threshold": float(v),
-        "lambda_cut": 0.65,
+        "lambda_cut": 0.7,
         "boundaries": [],
     }
 
@@ -203,13 +203,22 @@ def electre_tri_details(x, capability):
     p = std * ELECTRE_P_FACTOR
     inf_veto = v == float("inf")
     pq_range = p - q
-    w = 1.0 / len(x_arr)
+    # Per-service ELECTRE weights (from CAP_ELECTRE_W / the electre_weight column
+    # in config/capability.csv). Default to uniform if a weight is missing or the
+    # weights are degenerate, so the global concordance below stays well-defined.
+    cap_weights = CAP_ELECTRE_W.get(capability, {})
+    weights = [float(cap_weights.get(s, 1.0 / len(x_arr))) for s in services]
+    weight_sum = sum(weights)
+    if weight_sum <= 0:
+        weights = [1.0 / len(x_arr)] * len(x_arr)
+        weight_sum = 1.0
+    details["weights"] = {service: weights[idx] for idx, service in enumerate(services)}
 
     assigned_idx = 0
     for k, b in enumerate(_BOUNDARIES):
         concordance_terms = []
-        concordance_sum = 0.0
-        for service, xj in zip(services, x_arr):
+        weighted_concordance_sum = 0.0
+        for j, (service, xj) in enumerate(zip(services, x_arr)):
             d = xj - b
             if d >= -q:
                 c_j = 1.0
@@ -220,18 +229,20 @@ def electre_tri_details(x, capability):
             else:
                 c_j = 0.0
                 rule = "none"
-            concordance_sum += c_j
+            weighted_concordance_sum += weights[j] * c_j
             concordance_terms.append(
                 {
                     "service": service,
                     "score": xj,
                     "difference_vs_boundary": d,
                     "partial_concordance": c_j,
+                    "weight": weights[j],
                     "rule": rule,
                 }
             )
 
-        C = concordance_sum * w
+        # Global concordance: sum(w_j * c_j) / sum(w_j).
+        C = weighted_concordance_sum / weight_sum
         cred = C
         discordance_terms = []
         veto_triggered = False
@@ -284,7 +295,7 @@ def electre_tri_details(x, capability):
 
     details.update(
         {
-            "mode": "electre_tri_b",
+            "mode": "electre_tri",
             "q": q,
             "p": p,
             "assigned_category": _CATEGORIES[assigned_idx],

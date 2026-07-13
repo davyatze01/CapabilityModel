@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import os
 import pickle
 import math
@@ -13,11 +14,10 @@ from typing import Any, cast
 
 from tqdm import tqdm
 import psutil
-import walkability
 
 from context import PipelineContext
 from pipeline_types import SnappingStageResult, NonBusRoutingStageResult
-from utils import delta_g, services as serv
+from utils import delta_g, graphml, services as serv
 from snapping_stage import select_best_snap_candidate_for_origin, coord_key
 from config import PipelineConfig
 
@@ -386,34 +386,20 @@ def run_non_bus_routing_stage(
             continue
         nodes_to_compute.append((node_id, data))
 
-    # Warm walkability edge cache once in parent process so workers do not all
-    # attempt an expensive first-time build concurrently.
-    walk_graph = snap.shared_mode_graphs.get("walk")
+    # Walkability scores are baked into the walk CSR bundle (graphml.get_mode_csr embeds a
+    # per-edge `wscore` array at build time), and workers read them straight from that
+    # bundle via delta_g._csr_path_walkability — no full NetworkX graph or separate cache
+    # warm-up is needed. The CSR build below (origin pre-snap) builds the walk walkability
+    # index once in the parent as a side effect.
     walk_graph_signature = ""
-    if walk_graph is not None:
-        try:
-            print("[Non-bus] Preparing walkability edge cache...", flush=True)
-            walk_cache_obj = walkability.get_or_build_edge_walkability_index(
-                cfg=_PIPELINE_CONFIG,
-                G=walk_graph,
-                force_rebuild=False,
-                schema_version=1,
-            )
-            walk_graph_signature = walk_cache_obj.graph_signature
-            print("[Non-bus] Walkability edge cache ready.", flush=True)
-        except Exception as exc:
-            print(
-                f"[Non-bus] Walkability cache warm-up skipped due to error: {exc}",
-                flush=True,
-            )
 
     # Precompute origin node indices per mode once in the parent (one batched KD-tree
     # query per mode), so workers reuse them instead of snapping origins lazily. This
     # also triggers building the compact CSR routing matrices in the parent, so each
     # worker loads a few-MB matrix from disk instead of the full NetworkX graph.
     origin_nodes_by_id: dict[Any, Any] = {}
-    if nodes_to_compute and snap.shared_mode_graphs:
-        routing_modes = [m for m in ("walk", "bike", "drive") if m in snap.shared_mode_graphs]
+    if nodes_to_compute:
+        routing_modes = ["walk", "bike", "drive"]
         coords_by_id = {
             node_id: (data["y"], data["x"])
             for node_id, data in nodes_to_compute
@@ -431,6 +417,17 @@ def run_non_bus_routing_stage(
         except Exception as exc:
             print(f"[Non-bus] Origin pre-snap skipped due to error: {exc}", flush=True)
             origin_nodes_by_id = {}
+
+    # Everything the parent needs the full NetworkX graphs for is now done (POI snapping in
+    # the snapping stage and origin/CSR pre-snap above, which also builds walkability). If a
+    # CSR had to be built here it left the full graph cached in graphml._MODE_GRAPH_CACHE;
+    # drop it before the pool forks. Workers route on the compact CSR bundles, so otherwise
+    # every worker inherits the multi-GB graphs copy-on-write and refcount writes blow up
+    # RAM. This is the single biggest peak-memory reduction for large cities (Paris).
+    snap.shared_mode_graphs = {}
+    graphml.clear_mode_graph_cache()
+    gc.collect()
+    print("[Non-bus] Released full mode graphs before forking worker pool.", flush=True)
 
     global_radius_m = serv.get_global_radius_m(_PIPELINE_CONFIG)
     if global_radius_m is not None:

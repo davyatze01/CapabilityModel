@@ -180,7 +180,7 @@ def _get_mode_graph(network_type, cfg: PipelineConfig | None = None):
     - graph object for the requested mode.
     """
     if network_type not in _MODE_GRAPH_CACHE:
-        graph = graphml.get_mode_graph(network_type, cfg, simplified=False)
+        graph = graphml.get_mode_graph(network_type, cfg)
         if _STRIP_GRAPH_GEOMETRY:
             _strip_edge_geometry(graph)
         _MODE_GRAPH_CACHE[network_type] = graph
@@ -318,6 +318,44 @@ def snap_origin_nodes_by_mode(coords_by_id, cfg: PipelineConfig | None = None, m
     return result
 
 
+def snap_coords_to_mode_nodes(network_type, coords, cfg: PipelineConfig | None = None):
+    """Snap `(lat, lon)` coordinates to their nearest mode-graph node coordinates.
+
+    Uses the CSR bundle's KD-tree (built over the FULL graph's node coordinates), so the
+    snapped result is identical to `nearest_nodes(full_graph, ...)` but never materializes
+    the multi-GB NetworkX graph — only the few-MB CSR bundle. Lets the snapping stage drop
+    the full-graph dependency for POIs the same way origin snapping already did.
+
+    Inputs:
+    - network_type: mode string ("walk", "bike", "drive").
+    - coords: sequence of `(lat, lon)` pairs.
+
+    Outputs:
+    - list aligned to `coords` of snapped `(lat, lon)` tuples (EPSG:4326).
+    """
+    import numpy as np
+
+    coords = list(coords)
+    if not coords:
+        return []
+    bundle = graphml.get_mode_csr(network_type, cfg)
+    tree = bundle["tree"]
+    snap_indices = bundle["snap_indices"]
+    snap_x = bundle["snap_x"]
+    snap_y = bundle["snap_y"]
+    m_per_deg_lon, m_per_deg_lat = bundle["scale"]
+    query_xy = np.array(
+        [[float(lon) * m_per_deg_lon, float(lat) * m_per_deg_lat] for (lat, lon) in coords],
+        dtype=float,
+    )
+    _, idxs = tree.query(query_xy)
+    out = []
+    for idx in np.atleast_1d(idxs):
+        real_i = int(snap_indices[int(idx)])
+        out.append((float(snap_y[real_i]), float(snap_x[real_i])))
+    return out
+
+
 def _reconstruct_path_idx(predecessors, origin_idx, target_idx):
     """Rebuild an origin->target node-index path from a scipy predecessor array.
 
@@ -424,17 +462,23 @@ def _get_mode_lengths_and_paths(origin, network_type, radius_m, origin_idx=None,
     return (dist, pred, origin_idx)
 
 
-def build_rra(decay_walk, decay_bike, decay_drive, decay_bus):
+def build_rra(decay_walk, decay_bike, decay_drive, decay_bus, decay_subway=None):
     """Build per-POI RRA list by combining modal decay lists element-wise.
 
     Inputs:
     - decay_walk, decay_bike, decay_drive, decay_bus: modal decay arrays.
+    - decay_subway: optional extra-modality (subway) decay array. When None, subway is not
+      part of the RRA (mode count m=4, unchanged); when provided it adds a 5th mode.
 
     Outputs:
     - list[float]: merged RRA values for valid entries.
     """
+    has_subway = decay_subway is not None
     rra = []
-    n = max(len(decay_walk), len(decay_bike), len(decay_drive), len(decay_bus))
+    lengths = [len(decay_walk), len(decay_bike), len(decay_drive), len(decay_bus)]
+    if has_subway:
+        lengths.append(len(decay_subway))
+    n = max(lengths)
     for i in range(n):
         # Mode lists may differ in length (e.g. callers that only supply walk
         # decays and leave bike/drive/bus empty). Treat a missing entry as 0.0,
@@ -443,16 +487,22 @@ def build_rra(decay_walk, decay_bike, decay_drive, decay_bus):
         db = decay_bike[i] if i < len(decay_bike) else 0.0
         dd = decay_drive[i] if i < len(decay_drive) else 0.0
         d_bus = decay_bus[i] if i < len(decay_bus) else 0.0
+        d_subway = (decay_subway[i] if i < len(decay_subway) else 0.0) if has_subway else None
         if None not in (dw, db, dd, d_bus):
-            rra.append(decay.calculate_rra(dw, db, dd, d_bus))
+            rra.append(decay.calculate_rra(dw, db, dd, d_bus, d_subway))
     return rra
 
 
 def accessibility_from_rra(RRA, poi_type=None, contribution_coefficient=None):
-    """Aggregate RRA values into one accessibility score for a POI type.
+    """Aggregate per-POI RRA values into one accessibility score for a POI type.
+
+    Implements A^i_k(x) = sum_j A^i_k(x, y_j) * Delta g_k(j): per-POI RRAs are
+    sorted descending and weighted by the marginal saturation increments Delta g.
+    This is the type-level aggregation only; a single POI's accessibility is its
+    RRA (computed upstream) and must not be passed through here.
 
     Inputs:
-    - RRA: list of RRA values.
+    - RRA: list of per-POI RRA values.
     - poi_type: optional POI type key (for configured contribution coefficient lookup).
     - contribution_coefficient: optional explicit contribution coefficient.
 
@@ -666,16 +716,17 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
     }
 
 
-def merge_rra_and_accessibility(decay_walk, decay_bike, decay_drive, decay_bus, poi_type=None, contribution_coefficient=None):
+def merge_rra_and_accessibility(decay_walk, decay_bike, decay_drive, decay_bus, poi_type=None, contribution_coefficient=None, decay_subway=None):
     """Compute both RRA list and final accessibility from modal decays.
 
     Inputs:
     - decay_walk, decay_bike, decay_drive, decay_bus: modal decay arrays.
     - poi_type: optional POI type key.
     - contribution_coefficient: optional explicit contribution coefficient.
+    - decay_subway: optional extra-modality (subway) decay array; see build_rra.
 
     Outputs:
     - tuple `(rra_list, accessibility_value)`.
     """
-    rra = build_rra(decay_walk, decay_bike, decay_drive, decay_bus)
+    rra = build_rra(decay_walk, decay_bike, decay_drive, decay_bus, decay_subway)
     return rra, accessibility_from_rra(rra, poi_type=poi_type, contribution_coefficient=contribution_coefficient)

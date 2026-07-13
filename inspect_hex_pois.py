@@ -1,13 +1,12 @@
 import argparse
 import json
 import math
-import os
 import sqlite3
-import zipfile
 from html import escape
 from pathlib import Path
 from typing import Any
 
+import hex_shard_writer
 from config import PipelineConfig
 
 
@@ -60,62 +59,42 @@ def _default_paths(poi_export_dir_override: str | None) -> tuple[Path, Path, Pat
 
 
 def _find_spatial_export_gpkg(export_dir: Path) -> Path | None:
-    candidates = sorted((Path("outputs") / "export").glob("*_export.gpkg"))
-    if not candidates:
-        return None
-    if len(candidates) == 1:
-        return candidates[0]
+    """Locate the current run's combined capability GeoPackage for this city.
 
-    export_slug = export_dir.name.lower()
+    `export_dir` is `cfg.poi_export_dir` (`outputs/poi_exports/<slug>`), so its
+    directory name IS the artifact slug — use that to build the actual path the
+    pipeline writes to (`outputs/gpkg/<slug>/<slug>.gpkg`, see
+    pipeline_runner.py:generate_spatial_outputs) instead of guessing from an
+    unrelated legacy directory.
+    """
+    export_slug = export_dir.name
+    primary = Path("outputs") / "gpkg" / export_slug / f"{export_slug}.gpkg"
+    if primary.exists():
+        return primary
+
+    # Legacy fallback for older exports that used outputs/export/*_export.gpkg. Only
+    # trust a candidate whose filename actually names this slug — blindly returning
+    # a sole match here previously served a stale, unrelated city's GPKG (wrong node
+    # ids, wrong point count) whenever exactly one leftover file existed on disk.
+    candidates = sorted((Path("outputs") / "export").glob("*_export.gpkg"))
+    slug_lower = export_slug.lower()
     for candidate in candidates:
-        stem = candidate.stem.lower()
-        if export_slug in stem:
+        if slug_lower in candidate.stem.lower():
             return candidate
-    return candidates[-1]
+    return None
 
 
 def _load_hex_items(hex_id: str, hex_source: Path) -> list[dict[str, Any]]:
-    filename = f"{hex_id}.js"
-    if hex_source.is_dir():
-        hex_path = hex_source / filename
-        if not hex_path.exists():
-            raise FileNotFoundError(f"Hex file not found: {hex_path}")
-        text = hex_path.read_text(encoding="utf-8")
-    else:
-        if not hex_source.exists():
-            raise FileNotFoundError(f"Hex archive not found: {hex_source}")
-        with zipfile.ZipFile(hex_source) as zf:
-            try:
-                text = zf.read(filename).decode("utf-8")
-            except KeyError as exc:
-                raise FileNotFoundError(f"Hex file not found in zip: {filename}") from exc
+    """Load one hexagon's decoded records ({"i", "sp", "cp"}) from the sharded store.
 
-    prefix = f'__onHexPois("{hex_id}",'
-    suffix = ");"
-    if not text.startswith(prefix) or not text.endswith(suffix):
-        raise ValueError(f"Unexpected JSONP format for {filename}")
-    payload = text[len(prefix):-len(suffix)]
-    items = json.loads(payload)
-    if not isinstance(items, list):
-        raise ValueError(f"Unexpected payload type for {filename}: {type(items).__name__}")
-    return items
+    `hex_source` is either the hex_pois directory or the hex_pois.zip archive
+    (both hold the v2 shard files + index.js manifest).
+    """
+    return hex_shard_writer.load_hex_items(hex_id, hex_source)
 
 
 def _list_hex_ids(hex_source: Path) -> list[str]:
-    if hex_source.is_dir():
-        return sorted(
-            path.stem
-            for path in hex_source.glob("H*.js")
-            if path.is_file() and path.name != "index.js"
-        )
-    if not hex_source.exists():
-        raise FileNotFoundError(f"Hex archive not found: {hex_source}")
-    with zipfile.ZipFile(hex_source) as zf:
-        return sorted(
-            Path(name).stem
-            for name in zf.namelist()
-            if name.startswith("H") and name.endswith(".js")
-        )
+    return sorted(hex_shard_writer.list_hex_ids(hex_source))
 
 
 def _fetch_poi_rows(gpkg_path: Path, poi_ids: list[int]) -> dict[int, dict[str, Any]]:
@@ -217,7 +196,13 @@ def _write_geojson(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def _load_grid_params(export_dir: Path) -> dict[str, Any] | None:
+    # export_dir is cfg.poi_export_dir ("outputs/poi_exports/<slug>") — that's where
+    # context.py now writes this city's own grid_params.json. The other candidates are
+    # legacy shared-path fallbacks for older runs; prefer them only if this city's own
+    # file doesn't exist, since the shared "outputs/grid_params.json" gets silently
+    # overwritten by whichever city ran most recently.
     candidates = [
+        export_dir / "grid_params.json",
         export_dir.parent.parent / "grid_params.json",
         export_dir.parent / "grid_params.json",
         Path("outputs") / "grid_params.json",

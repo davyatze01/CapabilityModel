@@ -26,6 +26,7 @@ CITY_PRESETS: dict[str, dict[str, object]] = {
             "pois_shp/poi_polygons.shp",
         ],
         "bus_ticket_price": 1.3,
+        "osm_extract_url": "https://download.geofabrik.de/europe/italy/isole-latest.osm.pbf",
     },
     "paris": {
         "city_name": "Paris, France",
@@ -38,6 +39,16 @@ CITY_PRESETS: dict[str, dict[str, object]] = {
             "Paris/POI_polygon.shp",
         ],
         "bus_ticket_price": 2.05,
+        # The IDFM feed carries both bus (route_type 3) and subway (route_type 1); route them
+        # as two separate modalities.
+        "enable_subway": True,
+        "gtfs_feeds": [os.path.join("gtfs", "IDFM-gtfs.zip")],
+        # The IDFM GTFS calendar covers 2025-12-12..2026-01-13, so the global default
+        # departure (2025-10-15) falls outside it and R5 reports "no transit services on
+        # the selected date". Pin a normal weekday well inside the feed's calendar (a
+        # Wednesday, before the holiday tail) for Paris only.
+        "bus_departure_dt": dt.datetime(2025, 12, 17, 12, 0, 0),
+        "osm_extract_url": "https://download.geofabrik.de/europe/france/ile-de-france-latest.osm.pbf",
     },
 }
 
@@ -55,6 +66,14 @@ def apply_study_city(cfg: "PipelineConfig", study_city: str) -> None:
     cfg.poi_shapefile_paths = list(preset["poi_shapefile_paths"])
     if "bus_ticket_price" in preset:
         cfg.bus_ticket_price = float(preset["bus_ticket_price"])  # type: ignore[arg-type]
+    if "enable_subway" in preset:
+        cfg.enable_subway = bool(preset["enable_subway"])
+    if "gtfs_feeds" in preset:
+        cfg.gtfs_feeds = list(preset["gtfs_feeds"])  # type: ignore[arg-type]
+    if "bus_departure_dt" in preset:
+        cfg.bus_departure_dt = preset["bus_departure_dt"]  # type: ignore[assignment]
+    if "osm_extract_url" in preset:
+        cfg.osm_extract_url = str(preset["osm_extract_url"])
 
 
 def derive_city_slug(city_name: str) -> str:
@@ -102,7 +121,19 @@ class PipelineConfig:
     qgis_grid_cell_size_m: float = 100.0
     qgis_grid_capability_field: str = "capability_care"
     qgis_grid_opacity: float = 0.55
+    # Per-service heatmap grids are drawn as flat color fills (no hatch/lines to
+    # protect), so they can afford to be more opaque than the hatch grid above.
+    qgis_service_grid_opacity: float = 0.9
     qgis_grid_max_cells: int = 500000
+    # Stroke width (mm, QGIS symbol units) of the hexagon grid outline layer.
+    qgis_grid_outline_width: float = 0.1
+    # Stroke color of the hexagon grid outline layer, as "R,G,B,A" (0-255 each).
+    qgis_grid_outline_color: str = "90,90,90,170"
+    # Stroke width (mm, QGIS symbol units) of the diagonal hatch lines drawn inside
+    # each capability-grid cell. Kept thin and constant across all 5 density classes
+    # (only line *spacing* varies by class) so the underlying service color grid stays
+    # visible even at the tightest (Very High) spacing.
+    qgis_grid_hatch_line_width: float = 2
     # Fill the convex hull of the sampled nodes with hexagons (vs. only cells next to a node),
     # so the study area's shape/perimeter is recognizable and interior holes are filled.
     qgis_grid_fill_hull: bool = True
@@ -111,6 +142,9 @@ class PipelineConfig:
     # Boundary shape: >=1.0 = convex hull; ~0.3 = concave hull following a real concave outline
     # (coastlines/bays); lower = tighter/jaggier. Falls back to convex if concave_hull fails.
     qgis_grid_hull_ratio: float = 0.3
+    # Drop hull-fill cells (no real sampled node, has_data=0) that lie entirely within OSM
+    # water polygons. Cells with a real node are never dropped, even if partly over water.
+    qgis_grid_exclude_water: bool = True
     poi_from_shp: bool = True
     poi_shapefile_paths: list[str] = field(
         default_factory=lambda: [
@@ -139,7 +173,13 @@ class PipelineConfig:
     accessibility_node_to_row_path: str = ""
     accessibility_poi_to_col_path: str = ""
     accessibility_poi_by_node_path: str = ""
+    accessibility_poi_by_node_dir: str = ""
     accessibility_matrix_schema_version: int = 1
+
+    # Per-service POI de-duplication (OSM-download mode only): when a physical POI is
+    # matched by several poi_types of one service, keep it only under the owning type.
+    poi_service_dedup_enabled: bool = True
+    poi_ownership_drop_path: str = ""
 
     # Service matrix cache
     service_matrix_cache_enabled: bool = True
@@ -183,6 +223,11 @@ class PipelineConfig:
     time_indifference_bus: float = 60.0
     routing_data_dir: str = "gtfs"
     osm_pbf_autobuild: bool = True
+    # Regional Geofabrik PBF the city extract is clipped from (osmium extract).
+    osm_extract_url: str = field(default_factory=lambda: os.getenv("CAP_OSM_EXTRACT_URL", ""))
+    # Margin added around the study-area bounds when clipping, so routing near the
+    # boundary still sees the surrounding network.
+    osm_extract_buffer_m: float = 2000.0
     osm_autobuild_network_type: str = "all"
     osm_autobuild_simplify: bool = False
     osm_autobuild_retain_all: bool = True
@@ -198,13 +243,21 @@ class PipelineConfig:
     bus_dest_id_to_col_path : str = ""
     bus_impedance_matrix_path : str = ""
     bus_impedance_meta_path: str = ""
+    # Subway is an optional second public-transport modality (enabled per city, e.g. France).
+    # Its routing/impedance artifacts mirror the bus ones but live under a separate subfolder
+    # so the two modes don't overwrite each other. Populated in __post_init__.
+    enable_subway: bool = False
+    subway_routing_matrix_path: str = ""
+    subway_routing_cache_path: str = ""
+    subway_routing_origins_input_path: str = ""
+    subway_routing_destinations_input_path: str = ""
+    subway_source_id_to_row_path: str = ""
+    subway_dest_id_to_col_path: str = ""
+    subway_impedance_matrix_path: str = ""
+    subway_impedance_meta_path: str = ""
     pool_max_retries: int = 4
     pool_retry_delay_s: float = 2.0
     non_bus_max_workers: int = 24
-    # Non-bus routing always uses the full unsimplified graph topology, but workers
-    # load it through a compressed CSR/KD-tree bundle rather than a full NetworkX
-    # object. The legacy simplified-routing toggle is intentionally disabled.
-    route_on_simplified_graph: bool = False
     # Estimated resident RAM per worker. With CSR-based routing this is mostly the
     # compressed adjacency arrays and related caches rather than full mode graphs.
     mem_per_worker_gb: float = 1.2
@@ -235,6 +288,13 @@ class PipelineConfig:
         city_artifacts = os.path.join(self.artifacts_root_dir, self.artifact_slug)
         self.impedance_artifact_path = os.path.join(city_artifacts, "impedances.npz")
         self.poi_snap_cache_dir = os.path.join(city_artifacts, "snapping", "poi_snap_cache")
+        # Whole-stage snapping checkpoint (post dedup/radius filter). Lets a restart after a
+        # later-stage crash (e.g. bus routing) skip re-running run_snapping_stage from scratch.
+        self.snap_checkpoint_path = os.path.join(city_artifacts, "snapping", "snap_stage_checkpoint.pkl")
+        # Selected public-transport routing destinations, keyed by an origins+snap+radius
+        # signature. Lets a restart skip the O(origins × POIs) destination selection; shared
+        # across bus/subway since both select from the same snap candidates.
+        self.pt_destination_cache_path = os.path.join(city_artifacts, "snapping", "pt_selected_destinations.pkl")
         self.non_bus_cache_dir = os.path.join(city_artifacts, "non_bus")
         self.walkability_cache_dir = os.path.join(city_artifacts, "walkability")
 
@@ -247,11 +307,22 @@ class PipelineConfig:
         self.bus_impedance_matrix_path = os.path.join(city_artifacts, "bus", "bus_impedance_matrix.dat")
         self.bus_impedance_meta_path = os.path.join(city_artifacts, "bus", "bus_impedance_meta.json")
 
+        self.subway_routing_matrix_path = os.path.join(city_artifacts, "subway", "r5r_expanded_travel_time_matrix.csv")
+        self.subway_routing_cache_path = os.path.join(city_artifacts, "subway", "r5r_best_routes.pkl")
+        self.subway_routing_origins_input_path = os.path.join(city_artifacts, "subway", "r5r_origins.csv")
+        self.subway_routing_destinations_input_path = os.path.join(city_artifacts, "subway", "r5r_dest.csv")
+        self.subway_source_id_to_row_path = os.path.join(city_artifacts, "subway", "source_id_to_row.json")
+        self.subway_dest_id_to_col_path = os.path.join(city_artifacts, "subway", "dest_id_to_col.json")
+        self.subway_impedance_matrix_path = os.path.join(city_artifacts, "subway", "subway_impedance_matrix.dat")
+        self.subway_impedance_meta_path = os.path.join(city_artifacts, "subway", "subway_impedance_meta.json")
+
         self.accessibility_matrix_path = os.path.join(city_artifacts, "accessibility", "accessibility_matrix.dat")
         self.accessibility_meta_path = os.path.join(city_artifacts, "accessibility", "accessibility_meta.json")
         self.accessibility_node_to_row_path = os.path.join(city_artifacts, "accessibility", "access_node_to_row.json")
         self.accessibility_poi_to_col_path = os.path.join(city_artifacts, "accessibility", "access_poi_to_col.json")
         self.accessibility_poi_by_node_path = os.path.join(city_artifacts, "accessibility", "access_poi_by_node.json")
+        self.accessibility_poi_by_node_dir = os.path.join(city_artifacts, "accessibility", "poi_by_node")
+        self.poi_ownership_drop_path = os.path.join(city_artifacts, "accessibility", "poi_ownership_drop.json")
 
         self.service_matrix_path = os.path.join(city_artifacts, "service", "service_matrix.dat")
         self.service_meta_path = os.path.join(city_artifacts, "service", "service_meta.json")
@@ -264,3 +335,29 @@ class PipelineConfig:
         self.hexagon_service_pois_path = os.path.join(self.poi_export_dir, "hexagon_service_pois.json")
         self.hex_pois_dir = os.path.join(self.poi_export_dir, "hex_pois")
         self.hex_pois_zip_path = os.path.join(self.poi_export_dir, "hex_pois.zip")
+
+    def public_transport_paths(self, transport_type: str) -> dict[str, str]:
+        """Return the artifact path set for a public-transport modality.
+
+        Bus uses the legacy ``bus/`` paths; subway/metro use the parallel ``subway/``
+        paths. Keys mirror the names used by the routing stage / accessibility worker.
+        """
+        if transport_type in ("subway", "metro"):
+            return {
+                "routing_matrix": self.subway_routing_matrix_path,
+                "routing_cache": self.subway_routing_cache_path,
+                "routing_origins_input": self.subway_routing_origins_input_path,
+                "routing_destinations_input": self.subway_routing_destinations_input_path,
+                "source_id_to_row": self.subway_source_id_to_row_path,
+                "dest_id_to_col": self.subway_dest_id_to_col_path,
+                "impedance_matrix": self.subway_impedance_matrix_path,
+            }
+        return {
+            "routing_matrix": self.bus_routing_matrix_path,
+            "routing_cache": self.bus_routing_cache_path,
+            "routing_origins_input": self.bus_routing_origins_input_path,
+            "routing_destinations_input": self.bus_routing_destinations_input_path,
+            "source_id_to_row": self.bus_source_id_to_row_path,
+            "dest_id_to_col": self.bus_dest_id_to_col_path,
+            "impedance_matrix": self.bus_impedance_matrix_path,
+        }

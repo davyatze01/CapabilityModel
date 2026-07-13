@@ -2,18 +2,21 @@ import json
 import os
 import pickle
 import shutil
-import zipfile
 from collections import OrderedDict
 from typing import Any
 
+import gc
+import shapely
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry.base import BaseGeometry
 
 from context import PipelineContext
+from hex_shard_writer import HexShardWriter
 from pipeline_types import AccessibilityStageResult, NonBusRoutingStageResult, SnappingStageResult
 from utils import capabilities as cap_mod, delta_g, graphml, services as serv
-from utils.poi_identity import build_poi_source_key
+from utils.graphml import _ElapsedTimer
+from utils.poi_identity import SOURCE_KEY_COLUMNS, build_poi_source_key
 from snapping_stage import select_best_snap_candidate_for_origin
 
 
@@ -112,38 +115,103 @@ def _collect_poi_records() -> list[dict[str, Any]]:
     poi_type_to_services = _build_poi_type_service_lookup()
     records: dict[str, dict[str, Any]] = OrderedDict()
 
-    for query in serv.unique_query_keys():
+    queries = list(serv.unique_query_keys())
+    for q_idx, query in enumerate(queries, 1):
         poi = _query_frame(query)
         if poi is None or poi.empty:
             continue
         if "geometry" not in poi.columns:
-            continue
-
-        for _, row in poi.iterrows():
-            geom = row.get("geometry")
-            if geom is None or getattr(geom, "is_empty", False):
+            if "__snap_coord" not in poi.columns:
                 continue
-            point = _geometry_to_point(geom)
-            key = build_poi_source_key(row, point)
-            record = records.get(key)
-            if record is None:
-                record = {
-                    "source_key": key,
-                    "geometry": point,
-                    "poi_types": set(),
-                    "address": _compose_address(row),
-                    "lat": float(point.y),
-                    "lon": float(point.x),
-                }
-                records[key] = record
-            else:
-                if not record.get("address"):
-                    record["address"] = _compose_address(row)
-                record["lat"] = float(point.y)
-                record["lon"] = float(point.x)
+            # Cached GeoJSON is loaded as a plain DataFrame (no GEOS objects) to avoid
+            # segfaults on complex Paris geometries. Build Point geometries from the
+            # pre-extracted snap coordinates; Point(lon, lat) construction is safe.
+            coords = poi["__snap_coord"]
+            poi = poi.copy()
+            poi["geometry"] = gpd.array.GeometryArray(
+                shapely.points(
+                    [c[0] for c in coords],
+                    [c[1] for c in coords],
+                )
+            )
+            poi = gpd.GeoDataFrame(poi, geometry="geometry", crs="EPSG:4326")
+        print(
+            f"[POI Export] Collecting records {q_idx}/{len(queries)}: "
+            f"poi_type={query.poi_type} rows={len(poi)} unique_so_far={len(records)}",
+            flush=True,
+        )
 
-            record["poi_types"].add(str(query.poi_type))
+        # Filter null/empty geometries up front on the whole column (vectorized).
+        geom_col = poi.geometry
+        valid_mask = geom_col.notna() & ~geom_col.is_empty & ~shapely.is_missing(geom_col.values)
+        poi_valid = poi[valid_mask]
 
+        if not poi_valid.empty:
+            # Compute centroids for the whole filtered frame at once using the
+            # shapely 2.x ufunc path — avoids the GEOS interior-point algorithm
+            # used by representative_point(), which hard-crashes the interpreter
+            # on certain complex Paris/large-city polygons.
+            points_arr = shapely.centroid(poi_valid.geometry.values)
+
+            # Compute the "missing centroid" mask once, vectorized over the whole
+            # array (the supported shapely ufunc path). Calling shapely.is_missing()
+            # on a single indexed scalar geometry per-row segfaults the interpreter
+            # on this GEOS build, the same way representative_point() does above.
+            points_missing = shapely.is_missing(points_arr)
+
+            # Extract only the columns needed for source-key + address; avoids
+            # materialising a full wide pd.Series per row (the iterrows() crash path).
+            col_vals = {col: poi_valid[col].to_numpy() for col in SOURCE_KEY_COLUMNS if col in poi_valid.columns}
+            geoms_arr = poi_valid.geometry.to_numpy()
+
+            poi_type_str = str(query.poi_type)
+            for i in range(len(poi_valid)):
+                point = points_arr[i]
+                if point is None or points_missing[i]:
+                    continue
+                try:
+                    lat = float(point.y)
+                    lon = float(point.x)
+                except Exception:
+                    continue
+
+                row_dict = {col: vals[i] for col, vals in col_vals.items()}
+                key = build_poi_source_key(row_dict, geoms_arr[i])
+
+                record = records.get(key)
+                if record is None:
+                    records[key] = {
+                        "source_key": key,
+                        "geometry": point,
+                        "poi_types": {poi_type_str},
+                        "address": _compose_address(row_dict),
+                        "lat": lat,
+                        "lon": lon,
+                    }
+                else:
+                    if not record.get("address"):
+                        record["address"] = _compose_address(row_dict)
+                    record["lat"] = lat
+                    record["lon"] = lon
+                    record["poi_types"].add(poi_type_str)
+
+        # Explicitly release the GeoDataFrame and its GEOS objects before the next
+        # poi_type is loaded — prevents GEOS heap accumulation across poi_types.
+        del poi_valid, poi
+        gc.collect()
+
+    # Everything needed has already been extracted into `records` above. In shapefile
+    # mode (Paris), utils.load_shapefile keeps the full merged POI GeoDataFrame cached
+    # for the process's entire lifetime — on a 290k+ POI city that's a large permanent
+    # cost sitting on top of `records` itself and every per-query .copy(). Release it
+    # now; the next call (this runs once pre-routing and once post-routing) will just
+    # re-read the shapefile from disk, trading a one-time I/O cost for not holding it
+    # in RAM between calls.
+    from utils.load_shapefile import clear_poi_shp_cache
+    clear_poi_shp_cache()
+    gc.collect()
+
+    print(f"[POI Export] Collected {len(records)} unique POIs — sorting...", flush=True)
     export_rows: list[dict[str, Any]] = []
     for idx, (key, record) in enumerate(
         sorted(
@@ -175,6 +243,7 @@ def _collect_poi_records() -> list[dict[str, Any]]:
             }
         )
 
+    print(f"[POI Export] Built {len(export_rows)} export rows.", flush=True)
     return export_rows
 
 
@@ -216,6 +285,7 @@ def _poi_powers(
     poi_types: list[str],
     accessibility_by_poi: dict[str, float],
     node_scores: dict[str, dict[str, float]],
+    drop_map: dict[str, set[str]] | None = None,
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Compute service_power and capability_power for one POI from one hexagon.
 
@@ -227,8 +297,15 @@ def _poi_powers(
                               contributes to the service.
     capability_power[cap]   = same but also weighted by CAP_ELECTRE_W[cap][service].
     Only non-zero entries are included.
+
+    Per-service ownership dedup: `drop_map` is `{poi_type: {source_keys to drop}}` (from
+    utils.poi_dedup, the same map the accessibility stage applies). When a physical POI is
+    owned by another poi_type of the same service, its non-owning poi_type is skipped here
+    too, so service_power/capability_power never double-count it — keeping per-POI powers
+    consistent with the deduplicated accessibility values.
     """
     poi_acc = accessibility_by_poi.get(source_key)
+    drop_map = drop_map or {}
 
     service_power: dict[str, float] = {}
     for service in serv.SERVICE_KEYS:
@@ -236,6 +313,10 @@ def _poi_powers(
         sp = 0.0
         for pt in poi_types:
             if pt not in singletons:
+                continue
+            # Skip the poi_type that does not own this physical POI in its service
+            # (mirrors accessibility_stage zeroing dropped (poi_type, source_key) pairs).
+            if source_key in drop_map.get(pt, ()):
                 continue
             if poi_acc is not None:
                 acc_val = poi_acc
@@ -260,222 +341,66 @@ def _poi_powers(
     return service_power, capability_power
 
 
-def _build_hexagon_report(
+def _stream_hexagon_export(
     poi_rows: list[dict[str, Any]],
     ctx: PipelineContext,
-    snap: SnappingStageResult | None,
-    non_bus: NonBusRoutingStageResult | None,
-    acc: AccessibilityStageResult | None,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    non_bus: NonBusRoutingStageResult,
+    writer: HexShardWriter,
+) -> int:
+    """Stream per-hexagon POI id lists straight into the shard writer.
+
+    The previous implementation materialized the full hexagon->POIs dict for
+    every node, then copied it again for compaction, before writing a single
+    byte — O(all hexagons x POIs) memory, which OOMed on large cities. Here
+    each hexagon is encoded and appended to its shard part file the moment it
+    is built, so memory stays O(one hexagon) regardless of city size.
+
+    Score computation (sp/cp) is still omitted at this stage: it is produced
+    by the separate post-pipeline pass (score_report.py), which overwrites
+    this id-only export with the powered one.
+    """
     poi_index = _build_poi_index(poi_rows)
-    pid_to_source_key: dict[int, str] = {int(row["id"]): str(row["source_key"]) for row in poi_rows}
-    non_bus_payloads = _load_non_bus_payloads(ctx, non_bus) if non_bus is not None else {}
+    non_bus_cache_dir = ctx.config.non_bus_cache_dir
+    nodes = ctx.nodes_with_coords
+    total = len(nodes) if hasattr(nodes, "__len__") else None
 
-    # Main payload: hexagon id -> list of POI objects.
-    # Each object has at minimum {"id": int}; when acc is provided it also carries
-    # service_power and capability_power (non-zero entries only).
-    # Full POI attributes live in the GeoPackage (keyed by the same `id`).
-    hexagon_pois: dict[str, list[dict[str, Any]]] = {}
-    score_hexagons: list[dict[str, Any]] | None = [] if acc is not None else None
-    acc_by_node = {
-        str(node.node_id): {
-            service: {str(item.get("poi_type")): float(item.get("accessibility", 0.0)) for item in node.accessibility_by_service.get(service, [])}
-            for service in serv.SERVICE_KEYS
-        }
-        for node in acc.node_results
-    } if acc is not None else {}
-
-    # Per-POI accessibility keyed by node_id then source_key.
-    acc_by_poi_by_node: dict[str, dict[str, float]] = {
-        str(node.node_id): node.accessibility_by_poi
-        for node in acc.node_results
-    } if acc is not None else {}
-
-    for node_id, data in ctx.nodes_with_coords:
-        # Use the stable grid hex_id if available; fall back to raw node_id.
+    for idx, (node_id, data) in enumerate(nodes, start=1):
         hexagon_id = data.get("hex_id") or _normalize_scalar(node_id)
-        # poi_seen: poi_id -> list of poi_types (populated once per poi_id)
-        poi_seen: dict[int, list[str]] = {}
-        global_score_items: dict[str, dict[str, Any]] = {}
-        node_scores = acc_by_node.get(str(node_id), {})
-        node_poi_acc = acc_by_poi_by_node.get(str(node_id), {})
-        origin = (float(data["y"]), float(data["x"]))
+        poi_seen: set[int] = set()
 
-        def _upsert_item(source_key: str, service: str, snapped_coord: tuple[float, float] | None, snap_distance_m: float | None) -> None:
-            poi_row = poi_index.get(source_key)
-            if poi_row is None:
-                return
-            pid = int(poi_row["id"])
-            if pid not in poi_seen:
-                try:
-                    pt_list = json.loads(str(poi_row.get("poi_types", "[]")))
-                except Exception:
-                    pt_list = []
-                poi_seen[pid] = pt_list if isinstance(pt_list, list) else []
-            if acc is None:
-                return
-            poi_types = poi_seen[pid]
-            type_scores = node_scores.get(service, {})
-            score_item = global_score_items.setdefault(
-                source_key,
-                {
-                    "id": int(poi_row["id"]),
-                    "source_key": source_key,
-                    "hexagon_id": hexagon_id,
-                    "lat": float(poi_row["lat"]),
-                    "lon": float(poi_row["lon"]),
-                    "address": str(poi_row.get("address", "")),
-                    "poi_types": list(poi_types),
-                    "services": set(),
-                    "snap_lat": None,
-                    "snap_lon": None,
-                    "snap_distance_m": None,
-                    "poi_type_scores": {},
-                },
-            )
-            score_item["services"].add(service)
-            if snapped_coord is not None:
-                score_item["snap_lat"] = float(snapped_coord[0])
-                score_item["snap_lon"] = float(snapped_coord[1])
-            if snap_distance_m is not None:
-                score_item["snap_distance_m"] = float(snap_distance_m)
-            for poi_type in poi_types:
-                score_item["poi_type_scores"][str(poi_type)] = float(type_scores.get(str(poi_type), 0.0))
-
-        if snap is not None:
-            for service in serv.SERVICE_KEYS:
-                for query in serv.get_service_queries(service):
-                    poi_key = serv.query_key(query)
-                    snap_info_for_key = snap.poi_bus_snap_info_by_type.get(poi_key, {})
-                    for source_key_raw, snap_info in snap_info_for_key.items():
-                        snapped_coord, snap_distance_m = select_best_snap_candidate_for_origin(origin, (0.0, 0.0), snap_info)
-                        _upsert_item(str(source_key_raw), service, snapped_coord, snap_distance_m)
-        else:
-            payload = non_bus_payloads.get(node_id, {})
-            service_payload = payload.get("services", {}) if isinstance(payload, dict) else {}
-            for service in serv.SERVICE_KEYS:
-                service_entries = service_payload.get(service, []) if isinstance(service_payload, dict) else []
-                if not isinstance(service_entries, list):
-                    service_entries = []
-                for entry in service_entries:
-                    if not isinstance(entry, dict):
-                        continue
-                    entry_source_keys = entry.get("source_keys", [])
-                    if not isinstance(entry_source_keys, list):
-                        continue
-                    for source_key_raw in entry_source_keys:
-                        _upsert_item(str(source_key_raw), service, None, None)
+        # Real per-origin reachability data (which POIs this specific node can
+        # actually reach), loaded on demand and discarded immediately so memory
+        # never scales with node count.
+        path = non_bus.cache_paths.get(node_id)
+        if path is None and non_bus_cache_dir:
+            path = os.path.join(non_bus_cache_dir, f"{node_id}.pkl")
+        if path and os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    payload = pickle.load(f)
+                service_payload = payload.get("services", {}) if isinstance(payload, dict) else {}
+                for service in serv.SERVICE_KEYS:
+                    for entry in service_payload.get(service, []):
+                        if not isinstance(entry, dict):
+                            continue
+                        for source_key_raw in entry.get("source_keys", []):
+                            poi_row = poi_index.get(str(source_key_raw))
+                            if poi_row is not None:
+                                poi_seen.add(int(poi_row["id"]))
+            except Exception:
+                pass
 
         if poi_seen:
-            poi_objects: list[dict[str, Any]] = []
-            for pid in sorted(poi_seen.keys()):
-                obj: dict[str, Any] = {"id": pid}
-                if acc is not None:
-                    _sk = pid_to_source_key.get(pid, "")
-                    sp, cp = _poi_powers(_sk, poi_seen[pid], node_poi_acc, node_scores)
-                    if sp:
-                        obj["service_power"] = sp
-                    if cp:
-                        obj["capability_power"] = cp
-                poi_objects.append(obj)
-            hexagon_pois[str(hexagon_id)] = poi_objects
+            writer.add_hexagon(str(hexagon_id), [{"i": pid} for pid in sorted(poi_seen)])
 
-        if score_hexagons is not None:
-            sorted_score_items = [
-                {**item, "services": sorted(item["services"])}
-                for item in sorted(global_score_items.values(), key=lambda row: (int(row["id"]), row["source_key"]))
-            ]
-            score_hexagons.append(
-                {
-                    "hexagon_id": _normalize_scalar(node_id),
-                    "lat": float(data["y"]),
-                    "lon": float(data["x"]),
-                    "poi_count": len(sorted_score_items),
-                    "pois": sorted_score_items,
-                }
+        if idx % 500 == 0 or (total is not None and idx == total):
+            print(
+                f"[POI Export] hexagon stream: {idx}/{total if total is not None else '?'} nodes, "
+                f"{writer.hex_count} hexagons written",
+                flush=True,
             )
 
-    return {
-        "schema": "hexagon_poi_powers_v1",
-        "hexagons": hexagon_pois,
-    }, (
-        {
-            "schema": "hexagon_poi_report_v1_scores",
-            "hexagons": score_hexagons,
-        }
-        if score_hexagons is not None
-        else None
-    )
-
-
-def _compact_hex_payload(hexagons: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
-    """Shrink the hexagon->POI map using short keys for browser delivery.
-
-    Full POI attributes live in the pois_used GeoPackage (keyed by `id`), so each object keeps
-    only the POI id plus its non-empty power maps: id -> "i", service_power -> "sp",
-    capability_power -> "cp". `sp`/`cp` are omitted when absent/empty (e.g. the pre-routing,
-    acc-less export, where objects are id-only).
-    """
-    compact: dict[str, list[dict[str, Any]]] = {}
-    for hex_id, poi_objs in hexagons.items():
-        items: list[dict[str, Any]] = []
-        for obj in poi_objs:
-            item: dict[str, Any] = {"i": obj["id"]}
-            sp = obj.get("service_power")
-            cp = obj.get("capability_power")
-            if sp:
-                item["sp"] = sp
-            if cp:
-                item["cp"] = cp
-            items.append(item)
-        compact[hex_id] = items
-    return compact
-
-
-def _write_hex_poi_files(
-    compact: dict[str, list[dict[str, Any]]],
-    out_dir: str,
-    slug: str,
-    zip_path: str,
-) -> dict[str, Any]:
-    """Write one JSONP `.js` file per hexagon plus a manifest, then zip the directory.
-
-    JSONP (not `.json`) so the offline OpenLayers interface can load a single hexagon on demand
-    via `<script>` injection — browsers block fetch()/XHR of local files over file://, but not
-    script tags. The zip is a convenience artifact to hand to the interface developer.
-    """
-    # Regenerate from scratch so hexagons removed since a prior run don't linger.
-    if os.path.isdir(out_dir):
-        shutil.rmtree(out_dir)
-    os.makedirs(out_dir, exist_ok=True)
-
-    for hex_id, items in compact.items():
-        body = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
-        with open(os.path.join(out_dir, f"{hex_id}.js"), "w", encoding="utf-8") as f:
-            f.write(f'__onHexPois("{hex_id}",{body});')
-
-    hex_ids = sorted(compact.keys())
-    manifest = {
-        "schema": "hexagon_poi_powers_v1",
-        "slug": slug,
-        "count": len(hex_ids),
-        "hex_ids": hex_ids,
-    }
-    manifest_body = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))
-    with open(os.path.join(out_dir, "index.js"), "w", encoding="utf-8") as f:
-        f.write(f"__onHexPoisManifest({manifest_body});")
-
-    # Zip every generated file (per-hexagon + manifest), flat inside the archive.
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for name in sorted(os.listdir(out_dir)):
-            if name.endswith(".js"):
-                zf.write(os.path.join(out_dir, name), arcname=name)
-
-    return {
-        "hex_pois_dir": out_dir,
-        "hex_pois_zip_path": zip_path,
-        "hex_pois_count": len(hex_ids),
-    }
+    return writer.hex_count
 
 
 def generate_poi_exports(
@@ -491,20 +416,38 @@ def generate_poi_exports(
     if not poi_rows:
         raise ValueError("No POIs were collected for export.")
 
+    print(f"[POI Export] Building GeoDataFrame ({len(poi_rows)} rows)...", flush=True)
     poi_gdf = gpd.GeoDataFrame(poi_rows, geometry="geometry", crs="EPSG:4326")
-    hex_payload, _hex_scores_payload = _build_hexagon_report(poi_rows, ctx, snap, non_bus, acc)
-    # The hexagon<->POI relationship is exported via per-hex files, so the per-POI
+    # The hexagon<->POI relationship is exported via shard files, so the per-POI
     # hexagon column is dropped from the GPKG.
     poi_gdf = poi_gdf[["id", "source_key", "lon", "lat", "angular_coords", "poi_types", "svc_map", "geometry"]].copy()
-    poi_gdf.to_file(ctx.config.poi_export_geopackage_path, driver="GPKG", layer="pois_used")
+    poi_gdf = poi_gdf[poi_gdf.geometry.notna() & ~poi_gdf.geometry.is_empty]
+    with _ElapsedTimer(f"POI Export GPKG write ({len(poi_gdf)} rows)"):
+        poi_gdf.to_file(ctx.config.poi_export_geopackage_path, driver="GPKG", layer="pois_used")
 
     legacy_paths = (
         ctx.config.hexagon_service_pois_path,
         os.path.join(ctx.config.poi_export_dir, "hexagon_service_pois_scores.json"),
     )
-    has_hexagon_payload = bool(hex_payload.get("hexagons"))
 
-    if not has_hexagon_payload:
+    # Without non_bus there is no per-origin reachability data yet (that's the
+    # pre-routing export, called before routing has run), and `snap` is only a
+    # city-wide, node-independent map of POI type -> every instance of that type
+    # anywhere in the city — it carries no per-origin relevance at all. Building a
+    # per-hexagon list from it would give (approximately) the entire city's POIs to
+    # every hexagon: wrong, and at Paris scale an OOM. The pre-routing export's
+    # value is the id-only GeoPackage; the authoritative hexagon export is
+    # regenerated post-routing once non_bus exists.
+    hexagons_written = 0
+    if non_bus is not None:
+        writer = HexShardWriter(ctx.config.hex_pois_dir, ctx.config.artifact_slug)
+        with _ElapsedTimer(f"POI Export hexagon stream ({len(poi_rows)} POIs)"):
+            hexagons_written = _stream_hexagon_export(poi_rows, ctx, non_bus, writer)
+        if hexagons_written:
+            with _ElapsedTimer("POI Export shard finalize + zip"):
+                hex_files_info = writer.finalize(zip_path=ctx.config.hex_pois_zip_path)
+
+    if not hexagons_written:
         for path in (*legacy_paths, ctx.config.hex_pois_zip_path):
             if os.path.exists(path):
                 try:
@@ -527,16 +470,6 @@ def generate_poi_exports(
             "poi_shapefile_path": ctx.config.poi_export_geopackage_path,
         }
 
-    # Export the compact hexagon->POI map as one JSONP `.js` file per hexagon
-    # (+ manifest), then zip that directory for the offline interface.
-    compact_hexagons = _compact_hex_payload(hex_payload["hexagons"])
-    hex_files_info = _write_hex_poi_files(
-        compact_hexagons,
-        ctx.config.hex_pois_dir,
-        ctx.config.artifact_slug,
-        ctx.config.hex_pois_zip_path,
-    )
-
     for path in legacy_paths:
         if os.path.exists(path):
             try:
@@ -547,7 +480,8 @@ def generate_poi_exports(
     print(
         "[Output] POI export: "
         f"{ctx.config.poi_export_geopackage_path} | {hex_files_info['hex_pois_dir']}"
-        f" | {ctx.config.hex_pois_zip_path} ({hex_files_info['hex_pois_count']} hex files)",
+        f" | {ctx.config.hex_pois_zip_path} ({hex_files_info['hex_pois_count']} hexagons"
+        f" in {hex_files_info['shard_count']} shards)",
         flush=True,
     )
     print(f"[Output] POI export rows: {len(poi_rows)}", flush=True)

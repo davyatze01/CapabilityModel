@@ -8,10 +8,9 @@ osmnx>=1.9,<2.0
 # falls back to a pure-Python ElementTree path that builds the whole graph in memory and
 # serializes it recursively — a memory/recursion spike that segfaults on large OSM graphs.
 lxml>=4.9,<6.0
-# pyosmium (imported as `osmium`): Python fallback in the bus-routing stage for converting the
-# auto-generated OSM XML extract to PBF for r5r when the `osmium`/`osmconvert` CLI tools are
-# absent. The classic SimpleHandler/SimpleWriter API used there is present through 4.x.
-osmium>=3.6,<5.0
+# System dependency (not pip-installable): the `osmium` CLI (osmium-tool) is required by the
+# bus-routing stage to clip the study-area PBF out of the regional Geofabrik extract.
+# Install with: sudo dnf install osmium-tool   (Debian/Ubuntu: apt install osmium-tool)
 geopandas>=0.14.1,<1.0
 shapely>=2.0.1,<3.0
 # pyogrio is geopandas' vector IO engine. We force it over the default (fiona) because fiona

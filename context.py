@@ -8,15 +8,24 @@ from pipeline_types import PipelineContext
 from utils import capabilities as cap
 from utils import graphml
 
+# Legacy shared path, kept only as a read fallback in inspect_hex_pois._load_grid_params
+# for older runs. New writes go to a per-city path (see _hex_grid_sample_nodes) — this
+# single shared file used to be silently overwritten by whichever city ran most
+# recently, so a debug/inspect run for one city could read another city's grid
+# geometry (wrong hex positions, degenerate corner/centre selection) despite every
+# other artifact being correctly city-scoped.
 GRID_PARAMS_PATH = os.path.join("outputs", "grid_params.json")
 
 
-def _hex_grid_sample_nodes(nodes_with_coords, cell_size_m: float):
+def _hex_grid_sample_nodes(nodes_with_coords, cell_size_m: float, grid_params_path: str = GRID_PARAMS_PATH):
     """Return one representative node per hex cell (nearest to centroid).
 
     Inputs:
     - nodes_with_coords: list of (node_id, data_dict) with 'x' (lon) and 'y' (lat).
     - cell_size_m: inscribed-circle radius of each hex cell in metres.
+    - grid_params_path: where to persist the tiling parameters. Callers should pass a
+      per-city path (e.g. under config.poi_export_dir) so this city's grid geometry
+      can't be silently overwritten/read by another city's run.
 
     Outputs:
     - Filtered list of (node_id, data_dict) with one entry per occupied hex cell.
@@ -93,8 +102,8 @@ def _hex_grid_sample_nodes(nodes_with_coords, cell_size_m: float):
 
     # Persist the exact grid parameters so the display grid can reconstruct the
     # identical tiling without needing the full node set.
-    os.makedirs("outputs", exist_ok=True)
-    with open(GRID_PARAMS_PATH, "w", encoding="utf-8") as _f:
+    os.makedirs(os.path.dirname(grid_params_path) or ".", exist_ok=True)
+    with open(grid_params_path, "w", encoding="utf-8") as _f:
         json.dump(
             {
                 "min_x": min_x, "max_x": max_x,
@@ -154,9 +163,21 @@ def build_context(config: PipelineConfig) -> PipelineContext:
     Outputs:
     - PipelineContext: graph, node list, output paths, worker count, and service groupings.
     """
-    graph = graphml.get_mode_graph("walk", config)
-    nodes = list(graph.nodes(data=True))
-    nodes_with_coords = [item for item in nodes if "y" in item[1] and "x" in item[1]]
+    # Use the compact CSR bundle for startup node enumeration. This avoids loading the
+    # full multi-GB NetworkX walk graph just to read node coordinates.
+    walk_csr = graphml.get_mode_csr("walk", config)
+    node_ids = walk_csr["node_ids"]
+    snap_x = walk_csr["snap_x"]
+    snap_y = walk_csr["snap_y"]
+    snap_indices = walk_csr["snap_indices"]
+    nodes_with_coords = [
+        (
+            int(node_ids[int(i)]),
+            {"x": float(snap_x[int(i)]), "y": float(snap_y[int(i)])},
+        )
+        for i in snap_indices
+    ]
+    graph = None
 
     if config.debug_max_nodes is not None:
         import random
@@ -177,7 +198,11 @@ def build_context(config: PipelineConfig) -> PipelineContext:
         # bbox covers the case study, not the surrounding routing buffer.
         if not _boundary_filtered:
             nodes_with_coords = _filter_nodes_to_boundary(nodes_with_coords, config.city_name)
-        nodes_with_coords = _hex_grid_sample_nodes(nodes_with_coords, config.qgis_grid_cell_size_m)
+        nodes_with_coords = _hex_grid_sample_nodes(
+            nodes_with_coords,
+            config.qgis_grid_cell_size_m,
+            grid_params_path=os.path.join(config.poi_export_dir, "grid_params.json"),
+        )
 
     os.makedirs("outputs", exist_ok=True)
     os.makedirs(config.non_bus_cache_dir, exist_ok=True)
@@ -206,6 +231,15 @@ def build_context(config: PipelineConfig) -> PipelineContext:
         import psutil
 
         total_gb = psutil.virtual_memory().total / (1024 ** 3)
+        # When launched under run_safe.sh the run is confined to a memory cgroup
+        # (MemoryMax). Derive workers from that budget, not the machine's full RAM,
+        # so we don't oversubscribe and get the pipeline OOM-killed inside the cap.
+        budget_env = os.environ.get("CAP_MEM_BUDGET_GB")
+        if budget_env:
+            try:
+                total_gb = min(total_gb, float(budget_env))
+            except ValueError:
+                pass
         mem_per_worker_gb = max(0.5, float(getattr(config, "mem_per_worker_gb", 3.0)))
         reserve_gb = float(getattr(config, "worker_mem_reserve_gb", 10.0))
         mem_workers = max(1, int((total_gb - reserve_gb) / mem_per_worker_gb))

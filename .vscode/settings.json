@@ -1,5 +1,5 @@
 {
-  "python.defaultInterpreterPath": "C:\\Program Files\\WindowsApps\\PythonSoftwareFoundation.Python.3.11_3.11.2544.0_x64__qbz5n2kfra8p0\\python3.11.exe",
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
   "python.analysis.exclude": [
     "**/.git",
     "**/.hg",
@@ -18,5 +18,12 @@
   ],
   "python.analysis.indexing": false,
   "python.analysis.diagnosticMode": "openFilesOnly",
-  "python-envs.defaultEnvManager": "ms-python.python:system"
+  "python-envs.defaultEnvManager": "ms-python.python:system",
+  "terminal.integrated.profiles.linux": {
+    "host-bash": {
+      "path": "flatpak-spawn",
+      "args": ["--host", "bash"]
+    }
+  },
+  "terminal.integrated.defaultProfile.linux": "host-bash"
 }

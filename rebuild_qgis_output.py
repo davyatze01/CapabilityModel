@@ -24,26 +24,19 @@ def rebuild(slug_suffix: str = "") -> None:
     print(f"[Rebuild] artifact_slug = {artifact_slug}")
 
     experiments_dir = Path("experiments")
-    # Pick the single most-recently-modified CSV per capability type, mirroring
-    # what the pipeline does: each run writes exactly one CSV per capability.
-    capability_names = ["care", "nutrition", "restorativeness"]
-    csv_paths = []
-    for cap in capability_names:
-        candidates = [
-            p for p in experiments_dir.glob(f"{artifact_slug}_capability_{cap}*.csv")
-            if p.stat().st_size > 0
-        ]
-        if not candidates:
-            print(f"[Rebuild] No CSV found for capability '{cap}' — skipping.")
-            continue
-        csv_paths.append(max(candidates, key=lambda p: p.stat().st_mtime))
-
-    if not csv_paths:
+    # Pick the single most-recently-modified run CSV, mirroring what the pipeline
+    # does: each run writes one numbered CSV ({slug}_capability_<N>.csv) carrying
+    # every capability_* column and its underlying service_* columns.
+    candidates = [
+        p for p in experiments_dir.glob(f"{artifact_slug}_capability_*.csv")
+        if p.stat().st_size > 0
+    ]
+    if not candidates:
         print(f"[Rebuild] No experiment CSVs found for slug '{artifact_slug}' in {experiments_dir}/")
         sys.exit(1)
-    print(f"[Rebuild] Using {len(csv_paths)} CSVs (latest per capability):")
-    for p in csv_paths:
-        print(f"  {p.name}")
+    latest_csv = max(candidates, key=lambda p: p.stat().st_mtime)
+    csv_paths: list[str | Path] = [latest_csv]
+    print(f"[Rebuild] Using latest run CSV: {latest_csv.name}")
 
     gpkg_path = Path("outputs") / "gpkg" / artifact_slug / f"{artifact_slug}.gpkg"
     print(f"[Rebuild] Writing GeoPackage: {gpkg_path}")
@@ -57,6 +50,9 @@ def rebuild(slug_suffix: str = "") -> None:
         grid_fill_hull=cfg.qgis_grid_fill_hull,
         grid_hull_buffer_m=cfg.qgis_grid_hull_buffer_m,
         grid_hull_ratio=cfg.qgis_grid_hull_ratio,
+        grid_params_path=Path(cfg.poi_export_dir) / "grid_params.json",
+        grid_exclude_water=cfg.qgis_grid_exclude_water,
+        grid_water_cache_path=Path(cfg.poi_export_dir) / "water_mask.gpkg",
     )
     print(f"[Rebuild] GeoPackage written: {gpkg_path} ({gpkg_path.stat().st_size / 1024:.0f} KB)")
 

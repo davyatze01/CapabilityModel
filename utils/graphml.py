@@ -6,7 +6,11 @@ import geopandas as gpd
 import pandas as pd
 import hashlib
 import json
+import numpy as np
 from shapely.geometry import shape
+import threading
+import time
+import xml.etree.ElementTree as ET
 from typing import TypeAlias
 
 from utils.load_shapefile import poi_from_shp
@@ -19,11 +23,59 @@ TagValue: TypeAlias = bool | str | list[str]
 TagClause: TypeAlias = dict[str, TagValue]
 TagQuery: TypeAlias = TagClause | list[TagClause]
 
+class _ElapsedTimer:
+    """Context manager that prints a live elapsed-time ticker on a background thread.
+
+    Usage:
+        with _ElapsedTimer("Loading walk graph"):
+            graph = ox.io.load_graphml(path)
+
+    Prints:  [Loading walk graph] 1s ...   (updates in-place via \\r)
+    On exit: [Loading walk graph] done in 42.3s
+    """
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._tick, daemon=True)
+
+    def _tick(self) -> None:
+        start = time.monotonic()
+        while not self._stop.wait(timeout=1.0):
+            elapsed = int(time.monotonic() - start)
+            print(f"\r[{self._label}] {elapsed}s elapsed...", end="", flush=True)
+        elapsed = time.monotonic() - start
+        print(f"\r[{self._label}] done in {elapsed:.1f}s" + " " * 20, flush=True)
+
+    def __enter__(self) -> "_ElapsedTimer":
+        print(f"[{self._label}] starting...", flush=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_) -> None:
+        self._stop.set()
+        self._thread.join()
+
+
 # In-memory caches to avoid repeated disk loads
 _GRAPH_CACHE = None
 _MODE_GRAPH_CACHE = {}
 _CITY_POI_UNIVERSE_CACHE: dict[str, gpd.GeoDataFrame] = {}
 _POI_DOWNLOAD_LOGGED: set[tuple[str, str]] = set()
+
+
+def clear_mode_graph_cache() -> None:
+    """Drop cached full NetworkX mode graphs to release their (multi-GB) RAM.
+
+    Routing workers run off the compact CSR bundles (`_MODE_CSR_CACHE`), not the full
+    graphs, so once snapping / CSR-building / walkability warmup are done in the parent
+    the full graphs are dead weight. Clearing them before the worker pool forks keeps
+    the inherited (copy-on-write) baseline tiny and prevents OOM. The CSR cache is left
+    intact. Safe to call repeatedly; graphs are lazily rebuilt on demand if needed.
+    """
+    global _GRAPH_CACHE
+    _MODE_GRAPH_CACHE.clear()
+    _GRAPH_CACHE = None
 
 
 def _get_city_settings() -> tuple[str, str]:
@@ -58,11 +110,14 @@ def get_graph():
 
     graph = None
     try:
-        graph = ox.io.load_graphml(name_file)
+        with _ElapsedTimer(f"Graph load {name_file}"):
+            graph = ox.io.load_graphml(name_file)
     except Exception:
         print(f"[Graph] Cached graph not found. Downloading graph for {place_name}...", flush=True)
-        graph = ox.graph_from_place(place_name)
-        ox.io.save_graphml(graph, filepath=name_file)
+        with _ElapsedTimer(f"Graph download {place_name}"):
+            graph = ox.graph_from_place(place_name)
+        with _ElapsedTimer(f"Graph save {name_file}"):
+            ox.io.save_graphml(graph, filepath=name_file)
         print(f"[Graph] Graph downloaded and saved: {name_file}", flush=True)
 
     _GRAPH_CACHE = graph
@@ -85,60 +140,165 @@ def _resolve_mode_graph_path(network_type, cfg: PipelineConfig) -> str:
     return f"graph/{city_slug}_{network_type}{graph_tag}.graphml"
 
 
-def _get_simplified_mode_graph(network_type, cfg: PipelineConfig):
-    """Load (or build once) a topology-simplified routing graph for a mode.
-
-    Routing only needs correct network distances, which `ox.simplify_graph`
-    preserves (it sums `length` over merged degree-2 chains). Collapsing those
-    interstitial nodes cuts node count ~5x, so workers loading this instead of the
-    full graph use a fraction of the RAM. Origins and POIs are still enumerated and
-    snapped on the full graph upstream; their coordinates re-snap onto these nodes.
-
-    Built once and cached to `<full>_simplified.graphml`; subsequent loads (e.g. in
-    every worker) read that file directly without ever materializing the full graph.
-    """
-    cache_key = (network_type, "simplified")
-    cached = _MODE_GRAPH_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    full_path = _resolve_mode_graph_path(network_type, cfg)
-    simp_path = full_path[: -len(".graphml")] + "_simplified.graphml"
-
-    simp_stale = (
-        os.path.isfile(simp_path)
-        and os.path.isfile(full_path)
-        and os.path.getmtime(full_path) > os.path.getmtime(simp_path)
-    )
-    if simp_stale:
-        print(
-            f"[Graph] Source graph is newer than simplified cache; rebuilding for '{network_type}'",
-            flush=True,
-        )
-    if os.path.isfile(simp_path) and not simp_stale:
-        graph = ox.io.load_graphml(simp_path)
-    else:
-        # Build from the full graph (loaded only here, normally in the parent).
-        full_graph = get_mode_graph(network_type, cfg)
-        if full_graph.graph.get("simplified"):
-            graph = full_graph
-        else:
-            graph = ox.simplify_graph(full_graph.copy())
-        tmp_path = simp_path + ".tmp"
-        ox.io.save_graphml(graph, filepath=tmp_path)
-        os.replace(tmp_path, simp_path)
-        print(
-            f"[Graph] Built simplified routing graph for '{network_type}': "
-            f"{simp_path} nodes={graph.number_of_nodes()} edges={graph.number_of_edges()}",
-            flush=True,
-        )
-
-    _MODE_GRAPH_CACHE[cache_key] = graph
-    return graph
-
-
 # In-memory cache of compact CSR routing bundles, one per mode.
 _MODE_CSR_CACHE: dict[str, object] = {}
+
+
+def _xml_local_name(tag: str) -> str:
+    """Return an XML tag name without its namespace."""
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _parse_float(value: str | None, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_int(value: str | None, default: int = 0) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_mode_csr_streaming(
+    network_type: str,
+    full_path: str,
+    csr_path: str,
+) -> dict[str, object]:
+    """Build a CSR bundle from GraphML without materializing a NetworkX graph.
+
+    The normal CSR artifact is tiny compared with the full OSMnx NetworkX graph, but
+    the old first-run path loaded the full graph and then built large Python
+    intermediates. This parser keeps only node coordinates and the shortest directed
+    edge for each `(u, v)` pair, which is sufficient for length-minimizing Dijkstra.
+    """
+    from scipy.sparse import csr_matrix
+
+    key_to_attr: dict[str, str] = {}
+    nodes: list[tuple[int, float, float]] = []
+    node_idx: dict[int, int] = {}
+    best_edges: dict[tuple[int, int], float] = {}
+
+    context = ET.iterparse(full_path, events=("start", "end"))
+    graph_elem = None
+    for event, elem in context:
+        name = _xml_local_name(elem.tag)
+        if event == "start":
+            if name == "graph":
+                graph_elem = elem
+            continue
+
+        if name == "key":
+            key_id = elem.attrib.get("id")
+            attr_name = elem.attrib.get("attr.name")
+            if key_id and attr_name:
+                key_to_attr[key_id] = attr_name
+            elem.clear()
+            continue
+
+        if name == "node":
+            node_id = _parse_int(elem.attrib.get("id"))
+            x = y = None
+            for child in elem:
+                if _xml_local_name(child.tag) != "data":
+                    continue
+                attr = key_to_attr.get(child.attrib.get("key", ""))
+                if attr == "x":
+                    x = _parse_float(child.text, default=float("nan"))
+                elif attr == "y":
+                    y = _parse_float(child.text, default=float("nan"))
+            if x is not None and y is not None and math.isfinite(x) and math.isfinite(y):
+                node_idx[node_id] = len(nodes)
+                nodes.append((node_id, x, y))
+            elem.clear()
+            if graph_elem is not None:
+                try:
+                    graph_elem.remove(elem)
+                except ValueError:
+                    pass
+            continue
+
+        if name == "edge":
+            source_id = _parse_int(elem.attrib.get("source"))
+            target_id = _parse_int(elem.attrib.get("target"))
+            length_val = 0.0
+            for child in elem:
+                if _xml_local_name(child.tag) != "data":
+                    continue
+                attr = key_to_attr.get(child.attrib.get("key", ""))
+                if attr == "length":
+                    length_val = _parse_float(child.text, default=0.0)
+                    break
+            u_idx = node_idx.get(source_id)
+            v_idx = node_idx.get(target_id)
+            if u_idx is not None and v_idx is not None and math.isfinite(length_val):
+                pair = (u_idx, v_idx)
+                previous = best_edges.get(pair)
+                if previous is None or length_val < previous:
+                    best_edges[pair] = length_val
+            elem.clear()
+            if graph_elem is not None:
+                try:
+                    graph_elem.remove(elem)
+                except ValueError:
+                    pass
+
+    real_node_count = len(nodes)
+    node_ids = np.asarray([node_id for node_id, _x, _y in nodes], dtype=np.int64)
+    snap_x = np.asarray([x for _node_id, x, _y in nodes], dtype=float)
+    snap_y = np.asarray([y for _node_id, _x, y in nodes], dtype=float)
+    snap_indices = np.arange(real_node_count, dtype=np.int64)
+
+    if best_edges:
+        rows, cols = zip(*best_edges.keys())
+        rows_arr = np.asarray(rows, dtype=np.int64)
+        cols_arr = np.asarray(cols, dtype=np.int64)
+        length_vals = np.asarray(list(best_edges.values()), dtype=float)
+    else:
+        rows_arr = np.asarray([], dtype=np.int64)
+        cols_arr = np.asarray([], dtype=np.int64)
+        length_vals = np.asarray([], dtype=float)
+
+    mat = csr_matrix((length_vals, (rows_arr, cols_arr)), shape=(real_node_count, real_node_count))
+    mat.sort_indices()
+    indptr = mat.indptr.astype(np.int64)
+    indices = mat.indices.astype(np.int64)
+    length = mat.data.astype(float)
+    wscore = np.full(length.shape, 5.0, dtype=float) if network_type == "walk" else None
+
+    mean_lat_rad = math.radians(float(snap_y.mean())) if snap_y.size else 0.0
+    m_per_deg_lat = 111320.0
+    m_per_deg_lon = 111320.0 * math.cos(mean_lat_rad)
+
+    save_dict = dict(
+        indptr=indptr,
+        indices=indices,
+        length=length,
+        node_ids=node_ids,
+        snap_x=snap_x,
+        snap_y=snap_y,
+        snap_indices=snap_indices,
+        m_per_deg_lon=np.float64(m_per_deg_lon),
+        m_per_deg_lat=np.float64(m_per_deg_lat),
+    )
+    if wscore is not None:
+        save_dict["wscore"] = wscore
+    tmp_path = csr_path + ".tmp.npz"
+    np.savez(tmp_path, **save_dict)
+    os.replace(tmp_path, csr_path)
+    print(
+        f"[Graph] Built streaming CSR routing matrix for '{network_type}': "
+        f"{csr_path} nodes={real_node_count} edges={len(length)}",
+        flush=True,
+    )
+    return save_dict
 
 
 def get_mode_csr(network_type, cfg: PipelineConfig | None = None):
@@ -151,9 +311,9 @@ def get_mode_csr(network_type, cfg: PipelineConfig | None = None):
 
     Returns a dict with:
     - `mat`: scipy.sparse.csr_matrix over the full routing topology, with
-      additional virtual nodes when needed to preserve parallel edges.
+      same-endpoint parallel edges collapsed to their shortest length.
     - `indptr`, `indices`, `length`: the raw CSR arrays (for fast path walkability).
-    - `node_ids`: int64 array, row/col index -> OSM node id or synthetic virtual id.
+    - `node_ids`: int64 array, row/col index -> OSM node id.
     - `id_to_idx`: dict OSM node id -> index.
     - `tree`, `snap_indices`, `scale`: cKDTree over real node coords (m), the
       matching matrix row indices for those real nodes, and the projection scale.
@@ -196,103 +356,27 @@ def get_mode_csr(network_type, cfg: PipelineConfig | None = None):
         m_per_deg_lat = float(data["m_per_deg_lat"])
         wscore = data["wscore"] if "wscore" in data.files else None
     else:
-        G = get_mode_graph(network_type, cfg, simplified=False)
-        base_nodes = list(G.nodes())
-        real_node_count = len(base_nodes)
-        idx = {nid: i for i, nid in enumerate(base_nodes)}
-        node_ids_list = [int(nid) for nid in base_nodes]
-        next_virtual_id = -1
-        rows_list: list[int] = []
-        cols_list: list[int] = []
-        length_list: list[float] = []
+        if not os.path.isfile(full_path):
+            # First-ever run for a city still needs the existing graph build/download
+            # path. Once saved, immediately discard NetworkX and stream the GraphML
+            # into the compact artifact used by normal pipeline runs.
+            graph = get_mode_graph(network_type, cfg)
+            with _ElapsedTimer(f"Graph save {network_type} before streaming CSR"):
+                ox.io.save_graphml(graph, filepath=full_path)
+            clear_mode_graph_cache()
+        with _ElapsedTimer(f"Graph streaming CSR build {network_type}"):
+            built = _build_mode_csr_streaming(network_type, full_path, csr_path)
+        indptr = built["indptr"]
+        indices = built["indices"]
+        length = built["length"]
+        node_ids = built["node_ids"]
+        snap_x = built["snap_x"]
+        snap_y = built["snap_y"]
+        snap_indices = built["snap_indices"]
+        m_per_deg_lon = float(built["m_per_deg_lon"])
+        m_per_deg_lat = float(built["m_per_deg_lat"])
+        wscore = built.get("wscore")
 
-        need_scores = network_type == "walk"
-        if need_scores:
-            import walkability
-            cache_obj = walkability.get_or_build_edge_walkability_index(
-                cfg=cfg, G=G, force_rebuild=False, schema_version=1
-            )
-            escores = cache_obj.edge_scores
-            score_list: list[float] = []
-
-        edges_by_pair: dict[tuple[int, int], list[tuple[float, int, int, int]]] = {}
-        for u, v, k, d in G.edges(keys=True, data=True):
-            length_val = float(d.get("length", 0.0) or 0.0)
-            pair = (idx[u], idx[v])
-            edges_by_pair.setdefault(pair, []).append((length_val, int(u), int(v), int(k)))
-
-        for (u_idx, v_idx), options in edges_by_pair.items():
-            options.sort(key=lambda item: item[0])
-            for option_idx, (edge_len, u_id, v_id, edge_key) in enumerate(options):
-                edge_score = float(escores.get((u_id, v_id, edge_key), 5.0)) if need_scores else None
-                if option_idx == 0:
-                    rows_list.append(u_idx)
-                    cols_list.append(v_idx)
-                    length_list.append(edge_len)
-                    if need_scores:
-                        score_list.append(edge_score if edge_score is not None else 5.0)
-                    continue
-
-                virtual_idx = len(node_ids_list)
-                node_ids_list.append(next_virtual_id)
-                next_virtual_id -= 1
-
-                rows_list.append(u_idx)
-                cols_list.append(virtual_idx)
-                length_list.append(edge_len)
-                rows_list.append(virtual_idx)
-                cols_list.append(v_idx)
-                length_list.append(0.0)
-                if need_scores:
-                    score_list.append(edge_score if edge_score is not None else 5.0)
-                    score_list.append(edge_score if edge_score is not None else 5.0)
-
-        n = len(node_ids_list)
-        rows = np.asarray(rows_list, dtype=np.int64)
-        cols = np.asarray(cols_list, dtype=np.int64)
-        length_vals = np.asarray(length_list, dtype=float)
-        mat = csr_matrix((length_vals, (rows, cols)), shape=(n, n))
-        mat.sort_indices()
-        indptr = mat.indptr.astype(np.int64)
-        indices = mat.indices.astype(np.int64)
-        length = mat.data.astype(float)
-        if need_scores:
-            score_vals = np.asarray(score_list, dtype=float)
-            smat = csr_matrix((score_vals, (rows, cols)), shape=(n, n))
-            smat.sort_indices()
-            wscore = smat.data.astype(float)
-        else:
-            wscore = None
-
-        node_ids = np.asarray(node_ids_list, dtype=np.int64)
-        snap_x = np.asarray([float(G.nodes[nid]["x"]) for nid in base_nodes], dtype=float)
-        snap_y = np.asarray([float(G.nodes[nid]["y"]) for nid in base_nodes], dtype=float)
-        snap_indices = np.arange(real_node_count, dtype=np.int64)
-        mean_lat_rad = math.radians(float(snap_y.mean())) if snap_y.size else 0.0
-        m_per_deg_lat = 111320.0
-        m_per_deg_lon = 111320.0 * math.cos(mean_lat_rad)
-
-        save_dict = dict(
-            indptr=indptr,
-            indices=indices,
-            length=length,
-            node_ids=node_ids,
-            snap_x=snap_x,
-            snap_y=snap_y,
-            snap_indices=snap_indices,
-            m_per_deg_lon=np.float64(m_per_deg_lon),
-            m_per_deg_lat=np.float64(m_per_deg_lat),
-        )
-        if wscore is not None:
-            save_dict["wscore"] = wscore
-        tmp_path = csr_path + ".tmp.npz"
-        np.savez(tmp_path, **save_dict)
-        os.replace(tmp_path, csr_path)
-        print(
-            f"[Graph] Built CSR routing matrix for '{network_type}': "
-            f"{csr_path} nodes={n} real_nodes={real_node_count} edges={len(rows_list)}",
-            flush=True,
-        )
 
     n_nodes = len(node_ids)
     mat = csr_matrix((length, indices, indptr), shape=(n_nodes, n_nodes))
@@ -308,6 +392,11 @@ def get_mode_csr(network_type, cfg: PipelineConfig | None = None):
         "id_to_idx": id_to_idx,
         "tree": tree,
         "snap_indices": snap_indices,
+        # Real-node lon/lat (EPSG:4326), aligned to snap_indices/tree rows. Exposed so
+        # callers can recover the snapped coordinate (not just the node index) without
+        # loading the full NetworkX graph — used by POI snapping in the snapping stage.
+        "snap_x": snap_x,
+        "snap_y": snap_y,
         "scale": (m_per_deg_lon, m_per_deg_lat),
         "wscore": wscore,
     }
@@ -316,23 +405,18 @@ def get_mode_csr(network_type, cfg: PipelineConfig | None = None):
 
 
 
-def get_mode_graph(network_type, cfg: PipelineConfig | None = None, simplified: bool = False):
+def get_mode_graph(network_type, cfg: PipelineConfig | None = None):
     """Load or download graph for a specific travel mode.
 
     Inputs:
     - network_type: mode string (for example walk, bike, drive).
     - cfg: optional PipelineConfig. If not provided, creates a new one.
-    - simplified: when True, return the topology-simplified routing graph (smaller,
-      same network distances) instead of the full enumeration graph.
 
     Outputs:
     - graph object for that mode, cached in memory.
     """
     if cfg is None:
         cfg = PipelineConfig()
-
-    if simplified:
-        return _get_simplified_mode_graph(network_type, cfg)
 
     if network_type in _MODE_GRAPH_CACHE:
             return _MODE_GRAPH_CACHE[network_type]
@@ -347,18 +431,21 @@ def get_mode_graph(network_type, cfg: PipelineConfig | None = None, simplified: 
                 f"{graph_path}",
                 flush=True,
             )
-            graph = ox.io.load_graphml(graph_path)
+            with _ElapsedTimer(f"Graph load {network_type} from cache"):
+                graph = ox.io.load_graphml(graph_path)
         except Exception:
             print(
                 f"[Graph] Cached shapefile graph not found for mode '{network_type}'. "
                 f"Building from '{cfg.name_shapefile}'...",
                 flush=True,
             )
-            _, graph = graph_from_shapefile(
-                cfg.name_shapefile,
-                network_type=network_type,
-            )
-            ox.io.save_graphml(graph, filepath=graph_path)
+            with _ElapsedTimer(f"Graph build {network_type} from shapefile"):
+                _, graph = graph_from_shapefile(
+                    cfg.name_shapefile,
+                    network_type=network_type,
+                )
+            with _ElapsedTimer(f"Graph save {network_type}"):
+                ox.io.save_graphml(graph, filepath=graph_path)
             print(
                 f"[Graph] Shapefile graph for mode '{network_type}' saved to "
                 f"{graph_path}",
@@ -372,7 +459,8 @@ def get_mode_graph(network_type, cfg: PipelineConfig | None = None, simplified: 
         buffer_m = get_global_radius_m(cfg) or 0.0
 
         try:
-            graph = ox.io.load_graphml(name_file)
+            with _ElapsedTimer(f"Graph load {network_type}"):
+                graph = ox.io.load_graphml(name_file)
         except Exception:
             print(f"[Graph] Cached graph not found for mode '{network_type}'. Downloading from OSM...", flush=True)
             if buffer_m > 0:
@@ -393,21 +481,24 @@ def get_mode_graph(network_type, cfg: PipelineConfig | None = None, simplified: 
                 # warning isn't mistaken for the cause of a crash it actually prevents.
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", FutureWarning)
-                    graph = ox.graph_from_polygon(
-                        polygon,
+                    with _ElapsedTimer(f"Graph download {network_type} (buffered polygon)"):
+                        graph = ox.graph_from_polygon(
+                            polygon,
+                            network_type=network_type,
+                            simplify=cfg.osm_autobuild_simplify,
+                            retain_all=cfg.osm_autobuild_retain_all,
+                            clean_periphery=False,
+                        )
+            else:
+                with _ElapsedTimer(f"Graph download {network_type} from OSM"):
+                    graph = ox.graph_from_place(
+                        place_name,
                         network_type=network_type,
                         simplify=cfg.osm_autobuild_simplify,
                         retain_all=cfg.osm_autobuild_retain_all,
-                        clean_periphery=False,
                     )
-            else:
-                graph = ox.graph_from_place(
-                    place_name,
-                    network_type=network_type,
-                    simplify=cfg.osm_autobuild_simplify,
-                    retain_all=cfg.osm_autobuild_retain_all,
-                )
-            ox.io.save_graphml(graph, filepath=name_file)
+            with _ElapsedTimer(f"Graph save {network_type}"):
+                ox.io.save_graphml(graph, filepath=name_file)
             print(f"[Graph] Graph downloaded and saved: {name_file}", flush=True)
 
     _MODE_GRAPH_CACHE[network_type] = graph
@@ -465,6 +556,13 @@ def _iter_tag_clauses(tags: TagQuery | None) -> list[TagClause]:
     return []
 
 
+# Keys that only ever qualify another key inside a multi-key clause (e.g.
+# {"leisure": "swimming_pool", "indoor": "yes"}). They must NOT become standalone
+# download queries: fetching every access=private / indoor=yes element in a city would
+# blow up the universe. Their columns still materialize because OSMnx returns all tags
+# of the features fetched via the clause's primary key.
+_QUALIFIER_ONLY_KEYS = {"indoor", "access", "building", "water", "covered"}
+
 def _build_city_query_batches() -> dict[str, list[TagValue]]:
     """Group configured POI queries by tag key to enable batched extraction."""
     from utils import services as serv
@@ -472,7 +570,9 @@ def _build_city_query_batches() -> dict[str, list[TagValue]]:
     by_key: dict[str, set[TagValue]] = {}
     for q in serv.unique_query_keys():
         for clause in _iter_tag_clauses(q.tags):
-            for key, value in clause.items():
+            primary = {k: v for k, v in clause.items() if str(k) not in _QUALIFIER_ONLY_KEYS}
+            # A clause made solely of qualifier keys still needs downloading via its own keys.
+            for key, value in (primary or clause).items():
                 if isinstance(value, list):
                     for item in value:
                         by_key.setdefault(str(key), set()).add(str(item))
@@ -506,10 +606,10 @@ def _download_city_poi_universe(place_name: str, query_tags: TagClause, buffer_m
 def _values_match(series: pd.Series, value: TagValue) -> pd.Series:
     if value is True:
         return series.notna()
-    if isinstance(value, list):
-        wanted = {str(v) for v in value}
-        return series.astype(str).isin(wanted)
-    return series.astype(str) == str(value)
+    wanted = {str(v) for v in value} if isinstance(value, list) else {str(value)}
+    # OSM tags can carry semicolon-separated multi-values (e.g. "sport=climbing;bouldering");
+    # a plain == / isin against the raw string misses those, so split before comparing.
+    return series.astype(str).apply(lambda s: any(part.strip() in wanted for part in s.split(";")))
 
 def _filter_by_clause(gdf: gpd.GeoDataFrame, tags: TagClause) -> gpd.GeoDataFrame:
     if gdf.empty:
@@ -517,7 +617,12 @@ def _filter_by_clause(gdf: gpd.GeoDataFrame, tags: TagClause) -> gpd.GeoDataFram
     mask = pd.Series(True, index=gdf.index)
     for key, value in tags.items():
         if key not in gdf.columns:
-            return gpd.GeoDataFrame(geometry=[], crs=gdf.crs)
+            # Empty result of the SAME type as the input. The city-universe can be a plain
+            # DataFrame (loaded via _read_geojson_without_gdal, which avoids GDAL/GEOS), and
+            # gpd.GeoDataFrame(..., crs=gdf.crs) would AttributeError on it — that failure used
+            # to be swallowed upstream and silently zeroed every tag query, emptying the dedup
+            # drop map. An empty iloc slice preserves columns/dtype/crs for either type.
+            return gdf.iloc[0:0].copy()
         mask = mask & _values_match(gdf[key], value)
     out = gdf.loc[mask].copy()
     if "geometry" in out.columns:
@@ -528,7 +633,7 @@ def _filter_by_tags(gdf: gpd.GeoDataFrame, tags: TagQuery) -> gpd.GeoDataFrame:
     if isinstance(tags, dict):
         return _filter_by_clause(gdf, tags)
     if not isinstance(tags, list) or not tags:
-        return gpd.GeoDataFrame(geometry=[], crs=gdf.crs)
+        return gdf.iloc[0:0].copy()
     parts = []
     for clause in tags:
         if not isinstance(clause, dict):
@@ -537,8 +642,11 @@ def _filter_by_tags(gdf: gpd.GeoDataFrame, tags: TagQuery) -> gpd.GeoDataFrame:
         if part is not None and not part.empty:
             parts.append(part)
     if not parts:
-        return gpd.GeoDataFrame(geometry=[], crs=gdf.crs)
-    out = gpd.GeoDataFrame(pd.concat(parts, ignore_index=False), crs=parts[0].crs)
+        return gdf.iloc[0:0].copy()
+    # pd.concat preserves the concrete type (GeoDataFrame keeps its crs; a plain DataFrame
+    # stays a DataFrame), so don't force-wrap in gpd.GeoDataFrame — that broke the
+    # plain-DataFrame universe path.
+    out = pd.concat(parts, ignore_index=False)
     out = out[~out.index.duplicated(keep="first")].copy()
     if "geometry" in out.columns:
         out = out[out["geometry"].notna()].copy()
@@ -559,7 +667,7 @@ def _get_city_poi_universe(place_name: str, cache_slug: str, city_poi_dir: str, 
         except Exception as exc:
             print(f"[POI] City-universe download failed: {exc}")
             gdf = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-        if gdf is not None and not gdf.empty and "geometry" in gdf.columns and not gdf["geometry"].dropna().empty:
+        if gdf is not None and not gdf.empty and _has_geometry_values(gdf):
             try:
                 gdf.to_file(path, driver="GeoJSON")
             except Exception as exc:
@@ -581,10 +689,12 @@ def _download_poi_for_place(place_name: str, query_tags: TagClause, buffer_m: fl
         gdf_buffered["geometry"] = gdf_metric.geometry.buffer(buffer_m)
         polygon = gdf_buffered.to_crs("EPSG:4326").geometry.iloc[0]
         print(f"[POI] Query area expanded by {buffer_m/1000:.1f} km buffer", flush=True)
-        return ox.features_from_polygon(polygon, query_tags)
+        with _ElapsedTimer(f"POI download (buffered polygon, {len(query_tags)} tags)"):
+            return ox.features_from_polygon(polygon, query_tags)
 
     try:
-        return ox.features_from_place(place_name, query_tags)
+        with _ElapsedTimer(f"POI download {place_name} ({len(query_tags)} tags)"):
+            return ox.features_from_place(place_name, query_tags)
     except Exception as place_exc:
         print(
             f"[POI] features_from_place failed for '{place_name}' ({place_exc}); "
@@ -594,25 +704,122 @@ def _download_poi_for_place(place_name: str, query_tags: TagClause, buffer_m: fl
         if place_gdf.empty:
             raise RuntimeError(f"geocode_to_gdf returned no geometry for place '{place_name}'")
         polygon = place_gdf.geometry.iloc[0]
-        return ox.features_from_polygon(polygon, query_tags)
+        with _ElapsedTimer(f"POI download {place_name} retry (polygon, {len(query_tags)} tags)"):
+            return ox.features_from_polygon(polygon, query_tags)
 
-def _read_geojson_without_gdal(path: str) -> gpd.GeoDataFrame:
-    """Read a GeoJSON file using only json + shapely, never GDAL.
+def _coords_are_finite(obj) -> bool:
+    """Return True when a GeoJSON coordinate tree contains only finite numbers."""
+    if isinstance(obj, (int, float)):
+        return math.isfinite(float(obj))
+    if isinstance(obj, (list, tuple)):
+        return bool(obj) and all(_coords_are_finite(item) for item in obj)
+    return False
 
-    geopandas' normal read path (fiona or pyogrio) goes through GDAL, which bundles its own
-    GEOS. shapely bundles a *different* GEOS. Once shapely's GEOS has been heavily exercised
-    in the process (building the walk/bike/drive graphs in the snapping stage), any subsequent
-    GDAL geometry read segfaults the interpreter with no traceback — reproducible with both
-    fiona and pyogrio. Parsing the GeoJSON as plain JSON and building geometries with
-    shapely.geometry.shape uses shapely's GEOS exclusively, sidestepping the conflict entirely.
-    GeoJSON is always EPSG:4326 per RFC 7946, which matches what GDAL returned for these files.
+
+def _has_geometry_values(frame) -> bool:
+    if "__snap_coord" in frame.columns:
+        for coord in frame["__snap_coord"].to_numpy():
+            if isinstance(coord, tuple) and len(coord) >= 2:
+                return True
+    if "geometry" not in frame.columns:
+        return False
+    for geom in frame["geometry"].to_numpy():
+        if geom is not None:
+            return True
+    return False
+
+
+def _coord_pair_from_lon_lat(pair):
+    if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+        return None
+    lon, lat = pair[0], pair[1]
+    if not isinstance(lon, (int, float)) or not isinstance(lat, (int, float)):
+        return None
+    if not math.isfinite(float(lon)) or not math.isfinite(float(lat)):
+        return None
+    return (float(lat), float(lon))
+
+
+def _geojson_vertices(geometry_obj) -> list[tuple[float, float]]:
+    """Extract snap vertices as plain `(lat, lon)` tuples from raw GeoJSON."""
+    if not isinstance(geometry_obj, dict):
+        return []
+    gtype = geometry_obj.get("type")
+    coords = geometry_obj.get("coordinates")
+    if gtype == "Point":
+        coord = _coord_pair_from_lon_lat(coords)
+        return [coord] if coord is not None else []
+    if gtype in ("LineString", "MultiPoint"):
+        return [c for c in (_coord_pair_from_lon_lat(pair) for pair in (coords or [])) if c is not None]
+    if gtype in ("Polygon", "MultiLineString"):
+        out = []
+        for line in coords or []:
+            out.extend(c for c in (_coord_pair_from_lon_lat(pair) for pair in (line or [])) if c is not None)
+        return out
+    if gtype == "MultiPolygon":
+        out = []
+        for poly in coords or []:
+            for ring in poly or []:
+                out.extend(c for c in (_coord_pair_from_lon_lat(pair) for pair in (ring or [])) if c is not None)
+        return out
+    if gtype == "GeometryCollection":
+        out = []
+        for geom in geometry_obj.get("geometries") or []:
+            out.extend(_geojson_vertices(geom))
+        return out
+    return []
+
+
+def _compact_geometry_token(geometry_type: str, vertices: list) -> str:
+    # Avoid json.dumps on the raw geometry_obj: the C JSON encoder recurses into nested
+    # coordinate arrays at C level, which overflows the C stack on complex MultiPolygons
+    # and causes an unrecoverable segfault. Hashing the flat vertex list + type string
+    # is stable (same cached file → same order) and sufficient to distinguish geometries.
+    key = geometry_type + ":" + ",".join(f"{lon:.10g}:{lat:.10g}" for lon, lat in vertices)
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()
+
+
+def _safe_shape_from_geojson(geometry_obj):
+    """Build one Shapely geometry after rejecting invalid/non-finite coordinates."""
+    if not isinstance(geometry_obj, dict):
+        return None
+    coords = geometry_obj.get("coordinates")
+    if coords is not None and not _coords_are_finite(coords):
+        return None
+    try:
+        return shape(geometry_obj)
+    except Exception:
+        return None
+
+
+def _read_geojson_without_gdal(path: str) -> pd.DataFrame:
+    """Read cached GeoJSON as plain rows with pre-extracted snap coordinates.
+
+    This intentionally avoids GDAL, GeoPandas geometry arrays, and Shapely geometry
+    construction. On the Paris workload, several apparently harmless GEOS/Shapely
+    property calls hard-crash the interpreter. Snapping only needs stable source keys
+    and candidate coordinates, so cached GeoJSON stays as plain Python data here.
     """
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     features = data.get("features", []) if isinstance(data, dict) else []
-    geometries = [shape(ft["geometry"]) if ft.get("geometry") else None for ft in features]
-    properties = [ft.get("properties", {}) or {} for ft in features]
-    return gpd.GeoDataFrame(pd.DataFrame(properties), geometry=geometries, crs="EPSG:4326")
+
+    rows = []
+    for ft in features:
+        if not isinstance(ft, dict):
+            continue
+        geometry_obj = ft.get("geometry")
+        vertices = _geojson_vertices(geometry_obj)
+        if not vertices:
+            continue
+        row = dict(ft.get("properties", {}) or {})
+        row["__snap_coord"] = vertices[0]
+        row["__snap_vertices"] = vertices if len(vertices) > 1 else None
+        gtype = geometry_obj.get("type", "") if isinstance(geometry_obj, dict) else ""
+        row["__geometry_token"] = _compact_geometry_token(gtype, vertices)
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 def _load_cached_poi_if_nonempty(path: str):
@@ -623,9 +830,7 @@ def _load_cached_poi_if_nonempty(path: str):
         return None
     if poi is None or poi.empty:
         return None
-    if "geometry" not in poi.columns:
-        return None
-    if poi["geometry"].dropna().empty:
+    if not _has_geometry_values(poi):
         return None
     return poi
 
@@ -675,11 +880,10 @@ def get_poi(
                     frames.append(cached)
 
             if frames:
-                poi = gpd.GeoDataFrame(
-                    pd.concat(frames, ignore_index=True),
-                    crs=frames[0].crs
-                )
-                return poi
+                combined = pd.concat(frames, ignore_index=True)
+                if "geometry" in combined.columns:
+                    return gpd.GeoDataFrame(combined, geometry="geometry", crs=getattr(frames[0], "crs", "EPSG:4326"))
+                return combined
 
         # Fallback: download all amenities when no local cache is available.
         feature = "amenity"
@@ -701,7 +905,19 @@ def get_poi(
                 if universe is not None and not universe.empty:
                     poi = _filter_by_tags(universe, tags)
                     if poi is not None and not poi.empty:
-                        poi.to_file(NAME_FILE, driver="GeoJSON")
+                        # Persist the per-query result as a fast-path cache, but treat this as
+                        # best-effort: when the universe was loaded from the on-disk GeoJSON cache
+                        # it comes back as a plain DataFrame (see _read_geojson_without_gdal, which
+                        # avoids GDAL/GEOS on purpose), and DataFrame has no .to_file. That must NOT
+                        # discard the filtered result — downstream consumers (snapping, poi_dedup)
+                        # read the plain-DataFrame form via get_poi_geometries just fine. Previously
+                        # the failed write was caught below and silently returned zero POIs, which
+                        # made the whole dedup drop-map empty.
+                        if hasattr(poi, "to_file"):
+                            try:
+                                poi.to_file(NAME_FILE, driver="GeoJSON")
+                            except Exception as write_exc:
+                                print(f"[POI] Could not persist per-query cache {NAME_FILE}: {write_exc}", flush=True)
                         print(
                             f"[POI] Built poi_type={poi_type} from city-universe cache. "
                             f"count={len(poi)} file={NAME_FILE}",
@@ -762,7 +978,7 @@ def get_poi(
                 flush=True,
             )
             return poi
-        if "geometry" not in poi.columns or poi["geometry"].dropna().empty:
+        if not _has_geometry_values(poi):
             try:
                 if os.path.exists(NAME_FILE):
                     os.remove(NAME_FILE)
@@ -842,17 +1058,55 @@ def get_poi_geometries(poi):
     - list[tuple[geometry, name, source_key]]: geometry/name/key triples for downstream snapping.
     """
     out = []
-    if "geometry" not in poi.columns:
+    if "geometry" not in poi.columns and "__snap_coord" not in poi.columns:
         return out
-    names = poi["name"] if "name" in poi.columns else None
-    for idx, geometry in poi["geometry"].dropna().items():
+
+    # Extract only the columns build_poi_source_key may read, once, as numpy arrays,
+    # then iterate positionally. Building a full poi.loc[idx] Series per row over an
+    # OSM universe (which can have thousands of tag columns and hundreds of thousands
+    # of rows) is what previously segfaulted pandas in the snapping stage.
+    from utils.poi_identity import SOURCE_KEY_COLUMNS
+
+    if "geometry" in poi.columns:
+        geoms = poi["geometry"].to_numpy()
+    else:
+        geoms = np.empty(len(poi), dtype=object)
+        geoms[:] = None
+    col_names = tuple(SOURCE_KEY_COLUMNS) + ("__geometry_token", "__snap_coord", "__snap_vertices")
+    col_values = {col: poi[col].to_numpy() for col in col_names if col in poi.columns}
+    name_vals = col_values.get("name")
+    snap_coords = col_values.get("__snap_coord")
+    snap_vertices = col_values.get("__snap_vertices")
+    geometry_tokens = col_values.get("__geometry_token")
+
+    for i in range(len(geoms)):
+        geometry = geoms[i]
+        row = {col: vals[i] for col, vals in col_values.items()}
         name = None
-        if names is not None:
+        if name_vals is not None:
+            nv = name_vals[i]
             try:
-                name = names.loc[idx]
-            except Exception:
-                name = None
-        row = poi.loc[idx]
+                name = None if nv is None or pd.isna(nv) else nv
+            except (TypeError, ValueError):
+                name = nv
+
+        if snap_coords is not None and geometry_tokens is not None:
+            coord = snap_coords[i]
+            if isinstance(coord, tuple) and len(coord) >= 2:
+                vertices = snap_vertices[i] if snap_vertices is not None else None
+                plain_geom = {
+                    "snap_coord": coord,
+                    "snap_vertices": vertices if isinstance(vertices, list) else None,
+                    "geometry_token": str(geometry_tokens[i]),
+                }
+                source_key = build_poi_source_key(row, plain_geom["geometry_token"])
+                out.append((plain_geom, name, source_key))
+                continue
+
+        if geometry is None:
+            continue
+        if isinstance(geometry, float) and math.isnan(geometry):
+            continue
         source_key = build_poi_source_key(row, geometry)
         out.append((geometry, name, source_key))
     return out
