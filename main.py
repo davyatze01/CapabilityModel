@@ -18,6 +18,12 @@ SAFE_MODE = False
 # WORKER_COUNT: force the number of pool workers. None = automatic (memory/CPU derived, then
 #   the safe-mode cap if SAFE_MODE). Set to 1 for a single-process "survival" run.
 WORKER_COUNT = None
+# LIGHT_OUTPUT: skip the per-hexagon POI/interface exports — they exist only to feed the
+#   web interface and are by far the heaviest post-routing step. The run still produces the
+#   capability CSVs, the GeoPackage, and the QGIS project. Meant for colleagues starting
+#   from a shipped impedances.npz who only need to inspect results in QGIS.
+#   Also settable without editing this file: CAP_LIGHT_OUTPUT=1 python main.py
+LIGHT_OUTPUT = False
 
 
 def _reexec_under_run_safe_if_needed() -> None:
@@ -96,7 +102,11 @@ def main():
 
     # Create a context with the configuration values specified in PipelineConfig.
     # All global values accessed by multiple stages are found here.
+    light_output = LIGHT_OUTPUT or os.environ.get("CAP_LIGHT_OUTPUT") == "1"
+
     cfg = PipelineConfig(study_city=study_city)
+    if light_output:
+        print("[Config] LIGHT_OUTPUT: skipping hexagon/interface POI exports (CSV + gpkg + QGIS only).", flush=True)
     print(f"[Config] study_city={cfg.study_city}  city_name={cfg.city_name}", flush=True)
     print(f"[Config] boundary shapefile: {cfg.name_shapefile}  (use_shapefile={cfg.use_shapefile})", flush=True)
     print(f"[Config] POI source: poi_from_shp={cfg.poi_from_shp}", flush=True)
@@ -143,7 +153,9 @@ def main():
             flush=True,
         )
 
-        if not os.path.exists(cfg.poi_export_geopackage_path):
+        if light_output:
+            print("[Stage] POI Export (pre-routing) skipped — light output mode.", flush=True)
+        elif not os.path.exists(cfg.poi_export_geopackage_path):
             print("[Stage] POI Export (pre-routing)", flush=True)
             pre_route_poi_exports = generate_poi_exports(ctx, snap=snap)
             print(
@@ -181,8 +193,12 @@ def main():
     # per-(hexagon, POI) service/capability powers (from `acc`). The pre-routing export only
     # writes a provisional id-only version and creates the GeoPackage — gating this on the
     # GeoPackage's existence would skip the powered export and leave only id-only hex files.
-    print("[Stage] POI Export (post-routing)", flush=True)
-    poi_exports = generate_poi_exports(ctx, snap=snap, non_bus=non_bus, acc=acc)
+    if light_output:
+        print("[Stage] POI Export (post-routing) skipped — light output mode.", flush=True)
+        poi_exports = {}
+    else:
+        print("[Stage] POI Export (post-routing)", flush=True)
+        poi_exports = generate_poi_exports(ctx, snap=snap, non_bus=non_bus, acc=acc)
 
     # Each poi type contributes to one or multiple services. Based on the accessibility to the poi types, we compute the opportunity for services.
     print("[Stage] Service Aggregation", flush=True)
@@ -198,11 +214,12 @@ def main():
         + ", ".join(str(path) for path in cap.output_paths.values()),
         flush=True,
     )
-    print(
-        "[Output] POI export files: "
-        + ", ".join(str(path) for path in poi_exports.values()),
-        flush=True,
-    )
+    if poi_exports:
+        print(
+            "[Output] POI export files: "
+            + ", ".join(str(path) for path in poi_exports.values()),
+            flush=True,
+        )
 
     # Generate plots, a combined shapefile, and a GeoPackage output.
     spatial_outputs = generate_spatial_outputs(cfg, cap)

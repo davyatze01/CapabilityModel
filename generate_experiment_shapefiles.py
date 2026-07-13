@@ -84,8 +84,13 @@ def _build_graph_coordinates(graph: nx.Graph) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _prepare_geodataframe(frame: pd.DataFrame, graph: nx.Graph) -> tuple[gpd.GeoDataFrame, str]:
-    """Build a GeoDataFrame for one experiment from CSV rows plus graph geometry."""
+def _prepare_geodataframe(frame: pd.DataFrame, graph) -> tuple[gpd.GeoDataFrame, str]:
+    """Build a GeoDataFrame for one experiment from CSV rows plus graph geometry.
+
+    `graph` may be an nx.Graph or a zero-arg callable returning one: exports
+    whose CSVs carry lon/lat never touch the graph, so a callable lets callers
+    defer the (slow, multi-GB) GraphML load until a CSV actually needs it.
+    """
     frame = frame.copy()
 
     # Reuse the same convention as the plotting script: prefer a column named
@@ -109,6 +114,8 @@ def _prepare_geodataframe(frame: pd.DataFrame, graph: nx.Graph) -> tuple[gpd.Geo
         # When coordinates are not present in the CSV, we enrich each row by
         # joining against the network nodes loaded from GraphML.
         frame["node_id"] = frame["node_id"].astype(str)
+        if callable(graph):
+            graph = graph()
         coordinates = _build_graph_coordinates(graph)
         frame = frame.merge(coordinates, on="node_id", how="left")
         frame = frame.dropna(subset=["lon", "lat", value_column])
@@ -156,7 +163,7 @@ def _safe_shapefile_columns(gdf: gpd.GeoDataFrame, value_column: str) -> gpd.Geo
     return gdf.rename(columns=rename_map)
 
 
-def _prepare_combined_geodataframe(csv_paths: list[Path], graph: nx.Graph) -> gpd.GeoDataFrame:
+def _prepare_combined_geodataframe(csv_paths: list[Path], graph) -> gpd.GeoDataFrame:
     """Build one GeoDataFrame with one column per experiment metric."""
     combined: gpd.GeoDataFrame | None = None
 
@@ -375,11 +382,19 @@ def generate_combined_experiment_gpkg(
     """Generate one GeoPackage containing all selected experiment CSVs."""
     graph_dir = Path(graph_dir)
 
-    selected_graph = Path(graph_path) if graph_path is not None else pick_graphml_file(graph_dir, preferred_mode)
-    graph = load_graph(selected_graph)
+    # Deferred: pipeline CSVs carry lon/lat, so the (slow, multi-GB) GraphML is
+    # only loaded if some CSV actually lacks coordinates. This keeps the rebuild
+    # path runnable on machines that have no graph/ artifacts at all.
+    _graph_memo: list[nx.Graph] = []
+
+    def _lazy_graph() -> nx.Graph:
+        if not _graph_memo:
+            selected = Path(graph_path) if graph_path is not None else pick_graphml_file(graph_dir, preferred_mode)
+            _graph_memo.append(load_graph(selected))
+        return _graph_memo[0]
 
     selected_csv_paths = [Path(path) for path in csv_paths]
-    combined = _prepare_combined_geodataframe(selected_csv_paths, graph)
+    combined = _prepare_combined_geodataframe(selected_csv_paths, _lazy_graph)
     combined = _prepare_gpkg_layer(combined)
 
     output_path = Path(output_path)
