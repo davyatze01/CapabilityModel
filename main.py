@@ -29,7 +29,13 @@ def _reexec_under_run_safe_if_needed() -> None:
 
     Inside the VS Code Flatpak sandbox systemd-run lives on the host, not in the
     sandbox — so we use `flatpak-spawn --host` to exec run_safe.sh there.
+
+    Linux-only: the cgroup cap and hardware-crash retries exist for this
+    workstation specifically. On Windows/macOS (colleagues' machines) the
+    pipeline runs plainly — main.py is the same single entrypoint everywhere.
     """
+    if sys.platform != "linux":
+        return
     if os.environ.get("CAP_MEM_BUDGET_GB"):
         return  # already inside a run_safe.sh cgroup scope
     if os.environ.get("CAP_SKIP_RUN_SAFE"):
