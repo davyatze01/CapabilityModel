@@ -252,9 +252,23 @@ plots/edge_interpolation
 # Generated local graph/OSM caches
 graph/*.graphml
 graph/*.npz
-gtfs/*.osm.pbf
 gtfs/*.osm.xml
 gtfs/*.zip
+# ...but keep the small Cagliari GTFS feeds tracked (large Paris/metro zips stay ignored)
+!gtfs/GTFS.zip
+!gtfs/arst-cagliari-it.zip
+
+# Large binary routing inputs/derived data (kept on disk, never pushed)
+*.jar
+gtfs/**/*.osm.pbf
+gtfs-pbf/*.pbf
+gtfs/**/network.dat
+gtfs/**/*.mapdb
+gtfs/**/*.mapdb.p
+
+# Junk / diagnostic leftovers
+hs_err_pid*.log
+_hexout.txt
 
 # Large generated POI export artifacts (exceed GitHub's 100MB limit)
 /pois_used.gpkg
@@ -270,3 +284,6 @@ Paris/
 gtfs/_extracts/
 outputs/sensitivity/upstream/
 interfaccia/resources/hexagon_service_pois.json
+
+# Telegram notification credentials (see notify.py)
+notify_config.json
