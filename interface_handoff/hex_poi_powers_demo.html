@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>POI power + hexagon accessibility demo</title>
+  <style>
+    body { font-family: monospace; margin: 20px; max-width: 1000px; }
+    select, button { font: inherit; padding: 4px 8px; }
+    table { border-collapse: collapse; margin-top: 14px; width: 100%; }
+    th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: right; font-size: 12px; }
+    th { background: #f0f0f0; position: sticky; top: 0; }
+    td:first-child, th:first-child { text-align: left; }
+    .cp-col { background: #fff4f9; }
+    .empty { color: #999; }
+    #status { color: #666; margin: 8px 0; }
+    h2 { margin-top: 28px; font-size: 16px; }
+    .bar-cell { position: relative; }
+    .bar-fill { position: absolute; left: 0; top: 0; bottom: 0; background: #d8e8ff; z-index: 0; }
+    .bar-cell span { position: relative; z-index: 1; }
+    #access-table td:first-child { text-align: left; }
+  </style>
+  <script>
+    // Real Cagliari exports. Point these at a different city's exports to
+    // demo another dataset.
+    window.HEX_POIS_BASE = "../outputs/poi_exports/Cagliari/hex_pois/";
+  </script>
+  <script src="hex_shard_loader.js"></script>
+  <script src="../outputs/poi_exports/Cagliari/poi_type_accessibility.js"></script>
+</head>
+<body>
+  <h1>POI power + hexagon accessibility demo</h1>
+  <p>Two related but distinct pieces of data for the same hexagons, both
+     loaded straight from real exported artifacts:</p>
+  <ul>
+    <li><b>Per-POI table below</b>: <code>sp</code> (service power) and
+      <code>cp</code> (capability power) for individual POIs, from the hex
+      shard files via <code>hex_shard_loader.js</code>.</li>
+    <li><b>Per-poi_type accessibility table</b>: one aggregate accessibility
+      score per POI *type* for this hexagon overall (before it's weighted
+      into any service/capability), from
+      <code>poi_type_accessibility.js</code> (<code>window.POI_TYPE_ACCESSIBILITY</code>).</li>
+  </ul>
+  <p>Works over <code>file://</code>, just open this file directly.</p>
+
+  <label>Hexagon:
+    <select id="hex-select"><option>loading manifest…</option></select>
+  </label>
+  <button id="load-btn" disabled>Load</button>
+  <span id="status"></span>
+
+  <h2>Per-poi_type accessibility (this hexagon)</h2>
+  <table id="access-table">
+    <thead><tr><th>poi_type</th><th>accessibility</th></tr></thead>
+    <tbody id="access-table-body"></tbody>
+  </table>
+
+  <h2>Per-POI service/capability power</h2>
+  <table id="table" style="display:none">
+    <thead><tr id="table-head"></tr></thead>
+    <tbody id="table-body"></tbody>
+  </table>
+
+  <script>
+    var servicesList = [];
+    var capabilitiesList = [];
+
+    function setStatus(text) { document.getElementById('status').textContent = text; }
+
+    loadHexPoisManifest().then(function (manifest) {
+      servicesList = manifest.services;
+      capabilitiesList = manifest.capabilities;
+
+      var select = document.getElementById('hex-select');
+      select.innerHTML = '';
+      // Full list can be long; showing all is fine since it's just a <select>.
+      manifest.hex_ids.forEach(function (hexId) {
+        var opt = document.createElement('option');
+        opt.value = hexId;
+        opt.textContent = hexId;
+        select.appendChild(opt);
+      });
+      document.getElementById('load-btn').disabled = false;
+      setStatus(manifest.count + ' hexagons available (schema ' + manifest.schema + ')');
+
+      document.getElementById('load-btn').addEventListener('click', function () {
+        loadSelectedHex(select.value);
+      });
+      // Load the first one immediately so the page isn't empty.
+      loadSelectedHex(select.value);
+    }).catch(function (e) {
+      setStatus('ERROR loading manifest: ' + e.message);
+    });
+
+    function fmt(val) {
+      return val === undefined ? '' : val.toFixed(4);
+    }
+
+    function loadSelectedHex(hexId) {
+      setStatus('loading ' + hexId + ' …');
+      var t0 = performance.now();
+      loadHexPoiRecords(hexId).then(function (records) {
+        var ms = (performance.now() - t0).toFixed(0);
+        var withPower = records.filter(function (r) { return r.sp || r.cp; }).length;
+        setStatus(
+          hexId + ': ' + records.length + ' POIs (' + withPower + ' with sp/cp data), '
+          + 'loaded in ' + ms + 'ms'
+        );
+        renderTable(records);
+      }).catch(function (e) {
+        setStatus('ERROR loading ' + hexId + ': ' + e.message);
+      });
+      renderAccessTable(hexId);
+    }
+
+    function renderAccessTable(hexId) {
+      var body = document.getElementById('access-table-body');
+      body.innerHTML = '';
+      // window.POI_TYPE_ACCESSIBILITY: {hex_id: {poi_type: accessibility}, ...}
+      // (poi_exports._write_poi_type_accessibility) -- sparse, only nonzero
+      // values are stored, so a hexagon can legitimately be absent entirely.
+      var byType = (window.POI_TYPE_ACCESSIBILITY && window.POI_TYPE_ACCESSIBILITY[hexId]) || {};
+      var entries = Object.keys(byType).map(function (pt) { return [pt, byType[pt]]; });
+      entries.sort(function (a, b) { return b[1] - a[1]; });
+
+      if (!entries.length) {
+        body.innerHTML = '<tr><td colspan="2" class="empty">no accessibility data for this hexagon</td></tr>';
+        return;
+      }
+      entries.forEach(function (pair) {
+        var pt = pair[0], v = pair[1];
+        var row = document.createElement('tr');
+        row.innerHTML = '<td>' + pt + '</td>'
+          + '<td class="bar-cell"><div class="bar-fill" style="width:' + (v * 100).toFixed(1) + '%"></div>'
+          + '<span>' + v.toFixed(4) + '</span></td>';
+        body.appendChild(row);
+      });
+    }
+
+    function renderTable(records) {
+      var head = document.getElementById('table-head');
+      head.innerHTML = '<th>POI id</th>'
+        + servicesList.map(function (s) { return '<th>sp: ' + s + '</th>'; }).join('')
+        + capabilitiesList.map(function (c) { return '<th class="cp-col">cp: ' + c + '</th>'; }).join('');
+
+      var body = document.getElementById('table-body');
+      body.innerHTML = '';
+      // Show POIs that actually have power data first (the interesting ones),
+      // capped so the table stays readable.
+      var sorted = records.slice().sort(function (a, b) {
+        return (b.sp || b.cp ? 1 : 0) - (a.sp || a.cp ? 1 : 0);
+      });
+      sorted.slice(0, 200).forEach(function (r) {
+        var row = document.createElement('tr');
+        var cells = ['<td>' + r.i + '</td>'];
+        servicesList.forEach(function (s) {
+          var v = r.sp && r.sp[s];
+          cells.push('<td' + (v === undefined ? ' class="empty"' : '') + '>' + (v === undefined ? '—' : fmt(v)) + '</td>');
+        });
+        capabilitiesList.forEach(function (c) {
+          var v = r.cp && r.cp[c];
+          cells.push('<td class="cp-col' + (v === undefined ? ' empty' : '') + '">' + (v === undefined ? '—' : fmt(v)) + '</td>');
+        });
+        row.innerHTML = cells.join('');
+        body.appendChild(row);
+      });
+      document.getElementById('table').style.display = '';
+    }
+  </script>
+</body>
+</html>

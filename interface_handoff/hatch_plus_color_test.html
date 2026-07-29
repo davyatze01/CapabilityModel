@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>hatch + colored grid combined test</title>
+  <link rel="stylesheet" href="../interfaccia/resources/ol.css">
+  <style>
+    body { font-family: monospace; margin: 20px; }
+    #map { width: 900px; height: 700px; border: 1px solid #999; }
+    .controls { margin: 10px 0; }
+    button { font: inherit; padding: 4px 10px; margin-right: 6px; }
+    button.active { background: #333; color: #fff; }
+  </style>
+  <script src="../interfaccia/resources/ol.js"></script>
+  <script src="../outputs/gpkg/Cagliari/hatch/manifest.js"></script>
+  <script src="hatch_grid_static.js"></script>
+</head>
+<body>
+  <h1>hatch + colored grid, combined</h1>
+  <p>Real OpenLayers rendering (not a compositing simulation): the "care"
+     capability's colored grid (white &rarr; #EB4CCC ramp on grid_mean_care,
+     the same colors pipeline_runner.py uses) as one image layer, with the
+     real baked hatch overlay on top as a second image layer &mdash; both
+     pixel-aligned to the same extent. Toggle each on/off below and zoom in
+     to confirm the color shows through the hatch and both stay stable.
+     Works over <code>file://</code>, just open this file directly.</p>
+  <div class="controls">
+    <label><input type="checkbox" id="toggle-color" checked> colored grid</label>
+    <label><input type="checkbox" id="toggle-hatch" checked> hatch</label>
+  </div>
+  <div id="map"></div>
+  <script>
+    var careExtent = window.HATCH_MANIFEST.capabilities.care.extent;
+
+    var map = new ol.Map({
+      target: 'map',
+      layers: [new ol.layer.Tile({ source: new ol.source.OSM() })],
+      view: new ol.View({ center: ol.proj.fromLonLat([9.11, 39.22]), zoom: 13 })
+    });
+
+    var colorLayer = new ol.layer.Image({
+      source: new ol.source.ImageStatic({
+        url: 'colored_grid_care_test.png',
+        imageExtent: careExtent,
+        projection: 'EPSG:4326'
+      })
+    });
+    map.addLayer(colorLayer);
+
+    window.makeHatchGridImageLayers(
+      '../outputs/gpkg/Cagliari/hatch/manifest.json',
+      '../outputs/gpkg/Cagliari/hatch/'
+    ).then(function (hatchLayers) {
+      map.addLayer(hatchLayers.care);
+      window.setHatchCapability(hatchLayers, 'care');
+
+      document.getElementById('toggle-color').addEventListener('change', function (e) {
+        colorLayer.setVisible(e.target.checked);
+      });
+      document.getElementById('toggle-hatch').addEventListener('change', function (e) {
+        hatchLayers.care.setVisible(e.target.checked);
+      });
+    }).catch(function (e) {
+      document.getElementById('map').textContent = 'ERROR: ' + e.message;
+    });
+  </script>
+</body>
+</html>

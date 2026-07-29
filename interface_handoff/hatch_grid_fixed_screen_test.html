@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>hatch_grid_style fixed-screen-size test</title>
+  <link rel="stylesheet" href="../interfaccia/resources/ol.css">
+  <style>
+    body { font-family: monospace; margin: 20px; }
+    #map { width: 900px; height: 600px; border: 1px solid #999; }
+    .legend { display: flex; gap: 16px; margin: 10px 0; }
+    .legend span { display: inline-block; width: 14px; height: 14px; margin-right: 4px; vertical-align: middle; }
+  </style>
+  <script src="../interfaccia/resources/ol.js"></script>
+  <script src="hatch_grid_style.js"></script>
+</head>
+<body>
+  <h1>hatch_grid_style: fixed-screen-size variant</h1>
+  <p>Same six synthetic hexagons as hatch_grid_test.html, but styled with
+     <code>makeHatchGridStyleFixedScreen</code> instead of
+     <code>makeHatchGridStyle</code>. Zoom in/out: unlike the other test,
+     line spacing/thickness should look IDENTICAL at every zoom level --
+     what changes is how many repeats fit inside each hexagon as it grows
+     or shrinks on screen. Compare directly against hatch_grid_test.html
+     to see the difference. Works over <code>file://</code>, just open this
+     file directly.</p>
+  <div class="legend">
+    <div><span style="background:#eee;border:1px solid #999"></span>no data</div>
+    <div><span style="background:#eee;border:1px solid #999"></span>Very Low (0.1)</div>
+    <div><span style="background:#eee;border:1px solid #999"></span>Low (0.3)</div>
+    <div><span style="background:#eee;border:1px solid #999"></span>Medium (0.5)</div>
+    <div><span style="background:#eee;border:1px solid #999"></span>High (0.7)</div>
+    <div><span style="background:#eee;border:1px solid #999"></span>Very High (0.9)</div>
+  </div>
+  <div id="map"></div>
+  <script>
+    // Flat-top hexagon centered at (cx, cy) in EPSG:3857, ~100m across.
+    function hexRing(cx, cy, radiusM) {
+      var ring = [];
+      for (var i = 0; i < 6; i++) {
+        var angle = (Math.PI / 180) * (60 * i);
+        ring.push([cx + radiusM * Math.cos(angle), cy + radiusM * Math.sin(angle)]);
+      }
+      ring.push(ring[0]);
+      return ring;
+    }
+
+    var origin = ol.proj.fromLonLat([9.1097, 39.2238]); // Cagliari
+    var spacing = 130;
+    var values = [null, 0.1, 0.3, 0.5, 0.7, 0.9];
+
+    var features = values.map(function (v, i) {
+      var cx = origin[0] + i * spacing;
+      var cy = origin[1];
+      var f = new ol.Feature({
+        geometry: new ol.geom.Polygon([hexRing(cx, cy, 55)]),
+        grid_mean_care: v,
+        cell_size_m: 100
+      });
+      return f;
+    });
+
+    var selectedCapability = 'grid_mean_care';
+    var selectedHexId = null;
+
+    var style = window.makeHatchGridStyleFixedScreen(
+      function (feature) { return feature.get(selectedCapability); },
+      function (feature) { return !selectedHexId || feature.get('hex_id') === selectedHexId; }
+    );
+
+    var source = new ol.source.Vector({ features: features });
+    var layer = new ol.layer.Vector({ source: source, style: style });
+
+    new ol.Map({
+      target: 'map',
+      layers: [
+        new ol.layer.Tile({ source: new ol.source.OSM() }),
+        layer
+      ],
+      view: new ol.View({ center: origin, zoom: 17 })
+    });
+  </script>
+</body>
+</html>

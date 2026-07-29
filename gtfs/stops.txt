@@ -1,0 +1,25 @@
+stop_id,stop_code,stop_name,stop_desc,stop_lat,stop_lon,zone_id,wheelchair_boarding,stop_url
+M_9100,9100,REPUBBLICA,,39.217287,9.125268,901,1,https://app.arstspa.it/sinottico/M_9100.html
+M_9101,9101,GENNARI,,39.220251,9.131430,901,1,https://app.arstspa.it/sinottico/M_9101.html
+M_9102,9102,GENNERUXI,,39.225838,9.131887,901,1,https://app.arstspa.it/sinottico/M_9102.html
+M_9103,9103,MERCALLI,,39.232375,9.136722,901,1,https://app.arstspa.it/sinottico/M_9103.html
+M_9104,9104,VESALIO,,39.241722,9.137030,901,1,https://app.arstspa.it/sinottico/M_9104.html
+M_9106,9106,CARACALLA,,39.252876,9.134295,901,1,https://app.arstspa.it/sinottico/M_9106.html
+M_9107,9107,REDENTORE,,39.259026,9.137963,901,1,https://app.arstspa.it/sinottico/M_9107.html
+M_9108,9108,SAN GOTTARDO,,39.263978,9.141682,901,1,https://app.arstspa.it/sinottico/M_9108.html
+M_9109,9109,DELL'ARGINE,,39.264153,9.134542,901,1,https://app.arstspa.it/sinottico/M_9109.html
+M_9110,9110,POLICLINICO,,39.269469,9.126435,901,1,https://app.arstspa.it/sinottico/M_9110.html
+M_9111,9111,SETTIMO SAN PIETRO,,39.289272,9.176851,904,1,https://app.arstspa.it/sinottico/M_9111.html
+M_9112,9112,SELARGIUS CAMELIE,,39.267055,9.147827,901,1,https://app.arstspa.it/sinottico/M_9112.html
+M_9200,9200,POLICLINICO,,39.269388,9.126498,901,1,https://app.arstspa.it/sinottico/M_9200.html
+M_9201,9201,DELL'ARGINE,,39.264061,9.134491,901,1,https://app.arstspa.it/sinottico/M_9201.html
+M_9202,9202,SAN GOTTARDO,,39.263905,9.141842,901,1,https://app.arstspa.it/sinottico/M_9202.html
+M_9203,9203,REDENTORE,,39.258956,9.137905,901,1,https://app.arstspa.it/sinottico/M_9203.html
+M_9204,9204,CARACALLA,,39.252837,9.134200,901,1,https://app.arstspa.it/sinottico/M_9204.html
+M_9206,9206,VESALIO,,39.241587,9.136972,901,1,https://app.arstspa.it/sinottico/M_9206.html
+M_9207,9207,MERCALLI,,39.232241,9.136516,901,1,https://app.arstspa.it/sinottico/M_9207.html
+M_9208,9208,GENNERUXI,,39.226062,9.132050,901,1,https://app.arstspa.it/sinottico/M_9208.html
+M_9209,9209,GENNARI,,39.220279,9.131162,901,1,https://app.arstspa.it/sinottico/M_9209.html
+M_9210,9210,REPUBBLICA,,39.217341,9.125245,901,1,https://app.arstspa.it/sinottico/M_9210.html
+M_9211,9211,SELARGIUS CAMELIE,,39.267182,9.148017,901,1,https://app.arstspa.it/sinottico/M_9211.html
+M_9212,9212,SETTIMO SAN PIETRO,,39.289475,9.176838,904,1,https://app.arstspa.it/sinottico/M_9212.html

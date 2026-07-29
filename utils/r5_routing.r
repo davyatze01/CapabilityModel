@@ -63,10 +63,10 @@ report_memory <- function(label, track_baseline = FALSE, trigger_gc = FALSE) {
   # JNI/Arrow buffers behind it right at peak) that was never collected at those points
   # before, and risks being the actual stall itself. So skip R-heap reporting there
   # entirely — RSS (below) already reflects R's live memory without forcing anything.
-  r_used_str <- "n/a (not measured, to avoid forcing GC)"
+  r_used_str <- ""  # only reported at the post-cleanup checkpoint that actually runs gc()
   if (trigger_gc) {
     g <- gc(verbose = FALSE)
-    r_used_str <- sprintf("%.0fMB", sum(g[, 2]))  # "used" column (Mb), Ncells + Vcells rows
+    r_used_str <- sprintf("   R used=%.0fMB", sum(g[, 2]))  # "used" column (Mb), Ncells + Vcells rows
   }
 
   rss_gb <- process_rss_gb()
@@ -80,7 +80,7 @@ report_memory <- function(label, track_baseline = FALSE, trigger_gc = FALSE) {
   }
 
   cat(sprintf(
-    "[mem] %-28s  RSS=%.2fGB%s   JVM used=%.2fGB / max=%.2fGB   R used=%s\n",
+    "[mem] %-28s  RSS=%.2fGB%s   JVM used=%.2fGB / max=%.2fGB%s\n",
     label, rss_gb, rss_delta_str, jvm_used, jvm_max, r_used_str
   ))
 }
@@ -92,10 +92,17 @@ dest_path <- Sys.getenv("R5_DEST_PATH", unset = "outputs/r5r_dest.csv")
 output_path <- Sys.getenv("R5_OUTPUT_PATH", unset = "outputs/r5r_expanded_travel_time_matrix.csv")
 chunk_dir <- Sys.getenv("R5_CHUNK_DIR", unset = "outputs/r5r_chunks")
 departure_dt_text <- Sys.getenv("R5_DEPARTURE_DATETIME", unset = "2025-10-15 12:00:00")
-dest_chunk_size_text <- Sys.getenv("R5_DEST_CHUNK_SIZE", unset = "4000")
+dest_chunk_size_text <- Sys.getenv("R5_DEST_CHUNK_SIZE", unset = "0")
 dest_chunk_size <- as.integer(dest_chunk_size_text)
+# 0 / invalid => resolved to "all destinations in one chunk" once nrow is known.
 if (is.na(dest_chunk_size) || dest_chunk_size <= 0) {
-  dest_chunk_size <- 4000L
+  dest_chunk_size <- 0L
+}
+origin_chunk_size_text <- Sys.getenv("R5_ORIGIN_CHUNK_SIZE", unset = "0")
+origin_chunk_size <- as.integer(origin_chunk_size_text)
+# 0 / invalid => resolved to a safe default (1 origin) once nrow is known.
+if (is.na(origin_chunk_size) || origin_chunk_size <= 0) {
+  origin_chunk_size <- 0L
 }
 
 origins <- fread(
@@ -140,6 +147,14 @@ process_chunk <- function(origins_chunk, chunk_index, n_chunks, chunk_path) {
       breakdown = TRUE,
       max_walk_time = 30,
       max_trip_duration = max_trip_duration,
+      # r5r's default (5) draws multiple random headway realizations per departure
+      # minute -- meant for frequency-based GTFS (frequencies.txt). Neither GTFS feed
+      # this pipeline routes against uses frequencies.txt (both ARST/Cagliari and
+      # IDFM/Paris are fully stop_times-scheduled), so per-minute draws beyond the
+      # first are redundant resampling of a deterministic schedule. 1 draw keeps
+      # time_window's 60 distinct departure minutes exactly as before, just without
+      # the ~5x redundant resampling on top.
+      draws_per_minute = 1,
       progress = TRUE,
       verbose = FALSE
   )
@@ -182,6 +197,10 @@ process_origin_dest_chunk <- function(origins_chunk, destinations_chunk, chunk_l
       breakdown = TRUE,
       max_walk_time = 30,
       max_trip_duration = max_trip_duration,
+      # See the matching comment in process_chunk(): neither GTFS feed this pipeline
+      # uses is frequency-based, so the extra per-minute Monte Carlo draws r5r's
+      # default (5) would add are redundant resampling of a deterministic schedule.
+      draws_per_minute = 1,
       progress = TRUE,
       verbose = FALSE
   )
@@ -225,10 +244,44 @@ if (n_origins == 0) {
   stop("No origins found.")
 }
 
-chunk_size <- 200L
+# Origin-primary chunking: keep destinations in as few large chunk(s) as R5 allows
+# and chunk origins instead. R5's per-origin transit search (RAPTOR) dominates cost
+# and is ~independent of the destination count, so many small destination chunks
+# re-run it redundantly (once per chunk). Sizes are injected by Python from the
+# memory budget (R5_ORIGIN_CHUNK_SIZE / R5_DEST_CHUNK_SIZE); the fallbacks keep the
+# script runnable standalone.
+#
+# HARD CAP: expanded_travel_time_matrix(breakdown = TRUE) computes detailed path
+# breakdowns via R5's PathResult, which throws
+#   "Number of detailed path destinations exceeds limit of 5000"
+# for any call with more than 5000 destinations. The breakdown columns
+# (access_time / wait_time / ride_time / transfer_time / routes / n_rides) are
+# required by the downstream generalized-cost model, so we cannot drop breakdown to
+# lift this limit. The cap below is therefore mandatory, not tuning: it caps at 5000
+# regardless of the injected R5_DEST_CHUNK_SIZE. Small cities (e.g. Cagliari) stay in
+# one chunk; large ones (Paris' 268k destinations => 54 chunks) pay the unavoidable
+# RAPTOR re-run cost that breakdown = TRUE forces.
+R5_MAX_BREAKDOWN_DESTINATIONS <- 5000L
+if (origin_chunk_size <= 0L) {
+  origin_chunk_size <- 1L
+}
+chunk_size <- origin_chunk_size
 n_chunks <- ceiling(n_origins / chunk_size)
-destination_chunk_size <- min(dest_chunk_size, 5000L)
+if (dest_chunk_size <= 0L) {
+  destination_chunk_size <- nrow(destinations)
+} else {
+  destination_chunk_size <- min(dest_chunk_size, nrow(destinations))
+}
+if (destination_chunk_size <= 0L) {
+  destination_chunk_size <- nrow(destinations)
+}
+destination_chunk_size <- min(destination_chunk_size, R5_MAX_BREAKDOWN_DESTINATIONS)
 n_destination_chunks <- ceiling(nrow(destinations) / destination_chunk_size)
+cat(sprintf(
+  "Chunking: %d origins in %d chunk(s) of %d; %d destinations in %d chunk(s) of %d.\n",
+  n_origins, n_chunks, chunk_size,
+  nrow(destinations), n_destination_chunks, destination_chunk_size
+))
 
 dir.create(chunk_dir, recursive = TRUE, showWarnings = FALSE)
 chunk_files <- character()
@@ -249,21 +302,74 @@ departure_datetime <- as.POSIXct(
   format = "%Y-%m-%d %H:%M:%S"
 )
 
-# Resume support: skip chunks already computed by a previous run. No fingerprint
-# check against the origin/destination CSVs or routing parameters -- a chunk
-# file present in this city+transport-type's own chunk_dir (a distinct directory
-# per city and per transport type, e.g. artifacts/<city>/bus/r5r_chunks) is
-# treated as valid and reused as-is. This trades away protection against a
-# genuinely stale chunk left over from a *different* job reusing this same
-# directory (e.g. a prior run with a different chunk_size, destination set, or
-# departure time) in exchange for never discarding good progress: the previous
-# md5-based fingerprint invalidated (and wiped) all chunks whenever Python
-# regenerated the origin/destination CSVs with any incidental difference (byte
-# order, floating-point formatting, etc.) even when the job was identical --
-# which is what caused a mid-job crash retry to restart from chunk 1 instead of
-# resuming. If you deliberately change chunk_size, destination_chunk_size, mode,
-# or the origins/destinations for a city+transport_type, clear that chunk_dir
-# yourself before rerunning.
+# --- Stale-cache guard -------------------------------------------------------
+# The resume logic below reuses any chunk_*.csv present by name. That is only
+# valid when the inputs and chunk grid match the ones those files were written
+# under. If the origins/destinations, departure, transit mode, time window, or
+# chunk sizes changed, old chunks encode incompatible results -- e.g. a "d{idx}"
+# label now points at a different coordinate, or the (origin_chunk, dest_chunk)
+# grid no longer lines up -- and must not be silently blended into the matrix.
+#
+# The fingerprint is over ROUNDED coordinates (6 dp, ~0.1 m) plus the routing
+# parameters, NOT the raw CSV bytes. This is deliberate: an earlier md5-of-file
+# guard was removed because Python re-emitting the same coordinates with
+# incidental float-formatting/byte-order differences changed the hash and wiped
+# a perfectly valid cache (restarting a job from chunk 1). Rounded coordinates
+# are stable across that reformatting, while still changing on any real change of
+# the coordinates, their order, or the grid.
+rounded_coord_md5 <- function(dt) {
+  tf <- tempfile()
+  on.exit(unlink(tf), add = TRUE)
+  writeLines(sprintf("%.6f,%.6f", dt$lat, dt$lon), tf)
+  unname(tools::md5sum(tf))
+}
+current_signature <- paste(
+  rounded_coord_md5(origins),
+  rounded_coord_md5(destinations),
+  departure_dt_text,
+  paste(mode, collapse = "+"),
+  60,                       # time_window (minutes)
+  max_trip_duration,
+  chunk_size,
+  destination_chunk_size,
+  sep = "|"
+)
+signature_path <- file.path(chunk_dir, "input_signature.txt")
+previous_signature <- if (file.exists(signature_path)) {
+  readLines(signature_path, n = 1, warn = FALSE)
+} else {
+  ""
+}
+if (!identical(previous_signature, current_signature)) {
+  stale <- list.files(chunk_dir, pattern = "^chunk_.*\\.csv$", full.names = TRUE)
+  if (length(stale) > 0) {
+    cat(sprintf(
+      "Input signature changed since last run: clearing %d stale chunk file(s) in %s.\n",
+      length(stale), chunk_dir
+    ))
+    file.remove(stale)
+  }
+  writeLines(current_signature, signature_path)
+} else {
+  cat("Input signature unchanged: reusing existing chunk files where present.\n")
+}
+
+# Resume support: skip chunks already computed by a previous run. Within a run
+# whose inputs match the signature above, a chunk file present in this
+# city+transport-type's own chunk_dir (a distinct directory per city and per
+# transport type, e.g. artifacts/<city>/bus/r5r_chunks) is treated as valid and
+# reused as-is. Correctness against a genuinely stale chunk (a different
+# destination set, chunk grid, departure, or mode) is now handled up front by
+# the signature guard, which wipes the chunk_dir on mismatch -- so a changed job
+# can no longer silently blend incompatible rows into the matrix, while an
+# identical job (including one whose CSVs were merely re-emitted with different
+# float formatting) still resumes instead of restarting from chunk 1.
+#
+# draws_per_minute is deliberately NOT on that list: for a fully stop_times-scheduled
+# GTFS feed (no frequencies.txt -- true of every feed this pipeline currently routes
+# against), the best-of-N-draws-per-minute value should be the same regardless of N,
+# so chunks already computed under a different draws_per_minute are still valid to
+# reuse as-is alongside newly-computed ones.
 cat(sprintf("Resume: reusing any existing chunk files in %s.\n", chunk_dir))
 
 
@@ -307,22 +413,44 @@ for (chunk_index in seq_len(n_chunks)) {
   }
 }
 
-all_chunks <- lapply(
-  chunk_files,
-  fread,
-  colClasses = list(character = c("from_id", "to_id"))
-)
-final_ettm <- rbindlist(all_chunks)
-
-# Defensive filtering to avoid stale/mismatched IDs propagating downstream.
+# Streaming combine: one chunk file at a time -> filter -> append to the output.
+# The previous version loaded every chunk file at once (17GB+ of CSV for Paris),
+# rbindlist'd them, then filtered -- up to three simultaneous copies of the full
+# matrix on top of the live R5 JVM heap, which pinned the run at the cgroup
+# memory cap and reclaim-throttled it into what looked like a hang. Peak memory
+# is now a single chunk. The periodic progress lines both feed the Python stall
+# watchdog and mark the combine phase so it gets its own generous timeout
+# (public_transport_routing_stage.py) instead of the tight 60s routing one.
+# Written to a .part file first: a kill mid-combine must not leave a truncated
+# file that a later run could mistake for the finished matrix.
 valid_origin_ids <- as.character(origins$id)
 valid_destination_ids <- as.character(destinations$id)
-final_ettm <- final_ettm[
-  from_id %in% valid_origin_ids & to_id %in% valid_destination_ids
-]
 
-if (nrow(final_ettm) == 0) {
-  cat("Warning: final routing matrix is empty after ID filtering.\n")
+part_path <- paste0(output_path, ".part")
+if (file.exists(part_path)) {
+  file.remove(part_path)
+}
+n_chunk_files <- length(chunk_files)
+total_rows_kept <- 0
+cat(sprintf("Combining chunk files: 0/%d\n", n_chunk_files))
+for (i in seq_along(chunk_files)) {
+  chunk <- fread(
+    chunk_files[[i]],
+    colClasses = list(character = c("from_id", "to_id"))
+  )
+  # Defensive filtering to avoid stale/mismatched IDs propagating downstream.
+  chunk <- chunk[from_id %in% valid_origin_ids & to_id %in% valid_destination_ids]
+  total_rows_kept <- total_rows_kept + nrow(chunk)
+  fwrite(chunk, part_path, append = file.exists(part_path))
+  if (i %% 200 == 0 || i == n_chunk_files) {
+    cat(sprintf(
+      "Combining chunk files: %d/%d (%.0f rows kept)\n",
+      i, n_chunk_files, total_rows_kept
+    ))
+  }
 }
 
-fwrite(final_ettm, output_path)
+if (total_rows_kept == 0) {
+  cat("Warning: final routing matrix is empty after ID filtering.\n")
+}
+file.rename(part_path, output_path)

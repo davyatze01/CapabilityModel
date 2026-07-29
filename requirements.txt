@@ -21,6 +21,8 @@ pyogrio>=0.7,<1.0
 psutil>=5.9,<7.0
 tqdm>=4.66,<5.0
 shutup>=0.2,<1.0
+# Static hatch-grid PNG bake for the OpenLayers export (utils/hatch_raster.py)
+Pillow>=10.0,<13.0
 
 # Utility scripts in this repo
 beautifulsoup4>=4.12,<5.0
@@ -28,3 +30,11 @@ scikit-learn>=1.4,<1.6
 matplotlib>=3.8,<4.0
 seaborn>=0.13,<1.0
 pyDecision>=5.1,<6.0
+
+# ops/non_bus_routing_bench.py only: in-process C++ graph library, one of the routing
+# backends benchmarked against the production scipy path. MIT-licensed, actively
+# maintained; confirmed to install as a prebuilt wheel on this Python version.
+networkit>=11.0,<12.0
+# ops/non_bus_routing_bench.py's "osrm" backend also needs podman or docker on PATH
+# (runs the official ghcr.io/project-osrm/osrm-backend image) — not pip-installable.
+# Fedora: sudo dnf install podman

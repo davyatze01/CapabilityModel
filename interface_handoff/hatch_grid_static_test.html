@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>hatch_grid_static test</title>
+  <link rel="stylesheet" href="../interfaccia/resources/ol.css">
+  <style>
+    body { font-family: monospace; margin: 20px; }
+    #map { width: 900px; height: 700px; border: 1px solid #999; }
+    .controls { margin: 10px 0; }
+    button { font: inherit; padding: 4px 10px; margin-right: 6px; }
+    button.active { background: #333; color: #fff; }
+  </style>
+  <script src="../interfaccia/resources/ol.js"></script>
+  <!-- manifest.js sets window.HATCH_MANIFEST -- the file://-safe path (fetch
+       of local JSON is blocked over file://); same script-tag pattern as the
+       rest of the interface's data files. -->
+  <script src="../outputs/gpkg/Cagliari/hatch/manifest.js"></script>
+  <script src="hatch_grid_static.js"></script>
+</head>
+<body>
+  <h1>hatch_grid_static standalone test</h1>
+  <p>Loads the real, pipeline-generated PNGs from
+     <code>../outputs/gpkg/Cagliari/hatch/</code> (run
+     <code>python3 rebuild_qgis_output.py</code> first if that folder is
+     missing). Works over <code>file://</code> — just double-click this file.
+     Switch capability below and confirm each one renders in the correct
+     place over Cagliari, and that the hatch lines scale together with the
+     map (constant line count per hexagon) instead of re-rendering, at every
+     zoom level.</p>
+  <div class="controls">
+    <button data-cap="care">care</button>
+    <button data-cap="nutrition">nutrition</button>
+    <button data-cap="restorativeness">restorativeness</button>
+  </div>
+  <div id="map"></div>
+  <script>
+    var map = new ol.Map({
+      target: 'map',
+      layers: [new ol.layer.Tile({ source: new ol.source.OSM() })],
+      view: new ol.View({ center: ol.proj.fromLonLat([9.11, 39.22]), zoom: 13 })
+    });
+
+    window.makeHatchGridImageLayers(
+      '../outputs/gpkg/Cagliari/hatch/manifest.json',
+      '../outputs/gpkg/Cagliari/hatch/'
+    ).then(function (layers) {
+      Object.keys(layers).forEach(function (cap) { map.addLayer(layers[cap]); });
+      window.setHatchCapability(layers, 'care');
+      document.querySelector('button[data-cap="care"]').classList.add('active');
+
+      document.querySelectorAll('button[data-cap]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          window.setHatchCapability(layers, btn.dataset.cap);
+          document.querySelectorAll('button[data-cap]').forEach(function (b) { b.classList.remove('active'); });
+          btn.classList.add('active');
+        });
+      });
+    }).catch(function (e) {
+      document.getElementById('map').textContent = 'ERROR: ' + e.message;
+    });
+  </script>
+</body>
+</html>

@@ -270,6 +270,13 @@ gtfs/**/*.mapdb.p
 hs_err_pid*.log
 _hexout.txt
 
+# Generated web-interface exports (qgis2web output; not version-controlled)
+interfaccia/
+interfaccia_test/
+
+# Pipeline outputs — regenerable, kept out of git entirely
+outputs/
+
 # Large generated POI export artifacts (exceed GitHub's 100MB limit)
 /pois_used.gpkg
 outputs/poi_exports/

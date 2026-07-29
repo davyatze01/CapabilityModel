@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Cagliari hatch grid: millimetre (screen-constant) hatch</title>
+  <link rel="stylesheet" href="../interfaccia/resources/ol.css">
+  <style>
+    body { font-family: monospace; margin: 20px; }
+    .layout { display: flex; gap: 20px; align-items: flex-start; }
+    #map { width: 900px; height: 700px; border: 1px solid #999; }
+    .side { width: 240px; }
+    select, button { font: inherit; padding: 4px 8px; }
+    #status { color: #666; margin: 8px 0; }
+    label { display: block; margin: 8px 0 4px; }
+    #legend { border: 1px solid #ccc; padding: 10px; }
+    #legend .title { text-align: center; margin-bottom: 8px; }
+    .legend-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+    .legend-row canvas { border: 1px solid #000; background: #fff; flex: 0 0 auto; }
+  </style>
+  <script src="../interfaccia/resources/ol.js"></script>
+  <script src="hatch_grid_style.js"></script>
+  <script src="cagliari_hex_grid_demo_data.js"></script>
+</head>
+<body>
+  <h1>Cagliari hatch grid: millimetre (screen-constant) hatch</h1>
+  <p>The real 2,180-hexagon Cagliari capability grid (from
+     <code>outputs/gpkg/Cagliari/Cagliari_hex.csv</code>), reconstructed
+     client-side from <code>grid_params.json</code>, rendered live with
+     <code>makeHatchGridStyleMM</code>: a 45&deg; line hatch whose spacing and
+     width are set in <b>millimetres</b> (Very Low 9.5 &rarr; Very High 1.5 mm
+     spacing in 2 mm steps, with a progressive 0.1 &rarr; 0.5 mm line in 0.1 mm
+     steps). Because mm is a screen unit, the pattern
+     looks <b>identical at every zoom</b> (more stripes just fall inside a
+     hexagon as it grows) &mdash; and the legend on the right stays a FIXED
+     size (so it drops into interfaccia's fixed legend slot) but redraws on
+     zoom to show exactly how many hatch lines a cell of each level actually
+     contains right now, scaled to fit the box.
+     It's implemented as an OpenLayers <code>CanvasPattern</code> fill (a plain
+     cached fill, not a per-feature custom renderer), which is the stable,
+     flicker-free path &mdash; the reason earlier vector attempts were dropped
+     for a PNG. Works over <code>file://</code>, just open this file directly.</p>
+
+  <label>Capability / service:
+    <select id="capability-select"></select>
+  </label>
+  <span id="status"></span>
+
+  <div class="layout">
+    <div id="map"></div>
+    <div class="side">
+      <div id="legend">
+        <div class="title">Capability Level</div>
+        <div id="legend-rows"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    var gp = window.CAGLIARI_HEX_GRID_PARAMS;
+    var rows = window.CAGLIARI_HEX_ROWS;
+    var fields = window.CAGLIARI_CAPABILITY_FIELDS;
+    var C = window.HATCH_GRID_CONSTANTS;
+    var M_PER_DEG_LAT = 111320.0;
+    var hexRadiusM = gp.cell_size_m / Math.cos(Math.PI / 6);
+    var xStep = 1.5 * hexRadiusM;
+    var yStep = Math.sqrt(3) * hexRadiusM;
+
+    function hexRingLonLat(cxM, cyM) {
+      var ring = [];
+      for (var i = 0; i < 6; i++) {
+        var angle = (Math.PI / 180) * (60 * i);
+        var xM = cxM + hexRadiusM * Math.cos(angle);
+        var yM = cyM + hexRadiusM * Math.sin(angle);
+        ring.push([xM / gp.m_per_deg_lon, yM / M_PER_DEG_LAT]);
+      }
+      ring.push(ring[0]);
+      return ring;
+    }
+
+    // hex_id "H{col:04d}_{row:04d}" -> same col/row tiling as context.py's
+    // _hex_grid_sample_nodes (verified to reproduce the real gpkg geometry).
+    function centroidForHexId(hexId) {
+      var m = /^H(\d{4})_(\d{4})$/.exec(hexId);
+      if (!m) return null;
+      var col = parseInt(m[1], 10);
+      var row = parseInt(m[2], 10);
+      var cxM = gp.min_x - hexRadiusM + col * xStep;
+      var yOffset = (col % 2 === 0) ? 0 : yStep / 2;
+      var cyM = gp.min_y - yStep + yOffset + row * yStep;
+      return [cxM, cyM];
+    }
+
+    var features = [];
+    var skipped = 0;
+    rows.forEach(function (row) {
+      var c = centroidForHexId(row.hex_id);
+      if (!c) { skipped++; return; }
+      var ring3857 = hexRingLonLat(c[0], c[1]).map(function (ll) { return ol.proj.fromLonLat(ll); });
+      var f = new ol.Feature({ geometry: new ol.geom.Polygon([ring3857]) });
+      fields.forEach(function (fn) { f.set(fn, row[fn]); });
+      f.set('hex_id', row.hex_id);
+      features.push(f);
+    });
+
+    var select = document.getElementById('capability-select');
+    fields.forEach(function (fn) {
+      var opt = document.createElement('option');
+      opt.value = fn;
+      opt.textContent = fn.replace(/^grid_mean_/, '');
+      select.appendChild(opt);
+    });
+    select.value = 'grid_mean_care';
+
+    var selectedField = select.value;
+    var source = new ol.source.Vector({ features: features });
+    var layer = new ol.layer.Vector({
+      source: source,
+      style: window.makeHatchGridStyleMM(
+        function (feature) { return feature.get(selectedField); },
+        null
+      )
+    });
+
+    var extent = source.getExtent();
+    var map = new ol.Map({
+      target: 'map',
+      layers: [new ol.layer.Tile({ source: new ol.source.OSM() }), layer],
+      view: new ol.View({ center: ol.extent.getCenter(extent), zoom: 13 })
+    });
+    map.getView().fit(extent, { padding: [20, 20, 20, 20] });
+
+    select.addEventListener('change', function () {
+      selectedField = select.value;
+      layer.setStyle(window.makeHatchGridStyleMM(
+        function (feature) { return feature.get(selectedField); },
+        null
+      ));
+    });
+
+    // ---- Dynamic legend in a FIXED footprint --------------------------------
+    // Each swatch is a fixed-size (never-growing) hexagon showing ONE whole cell
+    // of that level, fit to the box. It's dynamic in the way that matters: the
+    // number of hatch lines drawn = how many lines a real cell actually contains
+    // at the current zoom (lines-per-cell = on-screen cell width / mm spacing),
+    // so as you zoom in the swatches fill with more lines -- the same reading the
+    // map gives -- WITHOUT the box changing size. That keeps it droppable into
+    // interfaccia's fixed 120x180 legend slot (a growing preview couldn't fit).
+    var pr = window.devicePixelRatio || 1;
+    var LEGEND_BOX_CSS = 48;                 // fixed; sized to fit a 120x180 slot
+    var S = Math.round(LEGEND_BOX_CSS * pr);
+    var legendRows = document.getElementById('legend-rows');
+    var legendCanvases = [];
+    for (var ci = C.ELECTRE_LABELS.length - 1; ci >= 0; ci--) {
+      (function (cls) {
+        var row = document.createElement('div');
+        row.className = 'legend-row';
+        var cv = document.createElement('canvas');
+        cv.width = S; cv.height = S;
+        cv.style.width = LEGEND_BOX_CSS + 'px';
+        cv.style.height = LEGEND_BOX_CSS + 'px';
+        legendCanvases[cls] = cv;
+        var lbl = document.createElement('span');
+        lbl.textContent = C.ELECTRE_LABELS[cls];
+        row.appendChild(cv);
+        row.appendChild(lbl);
+        legendRows.appendChild(row);
+      })(ci);
+    }
+
+    // On-screen width of one hexagon at the current zoom (feature 3857 extent /
+    // view resolution).
+    function currentHexPxCss() {
+      var ext = features[0].getGeometry().getExtent();
+      return (ext[2] - ext[0]) / map.getView().getResolution();
+    }
+
+    function redrawLegend() {
+      var hexPx = currentHexPxCss();
+      for (var cls = 0; cls < C.ELECTRE_LABELS.length; cls++) {
+        var spacingMapCss = C.HATCH_SPACING_MM[cls] * C.PX_PER_MM; // map's screen spacing
+        // Lines a real cell holds right now; >=1 so the swatch is never blank.
+        var n = Math.max(1, Math.round(hexPx / spacingMapCss));
+        // Fit that many lines into the fixed box, preserving the cell's coverage
+        // ratio (width/spacing) so the swatch reads at the right ink density.
+        var boxSpacingDev = S / n;
+        var coverage = C.HATCH_WIDTH_MM[cls] / C.HATCH_SPACING_MM[cls];
+        var boxWidthDev = boxSpacingDev * coverage;
+        var outlineDev = C.OUTLINE_WIDTH_MM * C.PX_PER_MM * pr;
+        window.drawHatchLegendHexCell(legendCanvases[cls], boxSpacingDev, boxWidthDev, outlineDev);
+      }
+    }
+
+    map.on('moveend', redrawLegend);
+    map.getView().on('change:resolution', redrawLegend);
+    redrawLegend();
+
+    document.getElementById('status').textContent =
+      features.length + ' hexagons rendered' + (skipped ? (', ' + skipped + ' skipped (bad hex_id)') : '') +
+      '. Zoom in/out: swatches keep a fixed size but fill with the number of lines a real cell has at the current zoom.';
+  </script>
+</body>
+</html>
