@@ -3,13 +3,18 @@ import math
 import os
 import json
 import hashlib
+from collections import OrderedDict
 from typing import Hashable, TypeGuard, cast
 import networkx as nx
 from shapely.geometry.base import BaseGeometry
 import logging
-import walkability
-from config import PipelineConfig
+import plotting.walkability as walkability
+from core.config import PipelineConfig
 logger = logging.getLogger(__name__)
+
+# Shared with graphml's walk CSR wscore placeholder -- see WALK_EDGE_DEFAULT_SCORE's
+# docstring and the comment in accessibility_non_bus_from_snap_map's w_i assignment.
+DEFAULT_WALK_SCORE = graphml.WALK_EDGE_DEFAULT_SCORE
 
 # Kept because main.py uses this in-memory geometry cache while building snap maps.
 POI_GEOM_CACHE_FOLDER = "poi_geom_cache"
@@ -18,7 +23,6 @@ os.makedirs(POI_GEOM_CACHE_FOLDER, exist_ok=True)
 _POI_GEOM_CACHE = {}  # key: (feature, value) -> list geometries
 _MODE_GRAPH_CACHE = {}  # key: network_type -> graph
 _MODE_LENGTHS_CACHE = {}  # key: (origin, network_type, radius_key) -> dict node->distance
-_MODE_PRED_CACHE = {}  # key: (origin, network_type, radius_key) -> dict node->predecessor list (walk only)
 
 # When True, edge `geometry` is dropped from mode graphs right after load to slash
 # per-worker RAM. Only safe in worker processes: the walkability signature is
@@ -26,8 +30,52 @@ _MODE_PRED_CACHE = {}  # key: (origin, network_type, radius_key) -> dict node->p
 # is never read again. The parent process (which builds that index) must keep it.
 _STRIP_GRAPH_GEOMETRY = False
 _MODE_NODE_KDTREE = {}  # key: network_type -> (cKDTree over projected (x,y) meters, node_id ndarray)
-_COORD_NODE_MEMO = {}  # key: (network_type, round(lat,6), round(lon,6)) -> nearest node id
-_NODE_IDX_MEMO = {}  # key: (network_type, round(lat,6), round(lon,6)) -> full-graph CSR node index
+
+
+class _BoundedMemo(OrderedDict):
+    """Insertion-ordered dict capped at `maxsize`, evicting oldest entries (FIFO).
+
+    `_COORD_NODE_MEMO`/`_NODE_IDX_MEMO` below are process-lifetime caches (only
+    `_MODE_LENGTHS_CACHE` is cleared per origin in `reset_origin_caches`), keyed by
+    rounded POI coordinates. A single Paris origin can pull in over a million distinct
+    POI-coordinate lookups, so an unbounded plain dict grows without limit across a
+    worker's life -- a contributor to the OOM kills of 2026-07-15/16. A fixed cap keeps
+    it bounded, in line with this repo's fail-fast/bounded-resource preference.
+
+    CRITICAL: eviction MUST be O(1). The first version subclassed `dict` and evicted
+    via `next(iter(self))` + `del`. On a dict where the front entry is repeatedly
+    deleted and new keys appended, the internal table fills with tombstones at the
+    front, so `iter()` scans past all of them to reach the first live key -- making
+    each eviction O(n). With the cap far below one origin's working set the cache was
+    permanently full (100% evict-on-insert), and this O(n) scan measured as 262s of a
+    413s / 4-origin profile (63% of total runtime, 2026-07-16). `OrderedDict.popitem(
+    last=False)` pops the oldest in O(1) with no tombstone scan, eliminating that cost.
+    """
+
+    def __init__(self, maxsize: int):
+        super().__init__()
+        self._maxsize = maxsize
+
+    def __setitem__(self, key, value):
+        if key in self:
+            super().__setitem__(key, value)
+            return
+        if len(self) >= self._maxsize:
+            self.popitem(last=False)  # O(1) FIFO eviction, no tombstone scan
+        super().__setitem__(key, value)
+
+
+# Memory-vs-hit-rate knob. Now that eviction is O(1) (see _BoundedMemo) a cache miss
+# just costs one cheap KD-tree query (profiled at ~1.9s self / 5.6M calls even near the
+# thrash regime) instead of the old O(n) cliff, so this can stay modest to protect
+# memory. At ~196 bytes/entry (tracemalloc, 2026-07-16) 1M entries is ~196MB/cache, so
+# ~0.4GB for both caches per worker -- small enough to run ~16-24 concurrent workers
+# under the 45G cap alongside the ~1.8GB/origin transient working set (the real memory
+# driver, bounded separately via non_bus_max_workers). Raise only if a fresh profile
+# shows _snap_node_idx re-climbing due to cross-origin misses at this cap.
+_MEMO_CACHE_MAXSIZE = 1_000_000
+_COORD_NODE_MEMO = _BoundedMemo(_MEMO_CACHE_MAXSIZE)  # key: (network_type, round(lat,6), round(lon,6)) -> nearest node id
+_NODE_IDX_MEMO = _BoundedMemo(_MEMO_CACHE_MAXSIZE)  # key: (network_type, round(lat,6), round(lon,6)) -> full-graph CSR node index
 _WALK_EDGE_SCORES_CACHE: dict[str, dict[tuple[int, int, int], float]] = {}
 _WALK_GRAPH_SIG_BY_OBJID: dict[int, str] = {}
 _WALK_GRAPH_SIG_OVERRIDE: str | None = None
@@ -202,13 +250,12 @@ def _strip_edge_geometry(graph) -> None:
 def reset_origin_caches() -> None:
     """Clear per-origin shortest-path caches between origin nodes.
 
-    `_MODE_LENGTHS_CACHE`/`_MODE_PRED_CACHE` only ever need the origin currently
-    being processed (all POI queries for one origin share the same key). Clearing
-    them per origin caps a worker's memory at one origin's data instead of letting
-    it grow without bound across every origin the worker handles.
+    `_MODE_LENGTHS_CACHE` only ever needs the origin currently being processed (all
+    POI queries for one origin share the same key). Clearing it per origin caps a
+    worker's memory at one origin's data instead of letting it grow without bound
+    across every origin the worker handles.
     """
     _MODE_LENGTHS_CACHE.clear()
-    _MODE_PRED_CACHE.clear()
 
 
 def _reconstruct_path(pred, origin_node, target_node):
@@ -426,8 +473,16 @@ def _get_mode_lengths_and_paths(origin, network_type, radius_m, origin_idx=None,
 
     Outputs:
     - tuple `(dist, pred, origin_idx)` where `dist` is a numpy array node_index ->
-      distance in meters (`inf` when unreachable/beyond cutoff), and `pred` is the
-      scipy predecessor array for path reconstruction (walk only; `None` otherwise).
+      distance in meters (`inf` when unreachable/beyond cutoff). `pred` is always
+      `None` -- predecessor arrays (for path reconstruction) are not computed. They
+      used to feed per-path walkability averaging (see the `w_i` comment in
+      `accessibility_non_bus_from_snap_map`), which is currently disabled because
+      every edge's walkability score is a flat placeholder constant (see
+      `graphml._build_mode_csr_streaming`'s `wscore`), making path-dependent
+      averaging a no-op that nonetheless cost ~94% of a Paris origin's routing time
+      (profiled 2026-07-15: 523 of 555s/origin in path reconstruction + averaging).
+      Re-enable `return_predecessors=True` here if real per-edge walkability data is
+      ever wired into `wscore`.
       Cached per origin index until `reset_origin_caches`.
     """
     import numpy as np
@@ -440,26 +495,19 @@ def _get_mode_lengths_and_paths(origin, network_type, radius_m, origin_idx=None,
     radius_key = "all" if radius_m is None else f"r{int(radius_m)}"
     cutoff_key = "all" if cutoff_m is None else f"c{int(cutoff_m)}"
     key = (int(origin_idx), network_type, radius_key, cutoff_key)
-    if key in _MODE_LENGTHS_CACHE and key in _MODE_PRED_CACHE:
-        return (_MODE_LENGTHS_CACHE[key], _MODE_PRED_CACHE[key], origin_idx)
+    if key in _MODE_LENGTHS_CACHE:
+        return (_MODE_LENGTHS_CACHE[key], None, origin_idx)
 
     limit = np.inf if cutoff_m is None else float(cutoff_m)
-    want_pred = network_type == "walk"
-    out = dijkstra(
+    dist = dijkstra(
         bundle["mat"],
         directed=True,
         indices=int(origin_idx),
         limit=limit,
-        return_predecessors=want_pred,
+        return_predecessors=False,
     )
-    if want_pred:
-        dist, pred = out
-    else:
-        dist = out
-        pred = None
     _MODE_LENGTHS_CACHE[key] = dist
-    _MODE_PRED_CACHE[key] = pred
-    return (dist, pred, origin_idx)
+    return (dist, None, origin_idx)
 
 
 def build_rra(decay_walk, decay_bike, decay_drive, decay_bus, decay_subway=None):
@@ -556,9 +604,16 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
     _feature, _value, _tags = _resolve_query(poi_type, feature, tags)
 
     mode_infos = poi_snap_info_by_mode or {}
+    # Individual-profile runs narrow the routed non-bus modes (e.g. walk-only for someone with
+    # no car/bike, walk+drive for a car owner). Baseline keeps all three. Disabled modes are
+    # simply never routed here, so their impedance arrays stay empty/None downstream.
+    enabled_modes = tuple(
+        m for m in ("walk", "bike", "drive")
+        if m in getattr(config, "enabled_non_bus_modes", ("walk", "bike", "drive"))
+    )
     source_keys_seen = set()
     source_items: list[dict[str, object]] = []
-    for mode in ("walk", "bike", "drive"):
+    for mode in enabled_modes:
         info = mode_infos.get(mode) or {}
         for src_key, src_info in info.items():
             if src_key in source_keys_seen:
@@ -600,12 +655,7 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
         cutoff_m = float(radius_m) * float(getattr(config, "non_bus_dijkstra_detour_factor", 1.6))
 
     mode_distances = {}
-    walk_pred = None
-    walk_origin_idx = None
-    walk_bundle = None
-    walk_paths_scores = []
-    walk_poi_idxs: list = []
-    for mode in ("walk", "bike", "drive"):
+    for mode in enabled_modes:
         info = mode_infos.get(mode) or {}
         chosen_coords = []
         for item in source_items:
@@ -623,7 +673,7 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
                 for coord in chosen_coords
             ]
 
-            dist, pred, _ = _get_mode_lengths_and_paths(
+            dist, _pred, _ = _get_mode_lengths_and_paths(
                 origine, mode, radius_m, origin_idx=origin_idx, cfg=config, cutoff_m=cutoff_m
             )
 
@@ -635,12 +685,6 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
                 leg.append(float(d) if math.isfinite(d) else None)
             mode_distances[mode] = leg
 
-            if mode == "walk":
-                walk_pred = pred
-                walk_origin_idx = origin_idx
-                walk_bundle = graphml.get_mode_csr(mode, config)
-                walk_poi_idxs = poi_idxs
-
         except (KeyError, ValueError, TypeError, IndexError, MemoryError) as exc:
             logger.warning("Non-bus routing fallback: mode=%s origin=%s reason=%s", mode, origine, exc)
             mode_distances[mode] = [None] * len(source_items)
@@ -648,24 +692,27 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
     imp_walk = []
     imp_bike = []
     imp_drive = []
+    walk_distances = mode_distances.get("walk", [None] * len(source_items))
+    walk_paths_scores: list = []
 
     for i in range(len(source_items)):
         iw = ib = idr = None
 
-        # Walkability score of the origin->POI walk path, read straight from the CSR
-        # length/score arrays (no NetworkX graph needed in the worker).
-        w_i = None
-        if (
-            walk_bundle is not None
-            and walk_pred is not None
-            and i < len(walk_poi_idxs)
-        ):
-            path_idx = _reconstruct_path_idx(walk_pred, walk_origin_idx, walk_poi_idxs[i])
-            if path_idx and len(path_idx) >= 2:
-                w_i = _csr_path_walkability(walk_bundle, path_idx)
+        # Walkability score of the origin->POI walk path. Real per-edge walkability
+        # isn't wired into the CSR yet -- every edge carries the same placeholder
+        # score (WALK_EDGE_DEFAULT_SCORE in utils/graphml.py), so the length-weighted
+        # average along ANY path is provably always that same constant. Reconstructing
+        # the actual path node-by-node and averaging it (the old behaviour) therefore
+        # never changed the result, yet profiled at ~94% of a Paris origin's routing
+        # time (523 of 555s/origin, 2026-07-15) because some queries have hundreds of
+        # thousands of in-radius POIs. Assign the constant directly instead. Swap this
+        # back to reconstruct-and-average (see git history of this function, or
+        # `_reconstruct_path_idx`/`_csr_path_walkability`) once real per-edge
+        # walkability data is wired into `wscore`.
+        w_i = DEFAULT_WALK_SCORE if walk_distances[i] is not None else None
         walk_paths_scores.append(w_i)
 
-        for mode in ("walk", "bike", "drive"):
+        for mode in enabled_modes:
             dist_m = mode_distances[mode][i]
             if dist_m is None:
                 continue

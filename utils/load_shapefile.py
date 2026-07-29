@@ -6,7 +6,7 @@ import os
 
 from shapely.geometry import Polygon, MultiPolygon
 from shapely.geometry.base import BaseGeometry
-from config import PipelineConfig
+from core.config import PipelineConfig
 
 
 _UNUSED_POI_TYPES_WARNED: set[tuple[str, tuple[str, ...]]] = set()

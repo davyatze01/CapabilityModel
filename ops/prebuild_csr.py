@@ -36,7 +36,7 @@ os.chdir(_PROJECT_ROOT)
 
 # run_runtime_setup must run before numpy/osmnx are imported (it caps native math
 # threads), so import the stage modules only after calling it inside main().
-from runtime_setup import run_runtime_setup  # noqa: E402
+from core.runtime_setup import run_runtime_setup  # noqa: E402
 
 
 def main() -> None:
@@ -57,7 +57,7 @@ def main() -> None:
     run_runtime_setup()
 
     import shutup
-    from config import PipelineConfig
+    from core.config import PipelineConfig
     from utils import graphml
 
     shutup.please()

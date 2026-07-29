@@ -15,9 +15,16 @@ from typing import TypeAlias
 
 from utils.load_shapefile import poi_from_shp
 
-from config import PipelineConfig
+from core.config import PipelineConfig
 from utils.load_shapefile import graph_from_shapefile, feature_from_shapefile
 from utils.poi_identity import build_poi_source_key
+
+# Placeholder per-edge walkability score used until real OSM-derived walkability
+# data is wired into the walk CSR's `wscore` array. Every walk edge currently gets
+# this same constant (see `_build_mode_csr_streaming`), and `utils.delta_g` reuses
+# it directly as the walk-path score instead of reconstructing and averaging paths
+# that are guaranteed to all average out to this same value.
+WALK_EDGE_DEFAULT_SCORE: float = 5.0
 
 TagValue: TypeAlias = bool | str | list[str]
 TagClause: TypeAlias = dict[str, TagValue]
@@ -271,7 +278,7 @@ def _build_mode_csr_streaming(
     indptr = mat.indptr.astype(np.int64)
     indices = mat.indices.astype(np.int64)
     length = mat.data.astype(float)
-    wscore = np.full(length.shape, 5.0, dtype=float) if network_type == "walk" else None
+    wscore = np.full(length.shape, WALK_EDGE_DEFAULT_SCORE, dtype=float) if network_type == "walk" else None
 
     mean_lat_rad = math.radians(float(snap_y.mean())) if snap_y.size else 0.0
     m_per_deg_lat = 111320.0

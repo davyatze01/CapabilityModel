@@ -3,12 +3,13 @@ import os
 import sys
 import traceback
 
-from runtime_setup import run_runtime_setup
+import core.notify as notify
+from core.runtime_setup import run_runtime_setup
 
 faulthandler.enable(all_threads=True)
 
 # Change this to "paris" to switch the whole pipeline to Paris.
-study_city = "cagliari"
+study_city = "paris"
 
 # ── Execution knobs (edit here instead of setting environment variables) ──────────────
 # SAFE_MODE: gentle execution to avoid pinning the machine at full load — caps native math
@@ -24,6 +25,12 @@ WORKER_COUNT = None
 #   from a shipped impedances.npz who only need to inspect results in QGIS.
 #   Also settable without editing this file: CAP_LIGHT_OUTPUT=1 python main.py
 LIGHT_OUTPUT = False
+# NOTIFY_CRASH: send a Telegram message when the run stops for ANY reason — unhandled
+#   exception, Ctrl+C, OOM/cgroup SIGKILL, hard crash, terminal dying — plus one on a clean
+#   finish. Uses a detached watchdog process (outside the run_safe.sh cgroup) so even a
+#   SIGKILL of the pipeline gets reported. Needs notify_config.json (gitignored) with the
+#   bot token and chat id; setup steps and a --test command are documented in notify.py.
+NOTIFY_CRASH = True
 
 
 def _reexec_under_run_safe_if_needed() -> None:
@@ -48,7 +55,7 @@ def _reexec_under_run_safe_if_needed() -> None:
         return
 
     root = os.path.dirname(os.path.abspath(__file__))
-    run_safe = os.path.join(root, "run_safe.sh")
+    run_safe = os.path.join(root, "scripts", "run_safe.sh")
     if not os.path.isfile(run_safe):
         print(f"[Safe mode] run_safe.sh not found at {run_safe}; continuing without cgroup.", flush=True)
         return
@@ -73,6 +80,11 @@ def main():
     """Run the full capability pipeline end-to-end and print generated output paths."""
     _reexec_under_run_safe_if_needed()
 
+    # Arm AFTER the re-exec so the watchdog tracks the real (scoped) pipeline process,
+    # not the pre-exec launcher. Fails fast here if notify_config.json is missing/broken.
+    if NOTIFY_CRASH:
+        notify.install_crash_notifier(f"capability pipeline ({study_city})")
+
     # Translate the script knobs into the env vars the runtime/stages read. Must happen
     # before run_runtime_setup() so the math-thread caps take effect before numpy is imported
     # (and propagate to spawned workers via inherited environment).
@@ -85,18 +97,18 @@ def main():
     os.environ["CAP_STUDY_CITY"] = study_city
 
     import shutup
-    from config import PipelineConfig
+    from core.config import PipelineConfig
     
-    from context import build_context
-    from snapping_stage import run_snapping_stage
-    from public_transport_routing_stage import run_public_transport_routing_stage
-    from non_bus_routing_stage import run_non_bus_routing_stage
-    from accessibility_stage import run_accessibility_stage
-    from service_stage import run_service_stage
-    from capability_stage import run_capability_stage
-    from artifact_bundle import load_impedance_bundle, write_impedance_bundle
-    from poi_exports import generate_poi_exports
-    from pipeline_runner import generate_spatial_outputs
+    from core.context import build_context
+    from stages.snapping_stage import run_snapping_stage, load_snap_checkpoint, write_snap_checkpoint
+    from routing.public_transport_routing_stage import run_public_transport_routing_stage
+    from routing.non_bus_routing_stage import run_non_bus_routing_stage
+    from stages.accessibility_stage import run_accessibility_stage
+    from stages.service_stage import run_service_stage
+    from stages.capability_stage import run_capability_stage
+    from exports.artifact_bundle import load_impedance_bundle, write_impedance_bundle
+    from exports.poi_exports import generate_poi_exports
+    from core.pipeline_runner import generate_spatial_outputs
 
     shutup.please()
 
@@ -144,7 +156,15 @@ def main():
         print("[Stage] Snapping", flush=True)
         # In the snapping stage, each of the pois is snapped to the closest point of the corresponding network.
         # Pois that are lines or geometries are snapped to a candidate set of points and the closest to the origin is selected when performing routing.
-        snap = run_snapping_stage(ctx)
+        # A crash in a later stage (e.g. bus routing) leaves no impedance bundle, so this block
+        # re-runs from snapping. The snap checkpoint lets that restart skip the stage's uncached
+        # per-run work (POI dedup, radius filter, CSR loads) entirely.
+        snap = load_snap_checkpoint(ctx)
+        if snap is not None:
+            print("[Snap] Loaded snapping checkpoint; skipping snapping recompute.", flush=True)
+        else:
+            snap = run_snapping_stage(ctx)
+            write_snap_checkpoint(ctx, snap)
         total_poi_instances = sum(len(info) for info in snap.poi_bus_snap_info_by_type.values())
         print(
             f"[Pipeline] origins={len(ctx.nodes_with_coords)}  "
@@ -200,6 +220,14 @@ def main():
         print("[Stage] POI Export (post-routing)", flush=True)
         poi_exports = generate_poi_exports(ctx, snap=snap, non_bus=non_bus, acc=acc)
 
+        # generate_poi_exports only writes the provisional id-only hex_pois export;
+        # the powered + quantile-scaled per-POI sp/cp values come from the score
+        # report pass, which overwrites it. Without this the hex_pois store is
+        # id-only (see pipeline_runner.py, which runs both back to back).
+        print("[Stage] Score Report (hex_pois service/capability power)", flush=True)
+        from analysis.score_report import generate_score_report
+        generate_score_report(ctx=ctx)
+
     # Each poi type contributes to one or multiple services. Based on the accessibility to the poi types, we compute the opportunity for services.
     print("[Stage] Service Aggregation", flush=True)
     svc = run_service_stage(ctx, acc)
@@ -233,9 +261,20 @@ def main():
     if shapefile_path:
         print(f"[Done] Shapefile output: {shapefile_path}", flush=True)
 
+    if NOTIFY_CRASH:
+        notify.mark_success(f"Spatial output: {gpkg_path or shapefile_path}")
+
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        traceback.print_exc()
+        # Intentional Ctrl+C: stand the watchdog down, but don't send a message.
+        notify.mark_interrupted()
+        sys.exit(130)
     except BaseException:
         traceback.print_exc()
+        # No-op unless install_crash_notifier() already armed; the watchdog covers
+        # deaths this handler can't see (SIGKILL, terminal crash).
+        notify.notify_exception(traceback.format_exc())
         sys.exit(1)

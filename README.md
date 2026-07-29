@@ -30,13 +30,37 @@ At a high level, the data flow is:
 
 `config/context -> snapping -> bus routing + non-bus routing -> accessibility -> services -> capabilities -> outputs/*.csv`
 
+## Repository layout
+
+The code is organized into packages by role. `main.py` stays at the repo root as the
+single pipeline entry point; everything else lives under a package:
+
+| Path | Contents |
+|------|----------|
+| [`main.py`](main.py) | Pipeline entry point (`python main.py`). |
+| [`core/`](core/) | Configuration & orchestration: `config`, `context`, `pipeline_types`, `pipeline_runner`, `runtime_setup`, `notify`, `profiles`. |
+| [`stages/`](stages/) | Pipeline stages: `snapping_stage`, `service_stage`, `capability_stage`, `accessibility_stage`. |
+| [`routing/`](routing/) | Travel-time routing: `non_bus_routing_stage`, `public_transport_routing_stage`. |
+| [`exports/`](exports/) | POI / QGIS / legend exports and artifact bundling. |
+| [`analysis/`](analysis/) | Reports & experiments: `score_report`, `sensitivity_*`, `robustness_*`, `scenarios`, `run_cities`. |
+| [`plotting/`](plotting/) | Standalone plotting helpers. |
+| [`utils/`](utils/) | Shared library utilities (imported as `utils.*`). |
+| [`tools/`](tools/) | Debug / one-off tools (`debug_pipeline`, `inspect_hex_pois`, `qgis/`). |
+| [`scripts/`](scripts/) | Shell entry points (`run_safe.sh`, `run_detached.sh`, `turbo.sh`) and R helpers. |
+| [`docs/`](docs/) | LaTeX/Markdown documentation. |
+| [`archive/`](archive/) | Retired scripts, kept for reference only. |
+
+Run the pipeline with `python main.py` (or `./scripts/run_safe.sh`). The scripts inside
+packages are run as modules from the repo root, e.g. `python -m analysis.score_report`
+or `python -m analysis.sensitivity_report`.
+
 ## Core Entry Files
 
 ### [`main.py`](main.py)
 
 `main()` orchestrates the whole pipeline. It creates a `PipelineConfig`, builds a `PipelineContext`, runs six stages in sequence, and prints the output paths returned by the final stage.
 
-### [`config.py`](config.py)
+### [`config.py`](core/config.py)
 
 Defines `PipelineConfig`, which controls:
 
@@ -52,7 +76,7 @@ Important current defaults:
 - non-bus cache lives in `cache/non_bus`
 - POI snapping cache lives in `cache/poi_snap_cache`
 
-### [`context.py`](context.py)
+### [`context.py`](core/context.py)
 
 Builds the shared runtime context used by every stage:
 
@@ -63,7 +87,7 @@ Builds the shared runtime context used by every stage:
 - computes worker count
 - injects the service lists associated with each capability
 
-### [`pipeline_types.py`](pipeline_types.py)
+### [`pipeline_types.py`](core/pipeline_types.py)
 
 Defines the dataclasses passed between stages, such as:
 
@@ -133,7 +157,7 @@ The code uses `config/poi_types.csv` and `utils/capabilities.py` directly; this 
 
 ### 2. Snapping Stage
 
-Implemented in [`snapping_stage.py`](snapping_stage.py).
+Implemented in [`snapping_stage.py`](stages/snapping_stage.py).
 
 Goal: convert each POI geometry into one or more graph-aligned candidate nodes for later routing.
 
@@ -227,7 +251,7 @@ The stored route record includes:
 
 ### 4. Non-Bus Routing Stage
 
-Implemented in [`non_bus_routing_stage.py`](non_bus_routing_stage.py).
+Implemented in [`non_bus_routing_stage.py`](routing/non_bus_routing_stage.py).
 
 Goal: for every origin node, compute the walk/bike/drive accessibility ingredients needed later for each POI type.
 
@@ -276,7 +300,7 @@ This design avoids recomputing shortest-path work for unchanged nodes.
 
 ### 5. Accessibility Stage
 
-Implemented in [`accessibility_stage.py`](accessibility_stage.py).
+Implemented in [`accessibility_stage.py`](stages/accessibility_stage.py).
 
 Goal: combine non-bus modal decays with bus impedances, compute POI-level accessibility, and organize the result by service.
 
@@ -321,7 +345,7 @@ The output of this stage is one `AccessibilityNodeResult` per origin node, conta
 
 ### 6. Service Aggregation Stage
 
-Implemented in [`service_stage.py`](service_stage.py).
+Implemented in [`service_stage.py`](stages/service_stage.py).
 
 Goal: aggregate the accessibility values of all POI types that contribute to the same service.
 
@@ -336,7 +360,7 @@ This is the stage where multiple POI types such as `restaurant`, `fast_food`, an
 
 ### 7. Capability Aggregation Stage
 
-Implemented in [`capability_stage.py`](capability_stage.py).
+Implemented in [`capability_stage.py`](stages/capability_stage.py).
 
 Goal: aggregate service scores into final capability scores and write the final CSVs.
 
@@ -437,8 +461,8 @@ If you want to understand the repo quickly, start with:
 
 1. [`main.py`](main.py)
 2. [`config/poi_types.csv`](config/poi_types.csv)
-3. [`snapping_stage.py`](snapping_stage.py)
-4. [`non_bus_routing_stage.py`](non_bus_routing_stage.py)
-5. [`accessibility_stage.py`](accessibility_stage.py)
+3. [`snapping_stage.py`](stages/snapping_stage.py)
+4. [`non_bus_routing_stage.py`](routing/non_bus_routing_stage.py)
+5. [`accessibility_stage.py`](stages/accessibility_stage.py)
 
 

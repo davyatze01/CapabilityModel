@@ -24,7 +24,7 @@ from collections import Counter, OrderedDict
 from pathlib import Path
 from statistics import pstdev
 
-from config import ELECTRE_Q_FACTOR, ELECTRE_P_FACTOR
+from core.config import ELECTRE_Q_FACTOR, ELECTRE_P_FACTOR, ELECTRE_LAMBDA_CUT
 
 
 # Ordered service lists for each capability.
@@ -179,7 +179,7 @@ def electre_tri_details(x, capability):
         "q_factor": float(ELECTRE_Q_FACTOR),
         "p_factor": float(ELECTRE_P_FACTOR),
         "veto_threshold": float(v),
-        "lambda_cut": 0.7,
+        "lambda_cut": float(ELECTRE_LAMBDA_CUT),
         "boundaries": [],
     }
 
@@ -275,7 +275,7 @@ def electre_tri_details(x, capability):
                     term["adjusted_credibility"] = cred
                 discordance_terms.append(term)
 
-        outranks = cred >= 0.65
+        outranks = cred >= ELECTRE_LAMBDA_CUT
         if outranks:
             assigned_idx = k + 1
 
@@ -333,6 +333,60 @@ CAP_ELECTRE_W = {
     capability: {service: 1.0 / len(services) for service in services}
     for capability, services in CAPABILITY_SERVICES.items()
 }
+
+
+# ── Shared capability-grid visualization constants ───────────────────────────
+# Single source of truth for the map/legend styling, imported by
+# pipeline_runner.py (QGIS project + gpkg styling) and
+# generate_capability_legend.py (standalone legend PNGs). Kept here rather than
+# duplicated with "must stay in sync" comments so the two rendering paths can
+# never drift.
+
+# Signature color for each capability. Every service under a capability, the
+# capability grid itself, and its legend all use this one color.
+CAPABILITY_COLORS = {
+    "nutrition": "#FFA200",
+    "care": "#EB4CCC",
+    "restorativeness": "#006BFF",
+}
+
+# ELECTRE TRI class boundaries and human labels. Five classes over [0, 1].
+ELECTRE_BOUNDS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+ELECTRE_LABELS = [
+    "Very Low (0.0–0.2)",
+    "Low (0.2–0.4)",
+    "Medium (0.4–0.6)",
+    "High (0.6–0.8)",
+    "Very High (0.8–1.0)",
+]
+# Short names (no range), for compact legend rows / band categories.
+ELECTRE_SHORT_LABELS = ["Very Low", "Low", "Medium", "High", "Very High"]
+
+# Iso-band outline stroke widths (mm, QGIS symbol units), thin at Very Low up to
+# thick at Very High so the level reads from line weight alone. The capability
+# legend reuses these exact per-level widths for each swatch's outline.
+ISO_BAND_WIDTHS_MM = [0.3, 0.6, 0.9, 1.3, 1.8]
+
+# Interpolation stops (white -> capability color) used to derive the 5 discrete
+# per-level shades of a capability's color.
+CAPABILITY_SHADE_FRACTIONS = [0.2, 0.4, 0.6, 0.8, 1.0]
+
+
+def capability_shade_hexes(color_hex: str) -> list[str]:
+    """Return the 5 discrete shade hexes for one capability's color.
+
+    Each shade is a linear interpolation from white (t=0) to the capability's
+    signature color (t=1) evaluated at CAPABILITY_SHADE_FRACTIONS -- four
+    progressively deeper hues plus the full color at 1.0, one per ELECTRE class.
+    """
+    from matplotlib.colors import LinearSegmentedColormap
+
+    cmap = LinearSegmentedColormap.from_list("shade", ["white", color_hex])
+    hexes = []
+    for frac in CAPABILITY_SHADE_FRACTIONS:
+        r, g, b, _ = cmap(frac)
+        hexes.append("#{:02x}{:02x}{:02x}".format(round(r * 255), round(g * 255), round(b * 255)))
+    return hexes
 
 
 output_path = Path(__file__).resolve().parents[1] / "config" / "capability.csv"
