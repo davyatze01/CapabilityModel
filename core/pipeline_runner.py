@@ -233,8 +233,8 @@ def _build_qgis_project(cfg: PipelineConfig, gpkg_path: Path, qgis_exe: str) -> 
     grid_sidecar_literal = repr(str(grid_sidecar_path.resolve()))
     output_literal = repr(str(output_path.resolve()))
     iso_table_names_literal = repr(ISOBANDS_TABLE_NAMES)
-    iso_default_capability_literal = repr(str(cfg.qgis_autostyle_field).replace("capability_", ""))
-    basemap_flag = "True" if cfg.qgis_autostyle_basemap else "False"
+    iso_default_capability_literal = repr(str(cfg.default_capability).replace("capability_", ""))
+    basemap_flag = "True" if cfg.show_basemap else "False"
 
     # ── Per-service monochrome heatmap specs ────────────────────────────────────
     # Every service is colored using its *capability's* signature color, not a color
@@ -242,15 +242,16 @@ def _build_qgis_project(cfg: PipelineConfig, gpkg_path: Path, qgis_exe: str) -> 
     # services feeding "care" share the care color map, etc. This is computed once per
     # capability and reused for every service under it.
     from utils.capabilities import (
-        CAPABILITY_COLORS,
+        CAPABILITY_ENABLED,
         CAPABILITY_SERVICES,
         ELECTRE_BOUNDS,
         ELECTRE_LABELS,
         ISO_BAND_WIDTHS_MM,
         capability_shade_hexes,
+        get_capability_colors,
     )
 
-    capability_grid_colors = CAPABILITY_COLORS
+    capability_grid_colors = get_capability_colors(cfg)
 
     import json as _json_cfg
     service_labels: dict[str, str] = {}
@@ -300,6 +301,8 @@ def _build_qgis_project(cfg: PipelineConfig, gpkg_path: Path, qgis_exe: str) -> 
     # signature color. This replaces the old single diagonal-hatch grid layer.
     capability_grid_specs: list[dict[str, object]] = []
     for _capability, _services in CAPABILITY_SERVICES.items():
+        if not CAPABILITY_ENABLED.get(_capability, True):
+            continue
         _color_hex = capability_grid_colors.get(_capability)
         if not _color_hex:
             continue
@@ -943,8 +946,8 @@ def generate_spatial_outputs(cfg, cap):
             run_experiment_paths,
             output_path=gpkg_output_path,
             grid_enabled=cfg.qgis_grid_enabled,
-            grid_cell_size_m=cfg.qgis_grid_cell_size_m,
-            grid_capability_field=cfg.qgis_autostyle_field,
+            grid_cell_size_m=cfg.hexagon_radius,
+            grid_capability_field=cfg.default_capability,
             grid_max_cells=cfg.qgis_grid_max_cells,
             grid_fill_hull=cfg.qgis_grid_fill_hull,
             grid_hull_buffer_m=cfg.qgis_grid_hull_buffer_m,

@@ -1,4 +1,6 @@
+import ctypes
 import json
+import multiprocessing as mp
 import os
 import pickle
 import shutil
@@ -247,37 +249,12 @@ def _collect_poi_records() -> list[dict[str, Any]]:
     return export_rows
 
 
-def _build_poi_index(poi_rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    return {str(row["source_key"]): row for row in poi_rows}
-
-
-def _load_non_bus_payloads(ctx: PipelineContext, non_bus: NonBusRoutingStageResult) -> dict[Any, dict[str, Any]]:
-    """Load cached non-bus payloads for all known node ids.
-
-    Paths come from `non_bus.cache_paths` when available, otherwise they are derived directly
-    from `config.non_bus_cache_dir`. We avoid `_non_bus_cache_path`, whose module-global cache
-    dir is only initialized while `run_non_bus_routing_stage` runs — when the impedance bundle
-    is loaded that stage is skipped, but the per-node `.pkl` files written by the run that
-    created the bundle still exist on disk.
-    """
-    cache_dir = ctx.config.non_bus_cache_dir
-    out: dict[Any, dict[str, Any]] = {}
-    for node_id, _ in ctx.nodes_with_coords:
-        path = non_bus.cache_paths.get(node_id)
-        if path is None:
-            if not cache_dir:
-                continue
-            path = os.path.join(cache_dir, f"{node_id}.pkl")
-        if not os.path.exists(path):
-            continue
-        try:
-            with open(path, "rb") as f:
-                payload = pickle.load(f)
-        except Exception:
-            continue
-        if isinstance(payload, dict):
-            out[node_id] = payload
-    return out
+def _build_poi_index(poi_rows: list[dict[str, Any]]) -> dict[str, int]:
+    """source_key -> POI id only. `_stream_hexagon_export`'s hot loop never reads
+    anything else off a POI row, so holding the full row (geometry, json strings,
+    address...) per entry for the whole node loop would be pure waste at
+    hundreds-of-thousands-of-POIs scale."""
+    return {str(row["source_key"]): int(row["id"]) for row in poi_rows}
 
 
 def _poi_powers(
@@ -341,6 +318,94 @@ def _poi_powers(
     return service_power, capability_power
 
 
+try:
+    _LIBC = ctypes.CDLL("libc.so.6")
+except OSError:
+    _LIBC = None
+
+
+def _trim_export_memory() -> None:
+    """Return freed heap memory to the OS. See non_bus_routing_stage._trim_worker_memory
+    for the incident this mirrors: gc.collect() clears reference cycles (glibc can't
+    reclaim memory still reachable via one), then malloc_trim(0) asks glibc to release
+    now-free top-of-heap arenas back to the kernel. No-op off glibc Linux."""
+    gc.collect()
+    if _LIBC is not None:
+        try:
+            _LIBC.malloc_trim(0)
+        except Exception:
+            pass
+
+
+def _resolve_stream_tasks(
+    ctx: PipelineContext,
+    non_bus: NonBusRoutingStageResult,
+) -> list[tuple[str, str | None]]:
+    """Precompute (hex_id, non_bus_cache_path) per node in the main process (pure
+    dict/path lookups, no I/O), so workers don't each need `non_bus.cache_paths`."""
+    non_bus_cache_dir = ctx.config.non_bus_cache_dir
+    tasks: list[tuple[str, str | None]] = []
+    for node_id, data in ctx.nodes_with_coords:
+        hexagon_id = str(data.get("hex_id") or _normalize_scalar(node_id))
+        path = non_bus.cache_paths.get(node_id)
+        if path is None and non_bus_cache_dir:
+            path = os.path.join(non_bus_cache_dir, f"{node_id}.pkl")
+        tasks.append((hexagon_id, path))
+    return tasks
+
+
+# Populated in each worker process by _init_stream_worker (via Pool initargs, pickled
+# once per worker at pool startup, not per task).
+_WORKER_POI_INDEX: dict[str, int] = {}
+_STREAM_TRIM_EVERY_N_NODES = 20  # mirrors non_bus_routing_stage._TRIM_EVERY_N_ORIGINS
+_stream_trim_counter = 0  # per worker process
+
+
+def _init_stream_worker(poi_index: dict[str, int]) -> None:
+    global _WORKER_POI_INDEX
+    _WORKER_POI_INDEX = poi_index
+
+
+def _stream_node_worker(args: tuple[str, str | None]) -> tuple[str, list[int]] | None:
+    """Load one node's non-bus routing payload and return its hexagon's POI ids.
+
+    Each call unpickles one node's non-bus routing payload -- the same per-origin
+    cache non_bus_routing_stage.py warns can hit ~1.8GB for a dense origin
+    (2026-07-16 incident, see its _trim_worker_memory). That stage reclaims memory
+    every few origins because glibc/pymalloc doesn't reliably hand freed arenas back
+    to the OS mid-process, so RSS ratchets upward across iterations even though each
+    payload is logically dropped; this worker walks the exact same per-node pickles,
+    so it periodically reclaims the same way.
+    """
+    global _stream_trim_counter
+    hexagon_id, path = args
+    poi_seen: set[int] = set()
+
+    if path and os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                payload = pickle.load(f)
+            service_payload = payload.get("services", {}) if isinstance(payload, dict) else {}
+            for service in serv.SERVICE_KEYS:
+                for entry in service_payload.get(service, []):
+                    if not isinstance(entry, dict):
+                        continue
+                    for source_key_raw in entry.get("source_keys", []):
+                        poi_id = _WORKER_POI_INDEX.get(str(source_key_raw))
+                        if poi_id is not None:
+                            poi_seen.add(poi_id)
+        except Exception:
+            pass
+
+    _stream_trim_counter += 1
+    if _stream_trim_counter % _STREAM_TRIM_EVERY_N_NODES == 0:
+        _trim_export_memory()
+
+    if not poi_seen:
+        return None
+    return hexagon_id, sorted(poi_seen)
+
+
 def _stream_hexagon_export(
     poi_rows: list[dict[str, Any]],
     ctx: PipelineContext,
@@ -358,47 +423,56 @@ def _stream_hexagon_export(
     Score computation (sp/cp) is still omitted at this stage: it is produced
     by the separate post-pipeline pass (score_report.py), which overwrites
     this id-only export with the powered one.
+
+    Per-node work (unpickle one non-bus payload, pull out its source_keys) is
+    independent across nodes, so it's farmed out to a worker pool the same way
+    non_bus_routing_stage.py parallelizes the identical per-origin payload --
+    this loop was previously single-threaded and, at large-city node counts, was
+    the slow part of the export. Capped by non_bus_max_workers (not ctx.workers)
+    since this reads the exact same payload class that cap was tuned for, and
+    recycled via maxtasksperchild for the same reason. Only the main process
+    touches `writer` (shard part-file appends aren't safe to parallelize).
     """
     poi_index = _build_poi_index(poi_rows)
-    non_bus_cache_dir = ctx.config.non_bus_cache_dir
-    nodes = ctx.nodes_with_coords
-    total = len(nodes) if hasattr(nodes, "__len__") else None
+    tasks = _resolve_stream_tasks(ctx, non_bus)
+    total = len(tasks)
 
-    for idx, (node_id, data) in enumerate(nodes, start=1):
-        hexagon_id = data.get("hex_id") or _normalize_scalar(node_id)
-        poi_seen: set[int] = set()
+    pool_workers = max(1, min(ctx.workers, ctx.config.non_bus_max_workers, total or 1))
+    # Kept small (not total // (pool_workers*4)) so maxtasksperchild=200 below
+    # actually fires: maxtasksperchild counts chunks, not individual items, so
+    # a large chunksize can make it never trigger a worker recycle for the
+    # whole run -- see the 2026-08-07 OOM incident where chunksize=720 meant
+    # each worker only ever received ~4 chunk-jobs total. Mirrors
+    # accessibility_chunksize (core/config.py) for the same reason.
+    chunksize = 4
 
-        # Real per-origin reachability data (which POIs this specific node can
-        # actually reach), loaded on demand and discarded immediately so memory
-        # never scales with node count.
-        path = non_bus.cache_paths.get(node_id)
-        if path is None and non_bus_cache_dir:
-            path = os.path.join(non_bus_cache_dir, f"{node_id}.pkl")
-        if path and os.path.exists(path):
-            try:
-                with open(path, "rb") as f:
-                    payload = pickle.load(f)
-                service_payload = payload.get("services", {}) if isinstance(payload, dict) else {}
-                for service in serv.SERVICE_KEYS:
-                    for entry in service_payload.get(service, []):
-                        if not isinstance(entry, dict):
-                            continue
-                        for source_key_raw in entry.get("source_keys", []):
-                            poi_row = poi_index.get(str(source_key_raw))
-                            if poi_row is not None:
-                                poi_seen.add(int(poi_row["id"]))
-            except Exception:
-                pass
+    # Workers here only unpickle small non-bus payloads and look up ids in poi_index --
+    # never a NetworkX graph. But this runs inside the same long-lived main.py process
+    # that ran routing earlier, where the full mode graphs can still be cached. Forking
+    # without releasing them first inherits that multi-GB baseline copy-on-write, which
+    # becomes N private copies as workers touch pages -- see clear_mode_graph_cache's own
+    # docstring and non_bus_routing_stage's "Released full mode graphs before forking
+    # worker pool" for the incident this mirrors.
+    graphml.clear_mode_graph_cache()
 
-        if poi_seen:
-            writer.add_hexagon(str(hexagon_id), [{"i": pid} for pid in sorted(poi_seen)])
+    with mp.Pool(
+        processes=pool_workers,
+        maxtasksperchild=200,
+        initializer=_init_stream_worker,
+        initargs=(poi_index,),
+    ) as pool:
+        for idx, result in enumerate(pool.imap_unordered(_stream_node_worker, tasks, chunksize=chunksize), start=1):
+            if result is not None:
+                hexagon_id, poi_ids = result
+                writer.add_hexagon(hexagon_id, [{"i": pid} for pid in poi_ids])
 
-        if idx % 500 == 0 or (total is not None and idx == total):
-            print(
-                f"[POI Export] hexagon stream: {idx}/{total if total is not None else '?'} nodes, "
-                f"{writer.hex_count} hexagons written",
-                flush=True,
-            )
+            if idx % 500 == 0 or idx == total:
+                _trim_export_memory()
+                print(
+                    f"[POI Export] hexagon stream: {idx}/{total} nodes, "
+                    f"{writer.hex_count} hexagons written",
+                    flush=True,
+                )
 
     return writer.hex_count
 

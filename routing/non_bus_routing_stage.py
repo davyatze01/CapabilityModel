@@ -19,7 +19,6 @@ import psutil
 from core.context import PipelineContext
 from core.pipeline_types import SnappingStageResult, NonBusRoutingStageResult
 from utils import delta_g, graphml, services as serv
-from stages.snapping_stage import select_best_snap_candidate_for_origin, coord_key
 from core.config import PipelineConfig
 
 # Module-level reference so atexit/signal handlers can always reach the active pool.
@@ -75,8 +74,10 @@ if mp.parent_process() is None:
             pass
 
 _POI_RADIUS_LOGGED: set[str] = set()
-_POI_BUS_SNAP_INFO: dict[Any, Any] | None = None
-_POI_MODE_SNAP_INFO: dict[Any, Any] | None = None
+# Compact, numpy-backed snap bundle keyed by poi_key (see delta_g.build_snap_compact).
+# Replaces the old _POI_BUS_SNAP_INFO / _POI_MODE_SNAP_INFO nested dicts, which forked
+# workers faulted private (~1.4 GB each) via refcount writes while traversing them.
+_POI_SNAP_COMPACT: dict[Any, Any] | None = None
 _ORIGIN_NODES_BY_ID: dict[Any, Any] | None = None
 _NON_BUS_PROGRESS_VALUE: Any | None = None
 _POI_WORK_UNITS_BY_KEY: dict[Any, int] | None = None
@@ -206,8 +207,7 @@ def _has_valid_non_bus_cache(path):
 
 def _init_worker(
     pipeline_config = None,
-    poi_bus_snap_info_by_type=None,
-    poi_mode_snap_info_by_type=None,
+    snap_compact=None,
     non_bus_progress_value=None,
     non_bus_cache_dir: str = "",
     non_bus_cache_schema_version: int = 0,
@@ -218,8 +218,7 @@ def _init_worker(
     """Initialize worker state for non-bus multiprocessing stage.
 
     Inputs:
-    - poi_bus_snap_info_by_type: bus snap candidates keyed by POI key.
-    - poi_mode_snap_info_by_type: snap candidates split by mode and POI key.
+    - snap_compact: compact numpy-backed snap bundle keyed by poi_key (build_snap_compact).
     - non_bus_progress_value: shared progress counter.
     - non_bus_cache_dir: cache directory for node payloads.
     - non_bus_cache_schema_version: expected cache schema version.
@@ -227,7 +226,7 @@ def _init_worker(
     Outputs:
     - None. Populates worker globals and warm caches.
     """
-    global _POI_BUS_SNAP_INFO, _POI_MODE_SNAP_INFO, _NON_BUS_PROGRESS_VALUE, _POI_WORK_UNITS_BY_KEY
+    global _POI_SNAP_COMPACT, _NON_BUS_PROGRESS_VALUE, _POI_WORK_UNITS_BY_KEY
     global _NON_BUS_CACHE_DIR, _NON_BUS_CACHE_SCHEMA_VERSION, _NON_BUS_POI_CONFIG_SIGNATURE, _PIPELINE_CONFIG
     global _ORIGIN_NODES_BY_ID
     _PIPELINE_CONFIG = pipeline_config
@@ -235,11 +234,13 @@ def _init_worker(
     _NON_BUS_CACHE_DIR = non_bus_cache_dir or ""
     _NON_BUS_CACHE_SCHEMA_VERSION = int(non_bus_cache_schema_version)
     _NON_BUS_POI_CONFIG_SIGNATURE = str(non_bus_poi_config_signature or "")
-    _POI_BUS_SNAP_INFO = poi_bus_snap_info_by_type or {}
-    _POI_WORK_UNITS_BY_KEY = {}
-    for poi_key, snap_info_by_source in _POI_BUS_SNAP_INFO.items():
-        _POI_WORK_UNITS_BY_KEY[poi_key] = len(snap_info_by_source)
-    _POI_MODE_SNAP_INFO = poi_mode_snap_info_by_type or {}
+    _POI_SNAP_COMPACT = snap_compact or {}
+    # Work units per poi_key = number of source POIs (the old code used len of the bus
+    # snap dict, which is exactly the compact src_keys count).
+    _POI_WORK_UNITS_BY_KEY = {
+        poi_key: len(bundle.get("src_keys", ()))
+        for poi_key, bundle in _POI_SNAP_COMPACT.items()
+    }
     _NON_BUS_PROGRESS_VALUE = non_bus_progress_value
     # Graphs are loaded lazily from disk by each worker via delta_g._get_mode_graph.
     # Do NOT pass them via initargs — pickling large NetworkX graphs to N workers
@@ -322,11 +323,11 @@ def _process_node(node_item):
                 raise RuntimeError("Worker config not initialized")
             radius_m = serv.get_global_radius_m(cfg)
             try:
-                data = delta_g.accessibility_non_bus_from_snap_map(
+                nb = delta_g.accessibility_non_bus_from_snap_map(
                     cfg,
                     query.poi_type,
                     origin,
-                    (_POI_MODE_SNAP_INFO or {}).get(poi_key, {}),
+                    (_POI_SNAP_COMPACT or {}).get(poi_key, {}),
                     tags=query.tags,
                     radius_m=radius_m,
                     origin_nodes_by_mode=origin_nodes_by_mode,
@@ -336,40 +337,18 @@ def _process_node(node_item):
                     f"Non-bus routing failed for node_id={node_id}, poi_type={query.poi_type}, cause={exc!r}"
                 ) from exc
 
-            imp_walk = data["imp_walk"]
-            imp_bike = data["imp_bike"]
-            imp_drive = data["imp_drive"]
-            source_items = data.get("source_items", [])
-            if not source_items:
-                source_coords = data.get("source_coords", [])
-                source_items = [{"source_key": coord_key(coord), "source_coord": coord} for coord in source_coords]
-
-            poi_coords = []
-            poi_source_keys = []
-            poi_source_coords = []
-            snap_info_for_key = _POI_BUS_SNAP_INFO.get(poi_key, {}) if _POI_BUS_SNAP_INFO else {}
-            for item in source_items:
-                coord = tuple(item.get("source_coord", (0.0, 0.0)))
-                source_key = item.get("source_key")
-                if source_key is None:
-                    source_key = coord_key(coord)
-                snap_info = snap_info_for_key.get(source_key)
-                if snap_info is None:
-                    snap_info = snap_info_for_key.get(coord_key(coord))
-                snapped_coord, _ = select_best_snap_candidate_for_origin(origin, coord, snap_info)
-                poi_coords.append(snapped_coord)
-                poi_source_keys.append(source_key)
-                poi_source_coords.append(coord)
-
+            # poi_coords (origin-snapped bus destinations), source_keys and source_coords
+            # are now produced directly by accessibility_non_bus_from_snap_map from the
+            # compact snap bundle, so the old per-item bus-snap loop here is gone.
             entries.append({
                 "poi_type": query.poi_type,
-                "imp_walk": imp_walk,
-                "imp_bike": imp_bike,
-                "imp_drive": imp_drive,
-                "poi_coords": poi_coords,
-                "source_keys": poi_source_keys,
-                "source_coords": poi_source_coords,
-                "walk_path_scores" : data.get("walk_path_scores", [])
+                "imp_walk": nb["imp_walk"],
+                "imp_bike": nb["imp_bike"],
+                "imp_drive": nb["imp_drive"],
+                "poi_coords": nb["poi_coords"],
+                "source_keys": nb["source_keys"],
+                "source_coords": nb["source_coords"],
+                "walk_path_scores": nb.get("walk_path_scores", []),
             })
 
             if _NON_BUS_PROGRESS_VALUE is not None and _POI_WORK_UNITS_BY_KEY is not None:
@@ -379,14 +358,23 @@ def _process_node(node_item):
                         _NON_BUS_PROGRESS_VALUE.value += units
         service_results[service] = entries
 
-    _trim_worker_memory()
-    return {
+    payload = {
         "schema_version": _NON_BUS_CACHE_SCHEMA_VERSION,
         "poi_config_signature": _NON_BUS_POI_CONFIG_SIGNATURE,
         "node_id": node_id,
         "origin": origin,
         "services": service_results,
     }
+    # Write the cache here, in the worker, and return only the (tiny) node_id. Returning
+    # the full ~40 MB payload to the parent made the parent's imap result buffer balloon:
+    # once the routing rewrite made workers ~10x faster, they produced dense payloads far
+    # faster than the parent's single-threaded pickle+write could drain them, and the
+    # backlog spiked parent RSS past the 45 GB cap in under a second (2026-07-31). Writing
+    # in the worker keeps only one payload live per worker and parallelises the pickling.
+    _write_non_bus_cache(_non_bus_cache_path(node_id), payload)
+    del payload, service_results
+    _trim_worker_memory()
+    return node_id
 
 
 def run_non_bus_routing_stage(
@@ -474,6 +462,20 @@ def run_non_bus_routing_stage(
     gc.collect()
     print("[Non-bus] Released full mode graphs before forking worker pool.", flush=True)
 
+    # Collapse the nested per-mode snap dict (~1.4 GB of small Python objects, faulted
+    # private by every forked worker via refcount writes) into numpy-backed arrays that
+    # fork genuinely shares copy-on-write. Built once in the parent, right before the pool
+    # forks. The original nested dict is dropped so it isn't inherited too.
+    snap_compact = delta_g.build_snap_compact(snap.poi_mode_snap_info_by_type)
+    snap.poi_mode_snap_info_by_type = {}
+    snap.poi_bus_snap_info_by_type = {}
+    gc.collect()
+    print(
+        f"[Non-bus] Built compact snap bundle for {len(snap_compact)} poi_types "
+        f"(numpy arrays, shared across workers).",
+        flush=True,
+    )
+
     global_radius_m = serv.get_global_radius_m(_PIPELINE_CONFIG)
     if global_radius_m is not None:
         print(
@@ -485,7 +487,8 @@ def run_non_bus_routing_stage(
     for service in serv.SERVICE_KEYS:
         for query in serv.get_service_queries(service):
             poi_key = serv.query_key(query)
-            total_non_bus_pois += len(snap.poi_bus_snap_info_by_type.get(poi_key, {}))
+            bundle = snap_compact.get(poi_key)
+            total_non_bus_pois += len(bundle.get("src_keys", ())) if bundle else 0
     total_non_bus_tasks = len(ctx.nodes_with_coords) * total_non_bus_pois
     initial_done = cached_nodes * total_non_bus_pois
 
@@ -575,8 +578,7 @@ def run_non_bus_routing_stage(
                     initializer=_init_worker,
                     initargs=(
                         ctx.config,
-                        snap.poi_bus_snap_info_by_type,
-                        snap.poi_mode_snap_info_by_type,
+                        snap_compact,
                         shared_progress,
                         _PIPELINE_CONFIG.non_bus_cache_dir,
                         _PIPELINE_CONFIG.non_bus_cache_schema_version,
@@ -589,12 +591,11 @@ def run_non_bus_routing_stage(
                 _ACTIVE_NON_BUS_POOL = pool
                 pending_batch = list(pending_non_bus.items())
                 made_progress = False
-                for partial in pool.imap_unordered(_process_node, pending_batch, chunksize=20):
-                    if partial is None:
+                # Workers write their own cache file and return just the node_id, so the
+                # parent only tracks progress here -- no large payloads flow back.
+                for node_id in pool.imap_unordered(_process_node, pending_batch, chunksize=20):
+                    if node_id is None:
                         continue
-                    node_id = partial["node_id"]
-                    cache_path = _non_bus_cache_path(node_id)
-                    _write_non_bus_cache(cache_path, partial)
                     if node_id in pending_non_bus:
                         pending_non_bus.pop(node_id, None)
                         made_progress = True
@@ -624,8 +625,7 @@ def run_non_bus_routing_stage(
                     )
                     _init_worker(
                         ctx.config,
-                        snap.poi_bus_snap_info_by_type,
-                        snap.poi_mode_snap_info_by_type,
+                        snap_compact,
                         None,
                         _PIPELINE_CONFIG.non_bus_cache_dir,
                         _PIPELINE_CONFIG.non_bus_cache_schema_version,
@@ -635,12 +635,11 @@ def run_non_bus_routing_stage(
                     )
                     pending_batch = list(pending_non_bus.items())
                     for node_id, data in pending_batch:
-                        partial = _process_node((node_id, data))
-                        if partial is None:
+                        # _process_node writes the cache itself and returns the node_id.
+                        done_id = _process_node((node_id, data))
+                        if done_id is None:
                             continue
-                        cache_path = _non_bus_cache_path(node_id)
-                        _write_non_bus_cache(cache_path, partial)
-                        pending_non_bus.pop(node_id, None)
+                        pending_non_bus.pop(done_id, None)
                     break
                 non_bus_attempt += 1
                 if non_bus_attempt > _PIPELINE_CONFIG.pool_max_retries:

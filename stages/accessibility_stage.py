@@ -15,8 +15,7 @@ from core.pipeline_types import (
     AccessibilityStageResult,
     AccessibilityNodeResult,
 )
-from utils import delta_g, services as serv
-from utils.delta_g import _haversine_m
+from utils import delta_g, decay, services as serv
 import json
 import csv
 import numpy as np
@@ -67,12 +66,31 @@ _POI_RADIUS_DECAY_THRESHOLD: float = 0.05
 _POI_RADIUS_MAX_SPEED_KMH: float = 60.0
 _global_radius_m: float | None = None
 
+# Per-node sparse accessibility_by_poi is written to a compressed .npz right here in the
+# worker, as soon as it's computed, instead of being returned through IPC. That dict can
+# hold thousands of entries per node in dense areas (Paris), so shipping it to the main
+# process and only compressing it there meant every worker buffered the full uncompressed
+# payload for its entire chunk before anything was written or freed.
+_POI_BY_NODE_DIR: str = ""
+_SOURCE_KEY_TO_ID: dict[str, int] = {}
+
 # Individual-profile knobs (see profiles.py). Defaults reproduce the baseline universal
 # traveler exactly: every non-bus mode fused, per-POI utility multiplier u(y) = 1.0 for all POIs.
 _ENABLED_NON_BUS_MODES: tuple[str, ...] = ("walk", "bike", "drive")
 _POI_UTIL_DEFAULT: float = 1.0        # general affordability multiplier
 _POI_UTIL_CANTEEN: float = 1.0        # status-benefit override for canteen instances
 _CANTEEN_OSMIDS: frozenset[str] = frozenset()  # OSM ids the canteen override applies to
+
+
+def _haversine_m_np(lat1: float, lon1: float, lat2: NDArray[np.float64], lon2: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Array version of utils.delta_g._haversine_m: one fixed origin vs many destinations."""
+    r = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+    a = np.sin(dphi / 2.0) ** 2 + math.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0) ** 2
+    return 2.0 * r * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
 
 
 def _utility_for_source_key(source_key) -> float:
@@ -486,6 +504,8 @@ def _init_accessibility_worker(
     poi_util_default=1.0,
     poi_util_canteen=1.0,
     canteen_osmids=(),
+    poi_by_node_dir=None,
+    poi_export_geopackage_path=None,
 ):
     """Initialize worker-local state for accessibility multiprocessing.
 
@@ -513,6 +533,7 @@ def _init_accessibility_worker(
     global _ACCESS_DEDUPLICATE_ENTRIES, _POI_DROP_BY_TYPE
     global _POI_RADIUS_ENABLED, _POI_RADIUS_M, _POI_RADIUS_DECAY_THRESHOLD, _POI_RADIUS_MAX_SPEED_KMH, _global_radius_m
     global _ENABLED_NON_BUS_MODES, _POI_UTIL_DEFAULT, _POI_UTIL_CANTEEN, _CANTEEN_OSMIDS
+    global _POI_BY_NODE_DIR, _SOURCE_KEY_TO_ID
     _ENABLED_NON_BUS_MODES = tuple(enabled_non_bus_modes)
     _POI_UTIL_DEFAULT = float(poi_util_default)
     _POI_UTIL_CANTEEN = float(poi_util_canteen)
@@ -586,6 +607,15 @@ def _init_accessibility_worker(
             shape=(len(_SUBWAY_SOURCE_ID_TO_ROW), len(subway_dest_id_to_col))
         )
 
+    _POI_BY_NODE_DIR = poi_by_node_dir or ""
+    _SOURCE_KEY_TO_ID = (
+        _load_source_key_to_id(poi_export_geopackage_path)
+        if _POI_BY_NODE_DIR and poi_export_geopackage_path
+        else {}
+    )
+    if not _SOURCE_KEY_TO_ID:
+        _POI_BY_NODE_DIR = ""
+
     # Yield CPU under safe mode so accessibility workers don't pin the machine at full load.
     from core.runtime_setup import lower_process_priority_if_safe
     lower_process_priority_if_safe()
@@ -650,9 +680,6 @@ def _compute_node_accessibility(item):
         
         
         source_row = source_id_to_row.get(str(node_id))
-        imp_cache: dict[tuple[float, float], float | None] = {}
-        coord_key_cache: dict[tuple[float, float], tuple[float, float]] = {}
-        exp = math.exp
 
         # Subway is optional: only active when the worker was initialized with a subway matrix.
         subway_enabled = (
@@ -661,60 +688,10 @@ def _compute_node_accessibility(item):
             and _SUBWAY_DEST_COORD_TO_COL is not None
         )
         subway_source_row = _SUBWAY_SOURCE_ID_TO_ROW.get(str(node_id)) if subway_enabled else None
-        subway_imp_cache: dict[tuple[float, float], float | None] = {}
 
-        def _get_imp(coord_key: tuple[float, float]) -> float | None:
-            """Return bus impedance for one destination coordinate using lazy memoization.
+        _rra_lambda_mode = os.environ.get("RRA_LAMBDA_MODE", "rank_desc")
 
-            Inputs:
-            - coord_key: destination coordinate key `(lat, lon)` rounded to 6 decimals.
-
-            Outputs:
-            - float impedance in minutes, or None if lookup is unavailable.
-            """
-            if coord_key in imp_cache:
-                return imp_cache[coord_key]
-
-            if source_row is None:
-                imp_cache[coord_key] = None
-                return None
-
-            dest_col = dest_coord_to_col.get(coord_key)
-            if dest_col is None:
-                imp_cache[coord_key] = None
-                return None
-
-            v = float(impedance_matrix[source_row, dest_col])
-            imp = v if v > 0 else None
-            imp_cache[coord_key] = imp
-            return imp
-
-        def _get_imp_subway(coord_key: tuple[float, float]) -> float | None:
-            """Return subway impedance for one destination coordinate (None when no subway)."""
-            if not subway_enabled or subway_source_row is None:
-                return None
-            if coord_key in subway_imp_cache:
-                return subway_imp_cache[coord_key]
-            dest_col = _SUBWAY_DEST_COORD_TO_COL.get(coord_key)
-            if dest_col is None:
-                subway_imp_cache[coord_key] = None
-                return None
-            v = float(_SUBWAY_IMPEDANCE_MATRIX[subway_source_row, dest_col])
-            imp = v if v > 0 else None
-            subway_imp_cache[coord_key] = imp
-            return imp
-
-        def _normalize_coord_key(coord: tuple[float, float]) -> tuple[float, float]:
-            cached = coord_key_cache.get(coord)
-            if cached is not None:
-                return cached
-            norm = (round(float(coord[0]), 6), round(float(coord[1]), 6))
-            coord_key_cache[coord] = norm
-            return norm
-
-
-
-        # For each poi_type, compute the accessibility. 
+        # For each poi_type, compute the accessibility.
         # Each entry is composed of the poi_type, the impedance values for that poi type from the origin, and the coords of the snapped POIs of that type.
         # The beta constant for accessibility is computed for the poi_type, based on the pre-configured impedance value that will bring the decay function value to 0.5
         # # The bus impedance is loaded from the cached numpy dense matrix and the decay is calculated
@@ -725,6 +702,12 @@ def _compute_node_accessibility(item):
             Each POI in poi_coords[i] / source_keys[i] is evaluated independently
             before being aggregated at the poi_type level. This preserves per-POI
             scores for downstream export (service_power / capability_power).
+
+            Vectorized over all POIs of this entry at once (numpy), instead of a
+            per-POI Python loop -- entries can hold thousands of POIs in dense
+            areas, and the old loop's per-POI math.exp/sorted() calls dominated
+            accessibility runtime (profiled: ~7.5s/origin node for Paris). Same
+            formulas as before, just batched; see git history for the scalar version.
 
             Inputs:
             - entry: non-bus cache entry with per-POI parallel lists.
@@ -739,6 +722,11 @@ def _compute_node_accessibility(item):
                 poi_beta_cache[poi_type] = beta
             neg_beta = -beta
 
+            poi_coords = entry["poi_coords"]
+            n = len(poi_coords)
+            if n == 0:
+                return []
+
             imp_walk_list = entry.get("imp_walk", [])
             imp_bike_list = entry.get("imp_bike", [])
             imp_drive_list = entry.get("imp_drive", [])
@@ -748,62 +736,109 @@ def _compute_node_accessibility(item):
             source_keys = entry.get("source_keys", [])
             drop_keys = _POI_DROP_BY_TYPE.get(poi_type)
 
-            poi_accs: list[float] = []
-            for i, coord in enumerate(entry["poi_coords"]):
-                if drop_keys and i < len(source_keys) and str(source_keys[i]) in drop_keys:
-                    poi_accs.append(0.0)
-                    continue
-                if _POI_RADIUS_ENABLED and origin_coord is not None and _global_radius_m is not None:
-                    if _haversine_m(origin_coord[0], origin_coord[1], coord[0], coord[1]) > _global_radius_m:
-                        poi_accs.append(0.0)
-                        continue
+            valid = np.ones(n, dtype=bool)
+            if drop_keys:
+                for i in range(min(n, len(source_keys))):
+                    if str(source_keys[i]) in drop_keys:
+                        valid[i] = False
 
-                coord_key = _normalize_coord_key(coord)
-                imp_bus = _get_imp(coord_key)
-                d_bus = 0.0 if imp_bus is None else exp(neg_beta * imp_bus)
+            lat_arr = np.fromiter((c[0] for c in poi_coords), dtype=np.float64, count=n)
+            lon_arr = np.fromiter((c[1] for c in poi_coords), dtype=np.float64, count=n)
 
-                # Subway is an independent extra mode; only included when the city has it.
+            if _POI_RADIUS_ENABLED and origin_coord is not None and _global_radius_m is not None:
+                dists = _haversine_m_np(origin_coord[0], origin_coord[1], lat_arr, lon_arr)
+                valid &= dists <= _global_radius_m
+
+            # Destination-column lookups require hashing rounded (lat, lon) tuples against
+            # the bus/subway coord->column maps -- that part stays a per-POI Python loop
+            # (only for still-valid rows), but it does no math beyond a dict.get, unlike the
+            # exp/sort work below which is now fully vectorized.
+            dest_cols = np.full(n, -1, dtype=np.int64)
+            subway_cols = np.full(n, -1, dtype=np.int64) if subway_enabled else None
+            valid_idx = np.nonzero(valid)[0]
+            for i in valid_idx:
+                coord_key = (round(float(lat_arr[i]), 6), round(float(lon_arr[i]), 6))
+                dc = dest_coord_to_col.get(coord_key)
+                if dc is not None:
+                    dest_cols[i] = dc
                 if subway_enabled:
-                    imp_subway = _get_imp_subway(coord_key)
-                    d_subway = 0.0 if imp_subway is None else exp(neg_beta * imp_subway)
-                else:
-                    d_subway = None
+                    sc = _SUBWAY_DEST_COORD_TO_COL.get(coord_key)
+                    if sc is not None:
+                        subway_cols[i] = sc
 
-                walk_i = imp_walk_list[i] if i < len(imp_walk_list) else None
-                bike_i = imp_bike_list[i] if i < len(imp_bike_list) else None
-                drive_i = imp_drive_list[i] if i < len(imp_drive_list) else None
+            def _matrix_decay(index_arr, matrix, src_row):
+                out = np.zeros(n, dtype=np.float64)
+                if src_row is None or index_arr is None:
+                    return out
+                mask = index_arr >= 0
+                if mask.any():
+                    vals = np.asarray(matrix[src_row, index_arr[mask]], dtype=np.float64)
+                    pos = vals > 0
+                    if pos.any():
+                        rows = np.nonzero(mask)[0][pos]
+                        out[rows] = np.exp(neg_beta * vals[pos])
+                return out
 
-                d_walk  = 0.0 if walk_i  is None else exp(neg_beta * float(walk_i))
-                d_bike  = 0.0 if bike_i  is None else exp(neg_beta * float(bike_i))
-                d_drive = 0.0 if drive_i is None else exp(neg_beta * float(drive_i))
+            def _list_decay(values_list):
+                out = np.zeros(n, dtype=np.float64)
+                limit = min(n, len(values_list))
+                if limit == 0:
+                    return out
+                sub = values_list[:limit]
+                present = np.array([v is not None for v in sub], dtype=bool)
+                if present.any():
+                    vals = np.array(
+                        [float(v) if v is not None else 0.0 for v in sub], dtype=np.float64
+                    )
+                    out[:limit] = np.where(present, np.exp(neg_beta * vals), 0.0)
+                return out
 
-                # Per-POI accessibility A^i_k(x, y) is exactly the RRA over modes
-                # (formula 2). The Delta-g aggregation belongs only at the POI-type
-                # level (Step 2), so do not pass this single value through it.
-                # Passing [d_subway] only when subway is enabled keeps the mode count at 4
-                # for cities without subway (identical results) and 5 where it exists.
-                #
-                # Individual-profile mode gating: a disabled non-bus mode contributes an
-                # empty decay list -> treated as 0.0 in build_rra, which ranks last and is a
-                # no-op in the 1 - prod(1 - w) formula, leaving the enabled modes with the
-                # correct top redundancy weights (exactly a smaller mode count m). Bus is a
-                # public-transport mode and always kept.
-                bike_list = [d_bike] if "bike" in _ENABLED_NON_BUS_MODES else []
-                drive_list = [d_drive] if "drive" in _ENABLED_NON_BUS_MODES else []
-                walk_list = [d_walk] if "walk" in _ENABLED_NON_BUS_MODES else []
-                rra_list = delta_g.build_rra(
-                    walk_list, bike_list, drive_list, [d_bus],
-                    [d_subway] if subway_enabled else None,
+            d_bus = _matrix_decay(dest_cols, impedance_matrix, source_row)
+            d_subway = (
+                _matrix_decay(subway_cols, _SUBWAY_IMPEDANCE_MATRIX, subway_source_row)
+                if subway_enabled
+                else None
+            )
+
+            # Individual-profile mode gating: a disabled non-bus mode is forced to 0.0
+            # regardless of its real computed decay, which ranks last and is a no-op in
+            # the 1 - prod(1 - w) formula, leaving the enabled modes with the correct top
+            # redundancy weights (exactly as if m were smaller). Bus is a public-transport
+            # mode and always kept.
+            d_walk = _list_decay(imp_walk_list) if "walk" in _ENABLED_NON_BUS_MODES else np.zeros(n)
+            d_bike = _list_decay(imp_bike_list) if "bike" in _ENABLED_NON_BUS_MODES else np.zeros(n)
+            d_drive = _list_decay(imp_drive_list) if "drive" in _ENABLED_NON_BUS_MODES else np.zeros(n)
+
+            # Per-POI accessibility A^i_k(x, y) is exactly the RRA over modes (formula 2):
+            # rank each POI's modal decays descending, apply the fixed redundancy weights
+            # lambda = 1, 1/2, ..., 1/m (best mode full weight), then combine as
+            # 1 - prod(1 - weighted). Passing subway only when enabled keeps the mode
+            # count at 4 for cities without it (identical results) and 5 where it exists.
+            cols = [d_walk, d_bike, d_drive, d_bus]
+            if subway_enabled:
+                cols.append(d_subway)
+            decay_matrix = np.stack(cols, axis=1)
+            m = decay_matrix.shape[1]
+            lambdas = np.asarray(decay._lambda_series(m, _rra_lambda_mode), dtype=np.float64)
+            sorted_desc = -np.sort(-decay_matrix, axis=1)
+            weighted = sorted_desc * lambdas[np.newaxis, :]
+            rra = 1.0 - np.prod(1.0 - weighted, axis=1)
+
+            # Per-POI utility u(y): affordability, with the canteen (status-benefit)
+            # override for specific instances. Defaults to 1.0 (baseline unchanged).
+            if _POI_UTIL_DEFAULT != 1.0 or _POI_UTIL_CANTEEN != 1.0:
+                util = np.fromiter(
+                    (
+                        _utility_for_source_key(source_keys[i] if i < len(source_keys) else None)
+                        for i in range(n)
+                    ),
+                    dtype=np.float64,
+                    count=n,
                 )
-                rra_val = rra_list[0] if rra_list else 0.0
+                rra = rra * util
 
-                # Per-POI utility u(y): affordability, with the canteen (status-benefit)
-                # override for specific instances. Defaults to 1.0 (baseline unchanged).
-                if _POI_UTIL_DEFAULT != 1.0 or _POI_UTIL_CANTEEN != 1.0:
-                    src_key = source_keys[i] if i < len(source_keys) else None
-                    rra_val *= _utility_for_source_key(src_key)
-                poi_accs.append(rra_val)
-            return poi_accs
+            rra = np.where(valid, rra, 0.0)
+            return rra.tolist()
 
         # --- Step 1: compute per-POI accessibility for every unique entry ----
         # Deduplicate by poi_type so each entry is processed once.
@@ -853,6 +888,15 @@ def _compute_node_accessibility(item):
             for sk, acc_val in zip(source_keys, accs):
                 if sk and acc_val > 0.0:
                     accessibility_by_poi[str(sk)] = acc_val
+
+        # Compress and persist right here, in the worker, and drop the dict immediately
+        # -- it never gets pickled for IPC or held across the rest of this chunk. See
+        # _POI_BY_NODE_DIR docstring above for why that round trip mattered.
+        if _POI_BY_NODE_DIR and accessibility_by_poi:
+            _write_poi_by_node_sparse(
+                node_id, accessibility_by_poi, _SOURCE_KEY_TO_ID, _POI_BY_NODE_DIR
+            )
+            accessibility_by_poi = {}
 
         return AccessibilityNodeResult(
             node_id=node_id,
@@ -912,14 +956,15 @@ def run_accessibility_stage(
     mat, node_to_row, poi_to_col = _open_or_create_accessibility_matrix_cache(ctx, bus)
 
     # Set up per-node sparse accessibility directory — individual POI accessibility is
-    # written as one small compressed .npz per node instead of a single giant JSON file,
-    # so it is never fully resident in memory during or after the accessibility stage.
+    # written as one small compressed .npz per node instead of a single giant JSON file.
+    # Workers write it themselves (see _POI_BY_NODE_DIR) as soon as each node is computed,
+    # so it is never fully resident in memory during or after the accessibility stage --
+    # not in a worker's chunk buffer, and not pickled across IPC to this main process.
     poi_by_node_dir: str = ctx.config.accessibility_poi_by_node_dir or ""
-    source_key_to_id: dict[str, int] = {}
-    if poi_by_node_dir:
-        source_key_to_id = _load_source_key_to_id(ctx.config.poi_export_geopackage_path)
-        if source_key_to_id:
-            os.makedirs(poi_by_node_dir, exist_ok=True)
+    if poi_by_node_dir and os.path.exists(ctx.config.poi_export_geopackage_path):
+        os.makedirs(poi_by_node_dir, exist_ok=True)
+    else:
+        poi_by_node_dir = ""
 
     # Preload complete node rows from cache and compute only missing rows.
     pending: dict[Any, str] = {}
@@ -934,7 +979,7 @@ def run_accessibility_stage(
             row = node_to_row[str(node_id)]
             # A node is a full cache hit only when its matrix row is complete AND its
             # per-node sparse file already exists (or no sparse files are needed).
-            need_sparse = bool(source_key_to_id and poi_by_node_dir)
+            need_sparse = bool(poi_by_node_dir)
             sparse_exists = (
                 os.path.exists(os.path.join(poi_by_node_dir, f"{node_id}.npz"))
                 if need_sparse else True
@@ -1043,6 +1088,8 @@ def run_accessibility_stage(
                         _profile_util_default,
                         _profile_util_canteen,
                         _profile_canteen_osmids,
+                        poi_by_node_dir,
+                        ctx.config.poi_export_geopackage_path,
                     ),
                 )
                 _ACTIVE_ACCESSIBILITY_POOL = pool
@@ -1060,11 +1107,8 @@ def run_accessibility_stage(
                         row = node_to_row.get(str(data.node_id))
                         if row is not None:
                             _write_node_result_to_matrix(mat, row, poi_to_col, data)
-                    if source_key_to_id and poi_by_node_dir and data.accessibility_by_poi:
-                        _write_poi_by_node_sparse(
-                            data.node_id, data.accessibility_by_poi, source_key_to_id, poi_by_node_dir
-                        )
-                        data.accessibility_by_poi = {}
+                    # accessibility_by_poi was already compressed to .npz and dropped by
+                    # the worker (see _POI_BY_NODE_DIR); nothing left to write here.
                     result.node_results.append(data)
                     if data.node_id in pending:
                         pending.pop(data.node_id, None)

@@ -24,13 +24,30 @@ WORKER_COUNT = None
 #   capability CSVs, the GeoPackage, and the QGIS project. Meant for colleagues starting
 #   from a shipped impedances.npz who only need to inspect results in QGIS.
 #   Also settable without editing this file: CAP_LIGHT_OUTPUT=1 python main.py
-LIGHT_OUTPUT = False
+LIGHT_OUTPUT = True
 # NOTIFY_CRASH: send a Telegram message when the run stops for ANY reason — unhandled
 #   exception, Ctrl+C, OOM/cgroup SIGKILL, hard crash, terminal dying — plus one on a clean
 #   finish. Uses a detached watchdog process (outside the run_safe.sh cgroup) so even a
 #   SIGKILL of the pipeline gets reported. Needs notify_config.json (gitignored) with the
 #   bot token and chat id; setup steps and a --test command are documented in notify.py.
 NOTIFY_CRASH = True
+# POI_RADIUS_KM: fixed POI search radius in km, overriding the usual decay-based threshold
+#   (see core.config.PipelineConfig.poi_radius_m). None = normal behavior (radius derived
+#   from poi_radius_decay_threshold). Set to e.g. 5.0 for a fixed-radius sensitivity run.
+#   Non-bus impedance is aggregated at routing time using this radius (see
+#   utils.delta_g.accessibility_non_bus_from_snap_map) so it cannot be reused across a radius
+#   change; setting this bucket-isolates the non-bus cache and impedance bundle under
+#   artifacts/<slug>/non_bus_r<radius> / impedances_r<radius>.npz so a rerun at the SAME
+#   radius still hits cache, while ARTIFACT_SLUG_SUFFIX below keeps this run's final outputs
+#   (gpkg/QGIS project) from overwriting the normal run's.
+POI_RADIUS_KM = 5.0
+# ARTIFACT_SLUG_SUFFIX: namespaces every output path under artifacts/<slug>_<suffix>/ and
+#   outputs/.../<slug>_<suffix> (see PipelineConfig.artifact_slug_suffix), so a radius/profile
+#   experiment never overwrites the normal run's outputs. Snapping and bus/subway routing are
+#   radius-independent (see config.py's radius_bucket comment) — symlink those subfolders from
+#   the normal artifacts/<slug>/ dir into the new one before running to reuse them instead of
+#   re-routing from scratch.
+ARTIFACT_SLUG_SUFFIX = "r5km"
 
 
 def _reexec_under_run_safe_if_needed() -> None:
@@ -116,7 +133,12 @@ def main():
     # All global values accessed by multiple stages are found here.
     light_output = LIGHT_OUTPUT or os.environ.get("CAP_LIGHT_OUTPUT") == "1"
 
-    cfg = PipelineConfig(study_city=study_city)
+    cfg_kwargs = {}
+    if POI_RADIUS_KM is not None:
+        cfg_kwargs["poi_radius_m"] = float(POI_RADIUS_KM) * 1000.0
+    if ARTIFACT_SLUG_SUFFIX:
+        cfg_kwargs["artifact_slug_suffix"] = ARTIFACT_SLUG_SUFFIX
+    cfg = PipelineConfig(study_city=study_city, **cfg_kwargs)
     if light_output:
         print("[Config] LIGHT_OUTPUT: skipping hexagon/interface POI exports (CSV + gpkg + QGIS only).", flush=True)
     print(f"[Config] study_city={cfg.study_city}  city_name={cfg.city_name}", flush=True)

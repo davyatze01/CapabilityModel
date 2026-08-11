@@ -11,14 +11,14 @@ def normalize_study_city(study_city: str) -> str:
 
 
 # ELECTRE TRI threshold factors — multiplied by std(service scores) at runtime.
-ELECTRE_Q_FACTOR: float = 0.25   # indifference threshold  q = std(x) * Q_FACTOR
-ELECTRE_P_FACTOR: float = 0.75   # preference threshold    p = std(x) * P_FACTOR
+ELECTRE_Q_FACTOR: float = 0.2   # indifference threshold  q = std(x) * Q_FACTOR
+ELECTRE_P_FACTOR: float = 0.8   # preference threshold    p = std(x) * P_FACTOR
 # Cutting level λ: minimum outranking credibility for a node to be assigned above a
 # boundary. The single source of truth — the assignment code, the debug details, and
 # the sensitivity baseline all read this value. The sensitivity report flags λ as the
 # model's steepest parameter (moving it flips up to ~10% of care nodes), so any change
 # here must come with an explicit justification.
-ELECTRE_LAMBDA_CUT: float = 0.65
+ELECTRE_LAMBDA_CUT: float = 0.75
 
 CITY_PRESETS: dict[str, dict[str, object]] = {
     "cagliari": {
@@ -31,6 +31,9 @@ CITY_PRESETS: dict[str, dict[str, object]] = {
             "pois_shp/poi_lines.shp",
             "pois_shp/poi_polygons.shp",
         ],
+        # Cagliari's own shapefiles (produced by utils/pois_to_shp.py) carry the
+        # classification attribute under this column name.
+        "poi_label_field": "poiType",
         "bus_ticket_price": 1.3,
         "osm_extract_url": "https://download.geofabrik.de/europe/italy/isole-latest.osm.pbf",
     },
@@ -44,6 +47,8 @@ CITY_PRESETS: dict[str, dict[str, object]] = {
             "Paris/POI_line.shp",
             "Paris/POI_polygon.shp",
         ],
+        # Paris' MGP layers carry the classification attribute under this column name.
+        "poi_label_field": "TYPEQU",
         "bus_ticket_price": 2.05,
         # The IDFM feed carries both bus (route_type 3) and subway (route_type 1); route them
         # as two separate modalities.
@@ -70,6 +75,8 @@ def apply_study_city(cfg: "PipelineConfig", study_city: str) -> None:
     cfg.name_shapefile = str(preset["name_shapefile"])
     cfg.poi_from_shp = bool(preset["poi_from_shp"])
     cfg.poi_shapefile_paths = list(preset["poi_shapefile_paths"])
+    if "poi_label_field" in preset:
+        cfg.poi_label_field = str(preset["poi_label_field"])
     if "bus_ticket_price" in preset:
         cfg.bus_ticket_price = float(preset["bus_ticket_price"])  # type: ignore[arg-type]
     if "enable_subway" in preset:
@@ -119,12 +126,27 @@ class PipelineConfig:
     qgis_bin_path: str = ""
     qgis_project_path: str = ""
     qgis_autostyle_project: bool = True
-    qgis_autostyle_field: str = "capability_care"
-    qgis_autostyle_classes: int = 5
+    default_capability: str = "capability_care"
+    # Which capability-score formula capability_stage.py writes into capability_<name>:
+    # "discrete" (default) = the ELECTRE TRI band midpoint (0.1/0.3/0.5/0.7/0.9, current
+    # production behavior, unchanged). "continuous" = utils.capabilities.
+    # electre_tri_continuous_score(), the raw outranking credibility averaged across the 4
+    # boundaries -- a statistics-only knob for testing whether scenario comparisons show more
+    # significant effects with the resolution the band midpoint collapses away (see
+    # analysis/scenarios.py's CAPABILITY_SCORE_MODE knob). Leave "discrete" for any run whose
+    # output should match the existing maps/legends.
+    capability_score_mode: str = "discrete"
     qgis_autostyle_ramp: str = "Viridis"
-    qgis_autostyle_basemap: bool = True
+    show_basemap: bool = True
     qgis_grid_enabled: bool = True
-    qgis_grid_cell_size_m: float = 100.0
+    hexagon_radius: float = 100.0
+    # Signature colour for each capability, in the order capabilities are defined
+    # (see utils.capabilities.CAPABILITY_SERVICES): restorativeness, nutrition, care.
+    # One capability, one colour; add an entry here for every capability the model
+    # is configured to compute.
+    capability_colors: list[str] = field(
+        default_factory=lambda: ["#006BFF", "#FFA200", "#EB4CCC"]
+    )
     qgis_grid_capability_field: str = "capability_care"
     qgis_grid_opacity: float = 1.0
     # Per-service heatmap grids and the per-capability colored grids are both drawn
@@ -160,6 +182,9 @@ class PipelineConfig:
             "Paris/POI_polygon.shp",
         ]
     )
+    # Name of the attribute in the source POI shapefiles whose values classify each
+    # record into a configured POI type (see utils/load_shapefile.poi_from_shp).
+    poi_label_field: str = "poi_type"
     worker_count: int | None = None
     # Opt-in gentle execution. Set by CAP_SAFE_MODE in __post_init__ (kept consistent with
     # runtime_setup, which also caps native math threads before numpy import). When on: the
@@ -167,7 +192,15 @@ class PipelineConfig:
     # priority. Pools already recycle workers (maxtasksperchild). Reduces sustained CPU/power
     # load without changing results.
     safe_mode: bool = field(init=False)
-    accessibility_chunksize: int = 100
+    # Kept small deliberately: a worker computes its whole chunk (holding every node's
+    # full result, including accessibility_by_poi, in memory) before returning any of
+    # it over IPC -- the per-node sparse .npz write only runs in the main process after
+    # the chunk comes back. On large cities (Paris: ~16MB avg non-bus cache/node, with
+    # much bigger outliers downtown) a chunksize of 100 let each of ~24 workers buffer
+    # up to 100 large results at once, which OOM-killed the whole run under the 45GB
+    # cgroup cap. A small chunksize bounds that per-worker buffer at the cost of more
+    # frequent (cheap) IPC round-trips.
+    accessibility_chunksize: int = 4
     accessibility_deduplicate_entries: bool = True
     artifacts_root_dir: str = "artifacts"
     impedance_artifact_path: str = ""
@@ -258,6 +291,15 @@ class PipelineConfig:
     # Its routing/impedance artifacts mirror the bus ones but live under a separate subfolder
     # so the two modes don't overwrite each other. Populated in __post_init__.
     enable_subway: bool = False
+    # The r5r transit mode string used to isolate this second modality's routes from the rest
+    # of the combined GTFS feed (see routing.public_transport_routing_stage._resolve_transit_
+    # mode). r5r's mode filter is keyed on GTFS route_type, not on what a city colloquially
+    # calls the line: Paris' IDFM métro is route_type=1 ("SUBWAY"), but Cagliari's
+    # Metrocagliari is published as route_type=0 ("TRAM", i.e. light rail) despite being
+    # called "metro" -- requesting the wrong mode string silently finds zero matching routes
+    # (every routing call falls back to a walk-only path, n_rides=0) rather than erroring.
+    # Check the actual route_type in the feed before changing this for a new city.
+    subway_transit_mode: str = "SUBWAY"
     subway_routing_matrix_path: str = ""
     subway_routing_cache_path: str = ""
     subway_routing_origins_input_path: str = ""
@@ -290,6 +332,15 @@ class PipelineConfig:
     # alongside either a higher MemoryMax or the numpy-array rewrite of
     # utils.delta_g.accessibility_non_bus_from_snap_map noted above.
     non_bus_max_workers: int = 8
+    # score_report.py's node-scoring pool (added 2026-08-04) pickles the precomputed
+    # per-POI weight dict to every worker via Pool initargs. Each worker's copy gets
+    # touched (refcounted) on nearly every dict access, which -- per the fork COW note
+    # in accessibility_stage.py's graph-loading comment -- tends to actually materialize
+    # as N private copies rather than one shared one, not just N x the dict's flat size.
+    # Capped independently of ctx.workers (which can be 20+ on a big machine) so this
+    # new, less-battle-tested pool can't reproduce the non_bus_max_workers-style OOM
+    # incident above until it's been observed running cleanly at full worker count.
+    score_report_max_workers: int = 8
     # Estimated resident RAM per worker. With CSR-based routing this is mostly the
     # compressed adjacency arrays and related caches rather than full mode graphs.
     # Does NOT include the per-origin transient working-set spike described above --
@@ -336,7 +387,6 @@ class PipelineConfig:
         if self.artifact_slug_suffix:
             self.artifact_slug = f"{self.artifact_slug}_{self.artifact_slug_suffix}"
         city_artifacts = os.path.join(self.artifacts_root_dir, self.artifact_slug)
-        self.impedance_artifact_path = os.path.join(city_artifacts, "impedances.npz")
         self.poi_snap_cache_dir = os.path.join(city_artifacts, "snapping", "poi_snap_cache")
         # Whole-stage snapping checkpoint (post dedup/radius filter). Lets a restart after a
         # later-stage crash (e.g. bus routing) skip re-running run_snapping_stage from scratch.
@@ -352,7 +402,19 @@ class PipelineConfig:
         # kept so a restart skips even that, and so _load_pt_destination_cache_raw can resolve
         # an old run's "d{idx}" labels; shared across bus/subway.
         self.pt_destination_cache_path = os.path.join(city_artifacts, "snapping", "pt_selected_destinations.pkl")
-        self.non_bus_cache_dir = os.path.join(city_artifacts, "non_bus")
+        # Unlike bus (filtered post-hoc, see pt_destination_cache_path above), non-bus
+        # (walk/bike/drive) impedance is aggregated AT ROUTING TIME from only the POIs
+        # inside poi_radius_m (utils.delta_g.accessibility_non_bus_from_snap_map) -- the
+        # per-node cache below stores that aggregate, not raw per-POI distances, so it
+        # cannot be reused across a radius change. Its on-disk validity check also does
+        # not look at radius. Bucketing by the fixed radius (when set) keeps a same-radius
+        # rerun cache-hit while making a different radius a clean cache MISS instead of a
+        # silent (wrong) cache HIT on another radius's aggregated values. The decay-based
+        # default (poi_radius_m is None) keeps the unsuffixed path so ordinary runs are
+        # unaffected.
+        radius_bucket = f"_r{int(self.poi_radius_m)}" if self.poi_radius_m is not None else ""
+        self.impedance_artifact_path = os.path.join(city_artifacts, f"impedances{radius_bucket}.npz")
+        self.non_bus_cache_dir = os.path.join(city_artifacts, f"non_bus{radius_bucket}")
         self.walkability_cache_dir = os.path.join(city_artifacts, "walkability")
 
         self.bus_routing_matrix_path = os.path.join(city_artifacts, "bus", "r5r_expanded_travel_time_matrix.csv")

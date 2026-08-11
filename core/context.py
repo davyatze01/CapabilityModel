@@ -251,7 +251,7 @@ def build_context(config: PipelineConfig) -> PipelineContext:
             )
         nodes_with_coords = _hex_grid_sample_nodes(
             nodes_with_coords,
-            config.qgis_grid_cell_size_m,
+            config.hexagon_radius,
             grid_params_path=os.path.join(config.poi_export_dir, "grid_params.json"),
         )
 
@@ -264,7 +264,9 @@ def build_context(config: PipelineConfig) -> PipelineContext:
     os.makedirs(os.path.dirname(config.impedance_artifact_path) or ".", exist_ok=True)
 
     output_paths = {
-        "capabilities": os.path.join("outputs", "capability.csv"),
+        "capabilities": os.path.join(
+            "outputs", f"{config.artifact_slug}_capability_{os.getpid()}.csv"
+        ),
     }
 
     env_workers = os.environ.get("CAP_WORKERS")
@@ -328,7 +330,5 @@ def build_context(config: PipelineConfig) -> PipelineContext:
         nodes_with_coords=nodes_with_coords,
         workers=workers,
         output_paths=output_paths,
-        rest_services=cap.CAPABILITY_SERVICES["restorativeness"],
-        nut_services=cap.CAPABILITY_SERVICES["nutrition"],
-        care_services=cap.CAPABILITY_SERVICES["care"],
+        capability_services=dict(cap.CAPABILITY_SERVICES),
     )

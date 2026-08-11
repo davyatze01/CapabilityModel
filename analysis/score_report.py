@@ -14,6 +14,7 @@ held in full.  POI metadata is loaded from the GPKG (source_key, poi_types, svc_
 """
 
 import json
+import multiprocessing as mp
 import os
 import sqlite3
 import sys
@@ -26,6 +27,7 @@ from core.config import PipelineConfig
 from core.context import build_context
 from exports.hex_shard_writer import HexShardWriter
 from utils import capabilities as cap_mod
+from utils import graphml
 from utils import services as serv
 
 if TYPE_CHECKING:
@@ -89,44 +91,91 @@ def _load_node_sparse(node_id, poi_by_node_dir: str) -> dict[int, float]:
         return {}
 
 
-def _compute_poi_powers(
-    poi_id: int,
-    poi_info: dict,
-    acc_val: float,
+def _precompute_poi_weights(
+    poi_by_id: dict[int, dict],
     drop_set: dict[str, set[str]],
-) -> tuple[dict[str, float], dict[str, float]]:
-    """Compute service_power and capability_power for one POI given its accessibility.
+) -> dict[int, tuple[dict[str, float], dict[str, float]]]:
+    """Per POI, the linear service_power/capability_power weight: power = acc_val * weight.
 
-    Mirrors poi_exports._poi_powers using exact per-POI accessibility (not poi_type fallback).
-    Applies ownership dedup: skips poi_type contributions where this POI is in the drop set.
+    Both powers are linear in the POI's own accessibility value (service_power sums
+    singleton weights over poi_types; capability_power is a fixed linear combination of
+    service_power via the ELECTRE weights), so the weight itself depends only on
+    poi_types/source_key/drop_set -- never on which node or accessibility value is asking.
+    The same POI is reachable from, and re-scored by, many nodes, so computing this once
+    here (instead of inside the per-(node, POI) hot loop) turns that loop from a ~12-service
+    x ~poi_types membership scan into a couple of dict lookups per POI.
     """
-    source_key = poi_info["source_key"]
-    poi_types: list[str] = poi_info["poi_types"]
+    weights: dict[int, tuple[dict[str, float], dict[str, float]]] = {}
+    for poi_id, poi_info in poi_by_id.items():
+        source_key = poi_info["source_key"]
+        poi_types: list[str] = poi_info["poi_types"]
 
-    service_power: dict[str, float] = {}
-    for service in serv.SERVICE_KEYS:
-        singletons = serv.SERVICE_SINGLETON_M.get(service, {})
-        sp = 0.0
-        for pt in poi_types:
-            if pt not in singletons:
-                continue
-            if source_key in drop_set.get(pt, ()):
-                continue
-            sp += acc_val * float(singletons[pt])
-        if sp > 0.0:
-            service_power[service] = round(sp, 7)
+        svc_w: dict[str, float] = {}
+        for service in serv.SERVICE_KEYS:
+            singletons = serv.SERVICE_SINGLETON_M.get(service, {})
+            w = 0.0
+            for pt in poi_types:
+                if pt not in singletons:
+                    continue
+                if source_key in drop_set.get(pt, ()):
+                    continue
+                w += float(singletons[pt])
+            if w > 0.0:
+                svc_w[service] = w
 
-    capability_power: dict[str, float] = {}
-    for capability, cap_services in cap_mod.CAPABILITY_SERVICES.items():
-        weights = cap_mod.CAP_ELECTRE_W[capability]
-        cp = sum(
-            service_power.get(svc, 0.0) * float(weights.get(svc, 0.0))
-            for svc in cap_services
-        )
-        if cp > 0.0:
-            capability_power[capability] = round(cp, 7)
+        cap_w: dict[str, float] = {}
+        for capability, cap_services in cap_mod.CAPABILITY_SERVICES.items():
+            cap_weights = cap_mod.CAP_ELECTRE_W[capability]
+            w = sum(svc_w.get(svc, 0.0) * float(cap_weights.get(svc, 0.0)) for svc in cap_services)
+            if w > 0.0:
+                cap_w[capability] = w
 
-    return service_power, capability_power
+        if svc_w or cap_w:
+            weights[poi_id] = (svc_w, cap_w)
+    return weights
+
+
+# Populated in each worker process by _init_score_worker (via Pool initargs, pickled once
+# per worker at pool startup, not per task).
+_WORKER_POI_WEIGHTS: dict[int, tuple[dict[str, float], dict[str, float]]] = {}
+_WORKER_POI_BY_NODE_DIR: str = ""
+
+
+def _init_score_worker(
+    poi_weights: dict[int, tuple[dict[str, float], dict[str, float]]],
+    poi_by_node_dir: str,
+) -> None:
+    global _WORKER_POI_WEIGHTS, _WORKER_POI_BY_NODE_DIR
+    _WORKER_POI_WEIGHTS = poi_weights
+    _WORKER_POI_BY_NODE_DIR = poi_by_node_dir
+
+
+def _score_node_worker(args: tuple) -> tuple[str, list[dict]] | None:
+    """Score one node: load its sparse accessibility, apply the precomputed per-POI
+    weights, and return its hexagon's POI entries (or None if it contributes nothing)."""
+    node_id, hex_id = args
+    acc_by_poi_id = _load_node_sparse(node_id, _WORKER_POI_BY_NODE_DIR)
+    if not acc_by_poi_id:
+        return None
+
+    poi_entries: list[dict] = []
+    for poi_id, acc_val in acc_by_poi_id.items():
+        weights = _WORKER_POI_WEIGHTS.get(poi_id)
+        if weights is None:
+            continue
+        svc_w, cap_w = weights
+        entry: dict = {"i": poi_id}
+        if svc_w:
+            entry["sp"] = {k: round(acc_val * w, 7) for k, w in svc_w.items()}
+        if cap_w:
+            entry["cp"] = {k: round(acc_val * w, 7) for k, w in cap_w.items()}
+        if "sp" in entry or "cp" in entry:
+            poi_entries.append(entry)
+
+    if not poi_entries:
+        return None
+    poi_entries.sort(key=lambda e: e["i"])
+    return hex_id, poi_entries
 
 
 def _migrate_json_to_sparse(json_path: str, poi_by_node_dir: str, source_key_to_id: dict[str, int]) -> None:
@@ -211,51 +260,75 @@ def generate_score_report(city: str | None = None, ctx: "PipelineContext | None"
     # so the values spread across [0, 1] (they otherwise cluster too tightly to
     # tell apart). Also dumps power_scaling.json next to the store for the
     # scaling dashboard. See utils/power_scaling.py.
-    writer = HexShardWriter(cfg.hex_pois_dir, cfg.artifact_slug, scale_powers=True)
+    # resume=True: if a prior run's node-scoring loop finished cleanly and left
+    # its part files + completion marker behind (see mark_scoring_complete),
+    # skip straight to finalize() instead of repeating the scoring loop, which
+    # is the expensive part of this script (hours, one npz read + POI-power
+    # computation per node).
+    writer = HexShardWriter(cfg.hex_pois_dir, cfg.artifact_slug, scale_powers=True, resume=True)
 
-    nodes = ctx.nodes_with_coords
-    total = len(nodes) if hasattr(nodes, "__len__") else None
-    skipped = 0
-    # Live progress bar over the node loop (each node reads its own .npz and
-    # computes per-POI powers). Drives off the known node count so it shows a
-    # real ETA instead of an occasional print, and updates in place in the
-    # VS Code terminal. Matches the tqdm style used elsewhere in the pipeline.
-    progress = tqdm(
-        total=total,
-        desc="[ScoreReport] scoring nodes",
-        unit="node",
-        file=sys.stderr,
-        mininterval=0.5,
-        dynamic_ncols=True,
-    )
-    for idx, (node_id, data) in enumerate(nodes, start=1):
-        hex_id: str = data.get("hex_id") or str(node_id)
-        acc_by_poi_id = _load_node_sparse(node_id, poi_by_node_dir)
-        if not acc_by_poi_id:
-            skipped += 1
-        else:
-            poi_entries: list[dict] = []
-            for poi_id, acc_val in acc_by_poi_id.items():
-                poi_info = poi_by_id.get(poi_id)
-                if poi_info is None:
-                    continue
-                sp, cp = _compute_poi_powers(poi_id, poi_info, acc_val, drop_set)
-                if sp or cp:
-                    entry: dict = {"i": poi_id}
-                    if sp:
-                        entry["sp"] = sp
-                    if cp:
-                        entry["cp"] = cp
-                    poi_entries.append(entry)
+    if writer.resumed:
+        print(
+            f"[ScoreReport] Resuming from a completed scoring pass "
+            f"({writer.hex_count} hexagons already scored) -- skipping straight to finalize.",
+            flush=True,
+        )
+    else:
+        nodes = ctx.nodes_with_coords
+        node_args = [(node_id, data.get("hex_id") or str(node_id)) for node_id, data in nodes]
+        total = len(node_args)
+        skipped = 0
 
-            if poi_entries:
-                poi_entries.sort(key=lambda e: e["i"])
-                writer.add_hexagon(hex_id, poi_entries)
+        print("[ScoreReport] Precomputing per-POI service/capability weights...", flush=True)
+        poi_weights = _precompute_poi_weights(poi_by_id, drop_set)
 
-        progress.update(1)
-        if idx % 500 == 0:
-            progress.set_postfix_str(f"{writer.hex_count} hexagons, {skipped} empty")
-    progress.close()
+        # Node scoring is embarrassingly parallel (each node reads its own .npz and is
+        # otherwise independent), so it's farmed out to a worker pool the same way the
+        # routing/accessibility stages are -- this is normally the slowest part of this
+        # script by far. ctx.workers is already sized for this machine's cores/memory by
+        # build_context, but capped again here by score_report_max_workers (see its
+        # definition in config.py) since this pool hasn't been proven safe yet at full
+        # worker count the way non_bus_max_workers was tuned down after a real OOM.
+        # Only the main process touches `writer` (shard part-file appends aren't safe to
+        # parallelize), so workers just return each node's computed entries.
+        pool_workers = max(1, min(ctx.workers, ctx.config.score_report_max_workers, total or 1))
+        chunksize = max(1, total // (pool_workers * 4)) if total else 1
+
+        # Workers here only read per-node .npz files and the precomputed weights dict --
+        # they never touch a NetworkX graph. But this script commonly runs at the tail of
+        # a long-lived main.py process, where the full mode graphs non_bus_routing_stage
+        # loaded earlier can still be cached in-process. Forking a pool without releasing
+        # them first inherits that multi-GB baseline copy-on-write, which turns into N
+        # private copies as each worker's refcounting touches pages -- this is the exact
+        # OOM pattern non_bus_max_workers exists to bound in that stage's own pool; clear
+        # it here too instead of re-learning that lesson in a second stage.
+        graphml.clear_mode_graph_cache()
+        progress = tqdm(
+            total=total,
+            desc="[ScoreReport] scoring nodes",
+            unit="node",
+            file=sys.stderr,
+            mininterval=0.5,
+            dynamic_ncols=True,
+        )
+        with mp.Pool(
+            processes=pool_workers,
+            initializer=_init_score_worker,
+            initargs=(poi_weights, poi_by_node_dir),
+        ) as pool:
+            for idx, result in enumerate(
+                pool.imap_unordered(_score_node_worker, node_args, chunksize=chunksize), start=1
+            ):
+                if result is None:
+                    skipped += 1
+                else:
+                    hex_id, poi_entries = result
+                    writer.add_hexagon(hex_id, poi_entries)
+                progress.update(1)
+                if idx % 500 == 0:
+                    progress.set_postfix_str(f"{writer.hex_count} hexagons, {skipped} empty")
+        progress.close()
+        writer.mark_scoring_complete()
 
     print(f"[ScoreReport] Finalizing {writer.hex_count} hexagons into shards (fitting scaler + writing)...", flush=True)
     info = writer.finalize(zip_path=cfg.hex_pois_zip_path)

@@ -229,6 +229,20 @@ def _parse_python_list_cell(raw: str, row_num: int, column: str) -> list[Any]:
 def _load_service_weights(
     valid_poi_types: set[str],
 ) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]], dict[str, list[str]]]:
+    """Load and validate service configuration rows from CSV.
+
+    A row is only valid when poi_types, choquet_capacity, and
+    contribution_coefficient all have the same length, and every POI type it
+    references exists in valid_poi_types.
+
+    Inputs:
+    - valid_poi_types: set of POI type identifiers known to the POI type
+      configuration.
+
+    Outputs:
+    - tuple of (singleton capacities, contribution coefficients, POI order),
+      each keyed by service.
+    """
     if not SERVICES_CSV_PATH.is_file():
         raise ValueError(f"Invalid services config CSV (path={SERVICES_CSV_PATH}): file not found")
 

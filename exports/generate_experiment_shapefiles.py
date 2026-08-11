@@ -465,9 +465,12 @@ def generate_combined_experiment_gpkg(
             # instead of a smoothed contour. Built for every capability present
             # in the grid, not just the one it's currently colored by, so all
             # three can be loaded in the project and toggled independently.
+            from utils.capabilities import CAPABILITY_ENABLED
             from utils.isolines import compute_capability_isobands_from_cells
 
             for _capability, _iso_table in ISOBANDS_TABLE_NAMES.items():
+                if not CAPABILITY_ENABLED.get(_capability, True):
+                    continue
                 try:
                     iso_value_field = f"grid_mean_{_capability}"
                     if iso_value_field not in grid_layer.columns:
@@ -665,7 +668,11 @@ def _create_service_grid_views(gpkg_path: Path) -> list[str]:
                     column,
                     "Per-service view of the capability grid",
                 ))
+        from utils.capabilities import CAPABILITY_ENABLED
+
         for _capability in ISOBANDS_TABLE_NAMES:
+            if not CAPABILITY_ENABLED.get(_capability, True):
+                continue
             column = f"grid_mean_{_capability}"
             if column in columns:
                 view_specs.append((
@@ -856,7 +863,7 @@ def _build_capability_grid(
             if len(centroids) > max_cells:
                 raise ValueError(
                     f"Grid would exceed {max_cells:,} cells. "
-                    "Increase qgis_grid_cell_size_m or clean coordinate outliers."
+                    "Increase hexagon_radius or clean coordinate outliers."
                 )
             cy += y_step
             row_idx += 1

@@ -159,7 +159,65 @@ def _prepare_r5r_data_bundle(cfg) -> str:
         if stray.name not in staged_names and stray.suffix.lower() in (".zip", ".pbf"):
             stray.unlink()
 
+    _invalidate_stale_r5_network(data_dir, [pbf_path] + staged_gtfs)
+
     return data_dir
+
+
+def _r5_network_cache_files(data_dir: str) -> list[str]:
+    return [
+        os.path.join(data_dir, "network.dat"),
+        os.path.join(data_dir, "network_settings.json"),
+        os.path.join(data_dir, "gtfs_errors.csv"),
+    ]
+
+
+def _invalidate_stale_r5_network(data_dir: str, input_paths: list[str]) -> None:
+    """Delete a cached R5 network build (network.dat/network_settings.json) when the
+    staged PBF/GTFS inputs it was built from have changed.
+
+    r5r's build_network() reuses an existing network.dat whenever one is present in
+    data_dir, regardless of whether the GTFS/PBF files there still match what it was
+    built from -- it doesn't hash file contents, only checks that a cached network
+    exists. That silently serves a stale transit network: swapping in a new GTFS zip
+    (even reusing the same filename, e.g. a rebuilt gtfs_new_metro.zip) or changing
+    which feeds are staged has no effect until this cache is cleared, and the failure
+    mode is not "wrong answer" but a confusing r5r error like "no transit services on
+    the selected date" when the stale network's calendar doesn't cover the requested
+    departure date.
+
+    A manifest of (basename, size, mtime_ns) per input file is written into data_dir
+    and compared on every call; any mismatch (including "manifest missing", e.g. first
+    run after r5r built the cache directly) clears the cache so the next build_network()
+    call is forced to rebuild from what's actually on disk now.
+    """
+    manifest_path = os.path.join(data_dir, "_bundle_manifest.json")
+    current = {
+        os.path.basename(p): [os.path.getsize(p), os.stat(p).st_mtime_ns]
+        for p in input_paths
+    }
+
+    previous = None
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, encoding="utf-8") as f:
+                previous = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            previous = None
+
+    if previous != current:
+        removed = [p for p in _r5_network_cache_files(data_dir) if os.path.isfile(p)]
+        for p in removed:
+            os.remove(p)
+        if removed:
+            print(
+                f"[Bus] Staged GTFS/PBF inputs changed; cleared stale R5 network cache "
+                f"({', '.join(os.path.basename(p) for p in removed)}) so build_network() "
+                "rebuilds from the current files.",
+                flush=True,
+            )
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(current, f)
 
 
 def _download_regional_extract(cfg) -> str:
@@ -489,13 +547,16 @@ def _routing_taskset_prefix(on_host: bool) -> list[str]:
 def _resolve_transit_mode(cfg, transport_type: str) -> str:
     """Map a transport_type to the r5r transit mode passed to the R script.
 
-    Subway/metro route only the subway layer. Bus routes only the bus layer when a second
-    modality (subway) is also being routed for this city, so the two don't double-count on a
-    combined feed; otherwise bus falls back to the generic "TRANSIT" to preserve the original
-    single-feed behaviour for cities like Cagliari.
+    Subway/metro route only the second modality's layer, using whichever r5r mode string
+    matches that feed's actual GTFS route_type (cfg.subway_transit_mode -- "SUBWAY" for a
+    true route_type=1 metro like Paris' IDFM, "TRAM" for a route_type=0 light rail like
+    Cagliari's Metrocagliari; see the field's docstring in core/config.py). Bus routes only
+    the bus layer when a second modality is also being routed for this city, so the two
+    don't double-count on a combined feed; otherwise bus falls back to the generic "TRANSIT"
+    to preserve the original single-feed behaviour for cities with no second modality.
     """
     if transport_type in ("subway", "metro"):
-        return "SUBWAY"
+        return getattr(cfg, "subway_transit_mode", "SUBWAY")
     if getattr(cfg, "enable_subway", False):
         return "BUS"
     return "TRANSIT"

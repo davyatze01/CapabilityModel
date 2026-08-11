@@ -33,10 +33,21 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
     Outputs:
     - CapabilityStageResult: written output paths and number of processed rows.
     """
+    # capabilities is the ordered (name, services) list from config/capability.csv,
+    # restricted to those with enabled=True -- a disabled capability gets no
+    # capability_<name> column at all, not just a blank one, and is excluded from
+    # the recap averages.
+    capabilities = [
+        (name, services)
+        for name, services in cap.CAPABILITY_SERVICES.items()
+        if cap.CAPABILITY_ENABLED.get(name, True)
+    ]
+    capability_names = [name for name, _ in capabilities]
+
     # Build a deduplicated ordered list of all services across all capabilities.
     all_services: list[str] = []
     seen_services: set[str] = set()
-    for services in cap.CAPABILITY_SERVICES.values():
+    for _, services in capabilities:
         for s in services:
             if s not in seen_services:
                 seen_services.add(s)
@@ -44,16 +55,21 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
 
     output_path = ctx.output_paths["capabilities"]
     rows_written = 0
-    rest_sum = 0.0
-    nut_sum = 0.0
-    care_sum = 0.0
+    sums = {name: 0.0 for name in capability_names}
+    counts = {name: 0 for name in capability_names}
+
+    # See PipelineConfig.capability_score_mode: "discrete" (default) keeps the current
+    # 5-band-midpoint score; "continuous" is a statistics-only knob for scenario testing.
+    score_fn = (
+        cap.electre_tri_continuous_score
+        if getattr(ctx.config, "capability_score_mode", "discrete") == "continuous"
+        else cap.electre_tri_integration
+    )
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        header = [
-            "node_id", "lat", "lon",
-            "capability_restorativeness", "capability_nutrition", "capability_care",
-        ]
+        header = ["node_id", "lat", "lon"]
+        header.extend(f"capability_{name}" for name in capability_names)
         header.extend(f"service_{s}" for s in all_services)
         writer.writerow(header)
 
@@ -62,21 +78,19 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
             for node in svc.node_results:
                 scores = node.service_scores
 
-                rest_vals = [scores[s] for s in cap.CAP_RESTORATIVENESS_IDX]
-                nut_vals = [scores[s] for s in cap.CAP_NUTRITION_IDX]
-                care_vals = [scores[s] for s in cap.CAP_CARE_IDX]
+                capability_values = []
+                for name, services in capabilities:
+                    vals = [scores[s] for s in services]
+                    value = score_fn(vals, name) if vals else 0.0
+                    sums[name] += value
+                    counts[name] += 1
+                    capability_values.append(value)
 
-                capability_rest = cap.electre_tri_integration(rest_vals, "restorativeness") if rest_vals else 0.0
-                capability_nut = cap.electre_tri_integration(nut_vals, "nutrition") if nut_vals else 0.0
-                capability_care = cap.electre_tri_integration(care_vals, "care") if care_vals else 0.0
-
-                row = [node.node_id, node.lat, node.lon, capability_rest, capability_nut, capability_care]
+                row = [node.node_id, node.lat, node.lon]
+                row.extend(capability_values)
                 row.extend(scores.get(s, 0.0) for s in all_services)
                 writer.writerow(row)
 
-                rest_sum += capability_rest
-                nut_sum += capability_nut
-                care_sum += capability_care
                 rows_written += 1
                 if pbar:
                     pbar.update(1)
@@ -84,32 +98,32 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
             if pbar:
                 pbar.close()
 
-    avg_rest = (rest_sum / rows_written) if rows_written else 0.0
-    avg_nut = (nut_sum / rows_written) if rows_written else 0.0
-    avg_care = (care_sum / rows_written) if rows_written else 0.0
+    averages = {
+        name: (sums[name] / counts[name]) if counts[name] else 0.0
+        for name in capability_names
+    }
 
     experiments_dir = "experiments"
     os.makedirs(experiments_dir, exist_ok=True)
 
-    basename = os.path.basename(output_path)
-    dst_path = os.path.join(experiments_dir, f"{ctx.config.artifact_slug}_{basename}")
+    dst_path = os.path.join(experiments_dir, f"{ctx.config.artifact_slug}_capability.csv")
     dst_path = _ensure_unique_path(dst_path)
     shutil.move(output_path, dst_path)
     moved_output_paths = {"capabilities": dst_path}
 
+    # The recap file's column set follows the currently configured capabilities. If
+    # that set changes between runs, older rows in the same recap file were written
+    # under a different header and will not line up column-for-column with new ones.
     recap_path = os.path.join(experiments_dir, "capability_experiments_recap.csv")
-    recap_header = [
-        "city_slug",
-        "artifact_slug",
-        "avg_capability_restorativeness",
-        "avg_capability_nutrition",
-        "avg_capability_care",
-    ]
+    recap_header = ["city_slug", "artifact_slug"]
+    recap_header.extend(f"avg_capability_{name}" for name in capability_names)
     should_write_header = (not os.path.exists(recap_path)) or os.path.getsize(recap_path) == 0
     with open(recap_path, "a", newline="", encoding="utf-8") as recap_f:
         writer = csv.writer(recap_f)
         if should_write_header:
             writer.writerow(recap_header)
-        writer.writerow([ctx.config.city_slug, ctx.config.artifact_slug, avg_rest, avg_nut, avg_care])
+        recap_row = [ctx.config.city_slug, ctx.config.artifact_slug]
+        recap_row.extend(averages[name] for name in capability_names)
+        writer.writerow(recap_row)
 
     return CapabilityStageResult(output_paths=moved_output_paths, rows_written=rows_written)

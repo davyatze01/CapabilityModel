@@ -13,10 +13,12 @@ capability score per node.
 Important implementation note:
 - ELECTRE TRI compares each alternative against a boundary profile (the ideal
   all-ones vector) and returns the credibility σ(x, b_ideal) ∈ [0, 1]
-- the module also writes `config/capability.csv` at import time so the CSV stays
-  aligned with the hardcoded capability-service mapping below
+- `config/capability.csv` is the source of truth for which capabilities exist,
+  their services, and their ELECTRE TRI weight/veto/enabled settings -- see
+  `_load_capability_config()`
 """
 
+import ast
 import bisect
 import csv
 import os
@@ -27,30 +29,12 @@ from statistics import pstdev
 from core.config import ELECTRE_Q_FACTOR, ELECTRE_P_FACTOR, ELECTRE_LAMBDA_CUT
 
 
-# Ordered service lists for each capability.
-# The dictionary values are only used to preserve a stable ordering.
-CAP_RESTORATIVENESS_IDX = {
-    "sport_and_movement": 0,
-    "scenic_views": 1,
-    "quietness": 2,
-    "cultural_activities": 3,
-    "nature_contact": 4,
-}
-
-CAP_NUTRITION_IDX = {
-    "eating_out": 0,
-    "food_access": 1,
-}
-
-CAP_CARE_IDX = {
-    "medicines_and_supplies": 0,
-    "diagnosis_and_prevention": 1,
-    "emergency_services": 2,
-    "care_services": 3,
-}
-
-# Per-capability singleton measures used by the Choquet aggregation.
-# These are the base importance values for individual services.
+# Per-capability singleton measures used by the legacy Choquet-based capability
+# aggregation (cap() / choquet_integral() below). The current pipeline does not
+# call these -- capability_stage.py uses electre_tri_integration() instead --
+# and this dict is not read from config/capability.csv, so it only has entries
+# for the case study's original three capabilities. Kept for reference/manual
+# use; will KeyError if called for a capability outside that original set.
 CAP_SINGLETON_M = {
     "restorativeness": {
         "sport_and_movement": 1.0,     # direct restorative mechanism (activity, stress relief)
@@ -70,6 +54,7 @@ CAP_SINGLETON_M = {
         "diagnosis_and_prevention": 1.0,     # core diagnostic/preventive access
         "emergency_services": 1.0,           # core
         "care_services": 1.0,                # core (ongoing care)
+        "impatient_and_rehabilitation": 1.0, # core (inpatient/rehab access)
     },
 }
 
@@ -127,7 +112,7 @@ def choquet_integral(x, capability):
         prev = x_sorted[j]
     return total
 
-_BOUNDARIES  = [0.2, 0.4, 0.6, 0.8]
+_BOUNDARIES  = [0.35, 0.6, 0.8, 0.95]
 _CATEGORIES  = ["Very Low", "Low", "Medium", "High", "Very High"]
 _CAT_SCORE   = {cat: (lo + hi) / 2
                 for cat, lo, hi in zip(
@@ -199,8 +184,8 @@ def electre_tri_details(x, capability):
         )
         return details
 
-    q = std * ELECTRE_Q_FACTOR
-    p = std * ELECTRE_P_FACTOR
+    q = 0.02
+    p = 0.06
     inf_veto = v == float("inf")
     pq_range = p - q
     # Per-service ELECTRE weights (from CAP_ELECTRE_W / the electre_weight column
@@ -321,17 +306,155 @@ def electre_tri_integration(x, capability):
     return float(electre_tri_details(x, capability)["score"])
 
 
-# Stable service order for each capability.
-CAPABILITY_SERVICES = {
-    "restorativeness": list(CAP_RESTORATIVENESS_IDX.keys()),
-    "nutrition": list(CAP_NUTRITION_IDX.keys()),
-    "care": list(CAP_CARE_IDX.keys()),
-}
+def electre_tri_continuous_score(x, capability):
+    """Aggregate service scores into one capability score, keeping ELECTRE TRI's
+    continuous credibility instead of collapsing it to a 5-band midpoint.
 
-# Equal default ELECTRE weights for all services inside each capability.
-CAP_ELECTRE_W = {
-    capability: {service: 1.0 / len(services) for service in services}
-    for capability, services in CAPABILITY_SERVICES.items()
+    `electre_tri_integration()` assigns a node to one of 5 categories and returns
+    that category's midpoint (0.1/0.3/0.5/0.7/0.9) -- every node in the same band
+    gets an identical score, which is exactly what makes level-based comparisons
+    lose resolution. This instead averages the raw outranking credibility
+    `sigma(x, b_k)` computed against each of the 4 interior boundaries (same
+    concordance/discordance/veto machinery, before the lambda-cut classification
+    step), giving a smooth, monotonically non-decreasing score in [0, 1] with the
+    same qualitative behavior. Statistics-only: not used by the production
+    capability_<name> map/level output unless PipelineConfig.capability_score_mode
+    is explicitly set to "continuous" (see stages/capability_stage.py).
+    """
+    details = electre_tri_details(x, capability)
+    boundaries = details["boundaries"]
+    if not boundaries:
+        # Degenerate case (all service scores equal): no boundary credibilities were
+        # computed, so fall back to the discrete band score already picked in details.
+        return float(details["score"])
+    return float(sum(b["credibility"] for b in boundaries) / len(boundaries))
+
+
+CAPABILITY_CSV_PATH = Path(__file__).resolve().parents[1] / "config" / "capability.csv"
+
+
+def _load_capability_config(
+    path: Path, valid_services: "set[str] | None" = None
+) -> tuple["OrderedDict[str, list[str]]", dict[str, dict[str, float]], dict[str, float], dict[str, bool]]:
+    """Load and validate capability configuration rows from config/capability.csv.
+
+    This is the single source of truth for which capabilities exist, which
+    services belong to each, and the ELECTRE TRI weight/veto/enabled settings
+    for each capability -- an analyst can add, remove, rename, or reweight
+    capabilities entirely through this file.
+
+    When valid_services is given, every service in `services` must exist in
+    it; passing None skips that check here (the reverse-direction check --
+    every service referenced by a capability has POIs configured -- is already
+    enforced by utils.services._bootstrap_compatibility_checks(), and doing it
+    here too would make this module import utils.services, which itself
+    imports this module to run that check, creating a circular import).
+    `electre_weight` falls back to equal weighting across the capability's
+    services when missing or malformed; `veto_threshold` falls back to
+    infinity (no veto); `enabled` falls back to true.
+
+    Inputs:
+    - path: path to the capability configuration CSV.
+    - valid_services: optional set of service identifiers to validate
+      `services` against; skipped when None.
+
+    Outputs:
+    - tuple of (ordered services per capability, weight per service per
+      capability, veto threshold per capability, enabled flag per
+      capability), each keyed by capability, in file order.
+    """
+    if not path.is_file():
+        raise ValueError(f"Invalid capability config CSV (path={path}): file not found")
+
+    capability_services: "OrderedDict[str, list[str]]" = OrderedDict()
+    weights: dict[str, dict[str, float]] = {}
+    veto: dict[str, float] = {}
+    enabled: dict[str, bool] = {}
+
+    with path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames) if reader.fieldnames is not None else None
+        required = ["capability", "services", "electre_weight", "veto_threshold", "enabled"]
+        if fieldnames is None:
+            raise ValueError(
+                f"Invalid capability config CSV (path={path}): missing header row, expected {required}"
+            )
+        missing = [c for c in required if c not in fieldnames]
+        if missing:
+            raise ValueError(
+                f"Invalid capability config CSV (path={path}): missing required columns {missing}; found {fieldnames}"
+            )
+
+        for idx, row in enumerate(reader, start=2):
+            capability = (row.get("capability") or "").strip()
+            if not capability:
+                raise ValueError(
+                    f"Invalid capability config CSV (path={path} row={idx} column=capability): expected non-empty string"
+                )
+            if capability in capability_services:
+                raise ValueError(
+                    f"Invalid capability config CSV (path={path} row={idx} column=capability): duplicate capability {capability!r}"
+                )
+
+            services_raw = (row.get("services") or "").strip()
+            try:
+                services = ast.literal_eval(services_raw)
+            except Exception as exc:
+                raise ValueError(
+                    f"Invalid capability config CSV (path={path} row={idx} column=services): "
+                    f"expected Python list literal, got {services_raw!r}"
+                ) from exc
+            if not isinstance(services, list) or not services:
+                raise ValueError(
+                    f"Invalid capability config CSV (path={path} row={idx} column=services): expected non-empty list"
+                )
+            services_clean = [str(s).strip() for s in services]
+            if valid_services is not None:
+                for s in services_clean:
+                    if s not in valid_services:
+                        raise ValueError(
+                            f"Invalid capability config CSV (path={path} row={idx} column=services): unknown service {s!r}"
+                        )
+
+            weight_raw = (row.get("electre_weight") or "").strip()
+            row_weights = None
+            if weight_raw:
+                try:
+                    weight_values = ast.literal_eval(weight_raw)
+                except Exception:
+                    weight_values = None
+                if isinstance(weight_values, list) and len(weight_values) == len(services_clean):
+                    try:
+                        row_weights = {s: float(w) for s, w in zip(services_clean, weight_values)}
+                    except (TypeError, ValueError):
+                        row_weights = None
+            if row_weights is None:
+                row_weights = {s: 1.0 / len(services_clean) for s in services_clean}
+
+            veto_raw = (row.get("veto_threshold") or "").strip()
+            try:
+                row_veto = float(veto_raw) if veto_raw else _DEFAULT_V
+            except ValueError:
+                row_veto = _DEFAULT_V
+
+            enabled_raw = (row.get("enabled") or "").strip().lower()
+            row_enabled = enabled_raw in ("true", "1", "yes") if enabled_raw else True
+
+            capability_services[capability] = services_clean
+            weights[capability] = row_weights
+            veto[capability] = row_veto
+            enabled[capability] = row_enabled
+
+    return capability_services, weights, veto, enabled
+
+
+CAPABILITY_SERVICES, CAP_ELECTRE_W, _veto_by_capability, CAPABILITY_ENABLED = _load_capability_config(
+    CAPABILITY_CSV_PATH
+)
+
+# Runtime lookup consumed by electre_tri_integration().
+_ELECTRE_PARAMS = {
+    capability: {"v": veto} for capability, veto in _veto_by_capability.items()
 }
 
 
@@ -342,13 +465,30 @@ CAP_ELECTRE_W = {
 # duplicated with "must stay in sync" comments so the two rendering paths can
 # never drift.
 
-# Signature color for each capability. Every service under a capability, the
-# capability grid itself, and its legend all use this one color.
-CAPABILITY_COLORS = {
-    "nutrition": "#FFA200",
-    "care": "#EB4CCC",
-    "restorativeness": "#006BFF",
-}
+# Default signature colours, in CAPABILITY_SERVICES order (restorativeness,
+# nutrition, care). Overridable per run via PipelineConfig.capability_colors.
+_DEFAULT_CAPABILITY_COLORS = ["#006BFF", "#FFA200", "#EB4CCC"]
+
+
+def get_capability_colors(cfg=None) -> dict[str, str]:
+    """Map each capability to its signature color, in CAPABILITY_SERVICES order.
+
+    Inputs:
+    - cfg: optional PipelineConfig. When given, colors come from
+      cfg.capability_colors instead of the module default.
+
+    Outputs:
+    - dict of capability name -> hex color string.
+    """
+    colors = list(cfg.capability_colors) if cfg is not None else _DEFAULT_CAPABILITY_COLORS
+    return dict(zip(CAPABILITY_SERVICES.keys(), colors))
+
+
+# Every service under a capability, the capability grid itself, and its legend
+# all use this one color. Kept as a module-level default for callers that don't
+# have a PipelineConfig handy (standalone legend/dashboard scripts); callers that
+# do have one should call get_capability_colors(cfg) instead.
+CAPABILITY_COLORS = get_capability_colors()
 
 # ELECTRE TRI class boundaries and human labels. Five classes over [0, 1].
 ELECTRE_BOUNDS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
@@ -387,47 +527,3 @@ def capability_shade_hexes(color_hex: str) -> list[str]:
         r, g, b, _ = cmap(frac)
         hexes.append("#{:02x}{:02x}{:02x}".format(round(r * 255), round(g * 255), round(b * 255)))
     return hexes
-
-
-output_path = Path(__file__).resolve().parents[1] / "config" / "capability.csv"
-
-# Read existing veto values so user edits in the CSV are preserved.
-_saved_v: dict[str, float] = {}
-if output_path.exists():
-    try:
-        with open(output_path, newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                capability = str(row.get("capability", "")).strip()
-                if not capability:
-                    continue
-                raw_veto = str(row.get("veto_threshold", "")).strip()
-                if raw_veto:
-                    _saved_v[capability] = float(raw_veto)
-    except Exception:
-        pass
-
-rows = []
-for capability, services in CAPABILITY_SERVICES.items():
-    rows.append({
-        "capability":    capability,
-        "services":      services,
-        "electre_weight": [CAP_ELECTRE_W[capability][s] for s in services],
-        "veto_threshold": _saved_v.get(capability, _DEFAULT_V),
-        "enabled":        True,
-    })
-
-with open(output_path, "w", newline="", encoding="utf-8") as f:
-    writer = csv.DictWriter(
-        f,
-        fieldnames=["capability", "services", "electre_weight", "veto_threshold", "enabled"],
-    )
-    writer.writeheader()
-    for row in rows:
-        writer.writerow(row)
-
-# Runtime lookup consumed by electre_tri_integration().
-_ELECTRE_PARAMS = {
-    str(row["capability"]): {"v": float(row["veto_threshold"])}
-    for row in rows
-}

@@ -111,10 +111,8 @@ def poi_from_shp(poi_type: str | None = None):
                 crs=frames[0].crs,
             )
             # Normalise poi_type column name once on load.
-            if "poi_type" not in merged.columns and "poiType" in merged.columns:
-                merged = merged.rename(columns={"poiType": "poi_type"})
-            if "poi_type" not in merged.columns and "TYPEQU" in merged.columns:
-                merged = merged.rename(columns={"TYPEQU": "poi_type"})
+            if "poi_type" not in merged.columns and cfg.poi_label_field in merged.columns:
+                merged = merged.rename(columns={cfg.poi_label_field: "poi_type"})
 
             # Shapefiles (esp. Paris' MGP layers) carry many attribute columns that
             # nothing downstream reads — graphml.get_poi_geometries only pulls

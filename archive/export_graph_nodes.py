@@ -78,7 +78,7 @@ def export_hex_centroids(out_path: str | Path | None = None) -> Path:
     work = points_gdf.to_crs(utm_crs)
     min_x, min_y, max_x, max_y = work.total_bounds
 
-    cell_size_m = float(cfg.qgis_grid_cell_size_m)
+    cell_size_m = float(cfg.hexagon_radius)
     hex_radius_m = cell_size_m / math.cos(math.pi / 6.0)
     hex_height_m = math.sqrt(3.0) * hex_radius_m
     x_step_m = 1.5 * hex_radius_m

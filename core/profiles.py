@@ -35,6 +35,10 @@ CANTEENS_CSV = os.path.join("config", "canteens_cagliari.csv")
 # gtfs/make_accessible_gtfs.py (only used by profiles with pt_accessible_stops_only).
 ACCESSIBLE_GTFS_PATH = os.path.join("gtfs", "GTFS_accessible.zip")
 
+# Default location of the Metrocagliari-plus-extension GTFS feed produced by
+# gtfs/make_new_metro_gtfs.py (only used by the "new-metro" scenario's NEW_METRO profile).
+NEW_METRO_GTFS_PATH = os.path.join("gtfs", "gtfs_new_metro.zip")
+
 _ALL_NON_BUS_MODES = ("walk", "bike", "drive")
 
 
@@ -87,6 +91,10 @@ class Profile:
     - pt_accessible_stops_only: when True, public transport is routed against an
       accessible-stops-only GTFS feed (accessible_gtfs_path).
     - accessible_gtfs_path: path to that feed.
+    - extra_config_overrides: additional ``PipelineConfig`` kwargs merged in on top of the
+      ones above (last, so it can override them) -- the escape hatch for scenarios that
+      aren't persona traits but still want a full ProfileRunner-style re-route, e.g. a new
+      transit line (``gtfs_feeds`` + ``enable_subway``). Empty for ordinary personas.
     """
 
     key: str
@@ -97,6 +105,7 @@ class Profile:
     canteen_source_keys: frozenset[str] = field(default_factory=frozenset)
     pt_accessible_stops_only: bool = False
     accessible_gtfs_path: str = ACCESSIBLE_GTFS_PATH
+    extra_config_overrides: dict[str, object] = field(default_factory=dict)
 
     def enabled_non_bus_modes(self) -> tuple[str, ...]:
         """The routed/fused non-bus modes, in the canonical walk/bike/drive order."""
@@ -115,6 +124,7 @@ class Profile:
         }
         if self.pt_accessible_stops_only and self.accessible_gtfs_path:
             overrides["gtfs_feeds"] = [self.accessible_gtfs_path]
+        overrides.update(self.extra_config_overrides)
         return overrides
 
     def utility_for(self, source_key: object) -> float:
@@ -167,13 +177,54 @@ STUDENT = Profile(
     pt_accessible_stops_only=False,
 )
 
+# Universal traveler again, but routed against Cagliari's own bus feed (gtfs/GTFS.zip,
+# untouched) *plus* MCA1 extended past REPUBBLICA to SAN SATURNINO/BONARIA/LUSSU/DARSENA/
+# MUNICIPIO/STAZIONE, merged by gtfs/make_new_metro_gtfs.py into gtfs/gtfs_new_metro.zip,
+# with subway routing turned on -- Cagliari has no metro modality at all in the ordinary
+# baseline (enable_subway defaults to False there), so this is "what if the city added this
+# line on top of what it already has", not a persona trait. Same enabled_modes/
+# affordability/canteen as BASELINE, and the same bus network + no bus_departure_dt
+# override, so the *only* difference from BASELINE is the metro line's presence.
+#
+# The metro source (gtfs_metrocagliari.zip) only has service via calendar_dates.txt
+# exceptions dated across 2026 -- a different vintage than gtfs/GTFS.zip's Oct-Nov 2025
+# calendar, with zero overlapping dates -- so make_new_metro_gtfs.py re-declares the
+# metro's FER/FEST services as plain weekday-flag services spanning the *bus* feed's own
+# calendar window instead of carrying over the metro's 2026 exceptions. That is what makes
+# BASELINE's default bus_departure_dt (2025-10-15, a Wednesday) resolve real metro trips
+# here too, without touching the bus network at all.
+NEW_METRO = Profile(
+    key="new_metro",
+    enabled_modes=frozenset({"walk", "bike", "drive", "bus"}),
+    walk_speed_kmh=5.0,
+    affordability=1.0,
+    canteen_utility=1.0,
+    canteen_source_keys=_CANTEENS,
+    pt_accessible_stops_only=False,
+    extra_config_overrides={
+        "gtfs_feeds": [NEW_METRO_GTFS_PATH],
+        "enable_subway": True,
+        # Metrocagliari (MCA1/MCA2) is published as GTFS route_type=0 (tram/light rail),
+        # not route_type=1 -- despite being colloquially "the metro" -- so r5r must be asked
+        # for "TRAM" here, not the "SUBWAY" default (which matches Paris' true route_type=1
+        # métro). Requesting the wrong mode finds zero matching routes silently, not an
+        # error: see core.config.PipelineConfig.subway_transit_mode's docstring.
+        "subway_transit_mode": "TRAM",
+    },
+)
+
 # Named scenario bundles, selected by string (e.g. `python scenarios.py elder-student`).
 # Order matters: it sets the display order of the per-scenario capability grids and the
 # pairwise-difference order (all C(n,2) pairs in listing order) — here baseline→student,
 # baseline→elderly, student→elderly.
 SCENARIOS: dict[str, tuple[Profile, ...]] = {
     "elder-student": (BASELINE, STUDENT, ELDERLY),
+    # baseline (no metro) -> new-metro (bus + extended Metrocagliari line to STAZIONE).
+    "new-metro": (BASELINE, NEW_METRO),
 }
 
-# The three capability keys, in a stable order for grids/legends.
-CAPABILITIES: tuple[str, ...] = ("restorativeness", "nutrition", "care")
+# The configured capability keys (config/capability.csv), in a stable order for
+# grids/legends. Not fixed to any particular set or count of capabilities.
+from utils.capabilities import CAPABILITY_SERVICES as _CAPABILITY_SERVICES
+
+CAPABILITIES: tuple[str, ...] = tuple(_CAPABILITY_SERVICES.keys())

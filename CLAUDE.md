@@ -1,5 +1,33 @@
 # Project preferences
 
+## Pair-programming mode: analyze, don't generate
+
+Do not write or edit code in this repository. The user writes the code; act as a pair-programming
+partner who analyzes and advises.
+
+- If asked for syntax (e.g. "how would I sort list x ascending?"), don't produce the exact line.
+  Name the relevant function/method and explain its parameters/behavior the way documentation
+  would, and let the user write the line themselves.
+- If asked how to approach a plan/problem, propose exactly 2 approaches as numbered steps, then
+  explain why approach 1 is preferable to approach 2.
+- When asked to explain a step from a proposed approach, frame the explanation as "we're doing
+  this instead of that" — contrast the chosen step against the alternative it displaced.
+
+## Dev log
+
+Maintain `docs/DEVLOG.md` as a running log of the user's code edits (I don't write code myself in
+this repo — see above — so this logs *the user's* changes, discussed/reviewed with me).
+
+- One `## YYYY-MM-DD` block per day.
+- Within a block, one bullet per semantically distinct edit: where the edit is (file/function),
+  what problem was detected, and how it was fixed. Keep adding detail to the same bullet while
+  we're still working the same thread; start a new bullet once the conversation moves to a
+  semantically different edit.
+- Check `git diff`/`git status` to ground entries in what actually changed, rather than relying
+  only on the conversation's account of it.
+- Update the log at natural checkpoints — when a discussed change looks finished, or when asked
+  directly — not continuously mid-edit.
+
 ## Fail fast, don't hang
 
 When implementing anything long-running (routing, batch jobs, subprocess calls, GC/memory-bound
@@ -80,7 +108,10 @@ namespace), and during the accessibility stage (`ctx.profile` → the per-POI ut
   `wheelchair_boarding == 1`; `--keep-unknown` also keeps `0`/empty). Canteen instances live in
   `config/canteens_cagliari.csv` (OSM ids), not as a POI type/category.
 - **Outputs** land in `scenarios/<key>/`: per-scenario capability hex grids (3 capabilities ×
-  baseline/persona…), `differences.gpkg` with one pairwise level-difference grid per pair
-  (`d_<capability> = level(second) − level(first)`, ELECTRE levels 1–5), and
-  `profile_comparison.qgz`. The difference grids use a red/yellow/green ramp: yellow = same
-  level, red = second scenario lower (by 1–4 levels), green = second scenario higher.
+  baseline/persona…), `differences.gpkg` with one `diff_<A>_to_<B>__<capability>` layer per
+  pair *per capability* (`d_<capability> = level(second) − level(first)`, ELECTRE levels 1–5),
+  and `profile_comparison.qgz`. The difference grids use a red/yellow/green ramp: yellow = same
+  level, red = second scenario lower (by 1–4 levels), green = second scenario higher. Each
+  layer's style is embedded into the gpkg itself (`saveStyleToDatabase`, one layer = one table
+  = one unambiguous default style), so opening `differences.gpkg` directly in QGIS — outside
+  `profile_comparison.qgz` — still shows the correct colors.

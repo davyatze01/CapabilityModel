@@ -9,9 +9,10 @@ class PipelineContext:
     nodes_with_coords: list[tuple[Any, dict]]
     workers: int
     output_paths: dict[str, str]
-    rest_services: list[str]
-    nut_services: list[str]
-    care_services: list[str]
+    # Ordered services per capability, as configured in config/capability.csv (see
+    # utils.capabilities.CAPABILITY_SERVICES) -- not fixed to any particular set of
+    # capability names.
+    capability_services: dict[str, list[str]]
 
 
 @dataclass

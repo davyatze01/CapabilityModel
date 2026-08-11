@@ -1,44 +1,43 @@
 """Visual debug pipeline for capability scores.
 
+This debug pipeline assumes that main.py pipeline has already
+completed a full run for the current study_city, since grid_params.json and the capability
+exports and non-bus/bus/accessibility/service caches must already be on disk.
+Otherwise, a runtime error will be thrown.
+
 Reads all intermediate pipeline artifacts for a sample of hexagons (4 near the
 grid centre + 1 near each bounding-box corner) and writes a single self-contained
 HTML report that walks through the full computation chain:
 
   raw impedances → accessibility decay → Choquet service aggregation → ELECTRE TRI
-
-Usage:
-    # Pick the city by editing STUDY_CITY below, then just run:
-    python debug_pipeline.py
-    # (--study-city / --output remain as optional overrides.)
 """
 
 from __future__ import annotations
 
-# ── Edit here to switch the whole debug report to another city ────────────────────────
-# Mirrors main.py's `study_city` knob. Must match a key in config.CITY_PRESETS
-# (e.g. "cagliari", "paris"). The config and every artifact path are derived from this,
-# so the report always reads the right city's artifacts.
 STUDY_CITY = "paris"
 
 # ── Report size knobs ──────────────────────────────────────────────────────────────────
+
 # Steps 1/2 list every POI a hex's node reaches per poi_type. That's fine for a sparse
 # city (Cagliari) but a dense one (Paris/mgp_boundary) can have thousands of POIs per
 # type per hex, which is what blew the report up to ~2GB. Lists are already sorted
 # best-first (nearest / highest accessibility), so truncating just drops the long tail
 # that nobody scrolls to anyway.
 MAX_POIS_PER_TYPE = 30
+
 # Cap on rows carried into the step-5 export-verification table (also sorted, mismatches
 # first). Kept as a knob alongside MAX_POIS_PER_TYPE rather than a hardcoded constant.
 MAX_VERIFY_ROWS = 150
+
 # How many hexagons to sample (kept as a knob for symmetry with the caps above; the
 # selection logic below assumes up to 4 centre + 1 per corner).
 MAX_CENTER_HEXAGONS = 4
+
 # The Δg aggregation table only ever renders the top 10 ranks per poi_type client-side
 # (see `agg.steps.slice(0, 10)`); keep at most this many in the exported JSON too. The
 # running `total` is still summed over every POI regardless of this cap.
 MAX_AGGREGATION_STEPS = 10
 
-import argparse
 import csv
 import json
 import math
@@ -1433,20 +1432,16 @@ def _build_html(chain_data: dict, slug: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point
+# This function is called by main.py to generate the debug pipeline 
+# immediately after the run is done
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate capability debug pipeline HTML.")
-    parser.add_argument("--study-city", default=None, help=f"Override the script's STUDY_CITY (default: {STUDY_CITY})")
-    parser.add_argument("--output", default=None, help="Output HTML path (default: outputs/debug_pipeline_{slug}.html)")
-    args = parser.parse_args()
+def run_debug_pipeline(study_city = STUDY_CITY, output = None) -> None:
 
     # Build the config straight from the chosen city so __post_init__ derives the city_slug,
     # artifact_slug and every *_path consistently. (Constructing a default config and then
     # calling apply_study_city() afterwards does NOT re-derive those paths, which is why the
     # report used to load the wrong city's artifacts.)
-    study_city = args.study_city or STUDY_CITY
     # Several lower-level functions (utils/graphml.py, utils/poi_dedup.py,
     # utils/load_shapefile.py) construct their own bare PipelineConfig() instead of using
     # the cfg built here, which falls back to CAP_STUDY_CITY from the environment. If a
@@ -1455,6 +1450,7 @@ def main() -> None:
     # script's own cfg correctly says `study_city`, causing a Frankenstein mix of this
     # city's paths/slug with the other city's data. Set it explicitly here too (mirroring
     # main.py) so every bare PipelineConfig() reconstruction agrees with this one.
+
     os.environ["CAP_STUDY_CITY"] = study_city
     cfg = PipelineConfig(study_city=study_city)
 
@@ -1509,11 +1505,13 @@ def main() -> None:
 
     html = _build_html(chain_data, slug)
 
-    out_path = args.output or os.path.join("outputs", f"debug_pipeline_{slug}.html")
+    out_path = os.path.join("outputs", f"debug/{slug}/debug_pipeline.html") if output is None else output 
+    # I haven't used " output or ..." because output = "" would count as False
+    
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_path).write_text(html, encoding="utf-8")
     print(f"[Debug] Written: {out_path}")
 
 
 if __name__ == "__main__":
-    main()
+    run_debug_pipeline()

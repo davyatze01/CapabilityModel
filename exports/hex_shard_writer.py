@@ -29,6 +29,7 @@ Record wire format inside a shard payload:
 
 import base64
 import json
+import multiprocessing as mp
 import os
 import re
 import shutil
@@ -37,6 +38,8 @@ import zlib
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+from tqdm import tqdm
 
 from utils import capabilities as cap_mod
 from utils import services as serv
@@ -48,10 +51,20 @@ SCHEMA = "hexagon_poi_powers_v2"
 # memory unit — 16 hexes/shard keeps one shard in the tens of MB of JS heap.
 SHARD_BLOCK = 4
 SCALE = 10000  # quantization: stored int = round(value * SCALE)
+# zlib level 9 (max compression) is ~3-5x slower than the default (6) for a few
+# percent smaller output. Shards are read directly by a browser, not shipped over a
+# slow link, so the extra bytes aren't worth the wait during finalize().
+SHARD_ZLIB_LEVEL = 6
 _HEX_ID_RE = re.compile(r"^H(\d+)_(\d+)$")
 
 MANIFEST_CALLBACK = "__onHexPoisManifest"
 SHARD_CALLBACK = "__onHexShardZ"
+# Written into _tmp_dir once the scoring loop (add_hexagon calls) has fully
+# completed, so a rerun of finalize() -- e.g. after crashing partway through
+# shard packing -- can skip re-scoring every node and go straight to
+# finalize(). Only ever written after the *complete* pass, so its presence is
+# proof the part files are a consistent, finished set.
+SCORING_DONE_MARKER = "_scoring_done.json"
 
 
 def shard_name_for_hex(hex_id: str, block: int = SHARD_BLOCK) -> str:
@@ -134,6 +147,47 @@ def decode_records(
     return out
 
 
+def _finalize_shard(
+    task: tuple[str, str, str, dict[str, dict[int, int]], dict[str, dict[int, int]], list[str], list[str]],
+) -> str:
+    """Assemble one shard: read its part file, remap sp/cp through the fitted
+    per-key quantile scaler, deflate, and write the shard .js file.
+
+    A plain top-level function (not a method) so it's picklable for
+    multiprocessing -- HexShardWriter.finalize() farms this out across a
+    worker pool, one call per shard, since shards are independent of each
+    other once the scaler has been fit.
+    """
+    tmp_dir, out_dir, part_name, svc_remap, cap_remap, services, capabilities = task
+    shard = part_name[: -len(".part")]
+    hexmap: dict[str, list[Any]] = {}
+    with open(os.path.join(tmp_dir, part_name), encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            hex_id, records = json.loads(line)
+            for rec in records:
+                if isinstance(rec, int):
+                    continue
+                _, sp_flat, cp_flat = rec
+                for k in range(0, len(sp_flat), 2):
+                    remap = svc_remap.get(services[sp_flat[k]])
+                    if remap:
+                        sp_flat[k + 1] = remap.get(sp_flat[k + 1], sp_flat[k + 1])
+                for k in range(0, len(cp_flat), 2):
+                    remap = cap_remap.get(capabilities[cp_flat[k]])
+                    if remap:
+                        cp_flat[k + 1] = remap.get(cp_flat[k + 1], cp_flat[k + 1])
+            hexmap[hex_id] = records
+    payload = json.dumps(hexmap, ensure_ascii=False, separators=(",", ":"))
+    packed = base64.b64encode(zlib.compress(payload.encode("utf-8"), SHARD_ZLIB_LEVEL)).decode("ascii")
+    out_name = f"{shard}.js"
+    with open(os.path.join(out_dir, out_name), "w", encoding="utf-8") as f:
+        f.write(f'{SHARD_CALLBACK}("{shard}","{packed}");')
+    return out_name
+
+
 class HexShardWriter:
     """Streaming writer for the sharded hex-POI store.
 
@@ -150,6 +204,7 @@ class HexShardWriter:
         block: int = SHARD_BLOCK,
         scale: int = SCALE,
         scale_powers: bool = False,
+        resume: bool = False,
     ):
         self.out_dir = out_dir
         self.slug = slug
@@ -167,11 +222,29 @@ class HexShardWriter:
         # (finalize), so no raw values are buffered -- memory stays bounded.
         self._scaler = PerKeyQuantileScaler(self.scale) if scale_powers else None
 
+        marker_path = os.path.join(self._tmp_dir, SCORING_DONE_MARKER)
+        self.resumed = resume and os.path.isfile(marker_path)
+        if self.resumed:
+            # A prior run's scoring pass (add_hexagon loop) finished cleanly and
+            # left its part files behind -- skip straight to finalize() instead
+            # of re-scoring every node, which is the expensive part (hours).
+            with open(marker_path, encoding="utf-8") as f:
+                self._hex_ids = json.load(f)["hex_ids"]
+            return
+
         # Regenerate from scratch so hexagons/shards removed since a prior run
-        # (including old v1 per-hex files) don't linger.
+        # (including old v1 per-hex files, or a scoring pass that never
+        # finished and left an inconsistent set of part files) don't linger.
         if os.path.isdir(out_dir):
             shutil.rmtree(out_dir)
         os.makedirs(self._tmp_dir, exist_ok=True)
+
+    def mark_scoring_complete(self) -> None:
+        """Checkpoint the finished scoring pass so a later run can resume=True
+        straight into finalize() without repeating add_hexagon() for every node."""
+        marker_path = os.path.join(self._tmp_dir, SCORING_DONE_MARKER)
+        with open(marker_path, "w", encoding="utf-8") as f:
+            json.dump({"hex_ids": self._hex_ids}, f)
 
     def add_hexagon(self, hex_id: str, entries: list[dict[str, Any]]) -> None:
         """Encode one hexagon's entries and append them to its shard part file.
@@ -184,17 +257,8 @@ class HexShardWriter:
         records = encode_records(entries, self._svc_index, self._cap_index, self.scale)
         if self._scaler is not None:
             # Pass 1 of the quantile scaling: tally every quantized sp/cp value
-            # so finalize() can remap it to its per-key rank. Records are either a
-            # bare poi_id (int) or [poi_id, sp_flat, cp_flat] with flats laid out
-            # as [key_index, q, key_index, q, ...].
-            for rec in records:
-                if isinstance(rec, int):
-                    continue
-                _, sp_flat, cp_flat = rec
-                for k in range(0, len(sp_flat), 2):
-                    self._scaler.observe(self.services[sp_flat[k]], sp_flat[k + 1])
-                for k in range(0, len(cp_flat), 2):
-                    self._scaler.observe(self.capabilities[cp_flat[k]], cp_flat[k + 1])
+            # so finalize() can remap it to its per-key rank.
+            self._observe_records(records)
         line = json.dumps([hex_id, records], ensure_ascii=False, separators=(",", ":"))
         shard = shard_name_for_hex(hex_id, self.block)
         with open(os.path.join(self._tmp_dir, f"{shard}.part"), "a", encoding="utf-8") as f:
@@ -206,50 +270,87 @@ class HexShardWriter:
     def hex_count(self) -> int:
         return len(self._hex_ids)
 
-    def _rescale_records(self, records: list[Any]) -> list[Any]:
-        """Remap each record's sp/cp quantized values through the fitted scaler."""
-        if self._scaler is None:
-            return records
+    def _observe_records(self, records: list[Any]) -> None:
+        """Feed one hexagon's encoded records into the scaler's histograms.
+
+        Records are either a bare poi_id (int) or [poi_id, sp_flat, cp_flat]
+        with flats laid out as [key_index, q, key_index, q, ...].
+        """
         for rec in records:
             if isinstance(rec, int):
                 continue
             _, sp_flat, cp_flat = rec
             for k in range(0, len(sp_flat), 2):
-                sp_flat[k + 1] = self._scaler.transform(self.services[sp_flat[k]], sp_flat[k + 1])
+                self._scaler.observe(self.services[sp_flat[k]], sp_flat[k + 1])
             for k in range(0, len(cp_flat), 2):
-                cp_flat[k + 1] = self._scaler.transform(self.capabilities[cp_flat[k]], cp_flat[k + 1])
-        return records
+                self._scaler.observe(self.capabilities[cp_flat[k]], cp_flat[k + 1])
 
-    def finalize(self, zip_path: str | None = None) -> dict[str, Any]:
-        """Assemble each shard (one at a time), write the manifest, optionally zip."""
+    def _reobserve_existing_parts(self, part_names: list[str]) -> None:
+        """Rebuild the scaler's histograms by reading back already-written part
+        files. Only needed after a resume=True skip, since the histograms
+        normally accumulate live during add_hexagon() and aren't persisted by
+        the scoring-complete marker (only the hex id list is)."""
+        for part_name in tqdm(
+            part_names,
+            desc="[HexShardWriter] rebuilding scaler stats from resumed parts",
+            unit="shard",
+        ):
+            with open(os.path.join(self._tmp_dir, part_name), encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    _, records = json.loads(line)
+                    self._observe_records(records)
+
+    def finalize(self, zip_path: str | None = None, workers: int | None = None) -> dict[str, Any]:
+        """Assemble each shard, write the manifest, optionally zip.
+
+        Shard assembly (read part file, remap through the fitted scaler, deflate,
+        write) is independent per shard, so it's farmed out to a worker pool --
+        `workers` defaults to all cores, since each worker only holds one shard's
+        JSON in memory at a time (same bound as the sequential version).
+        """
+        part_names = sorted(n for n in os.listdir(self._tmp_dir) if n.endswith(".part"))
+
         scaling_report_path: str | None = None
+        svc_remap: dict[str, dict[int, int]] = {}
+        cap_remap: dict[str, dict[int, int]] = {}
         if self._scaler is not None:
+            if self.resumed:
+                # The scoring-complete marker only persists hex ids, not the
+                # live histograms add_hexagon() would normally have built --
+                # rebuild them from the part files themselves before fitting.
+                self._reobserve_existing_parts(part_names)
             # Pass 2 setup: build the per-key rank remap from the pass-1 histograms,
             # then dump the raw distribution + mapping for the scaling dashboard.
             self._scaler.fit()
             scaling_report_path = os.path.join(os.path.dirname(self.out_dir), "power_scaling.json")
             with open(scaling_report_path, "w", encoding="utf-8") as f:
                 json.dump(self._scaler.report(), f, ensure_ascii=False, separators=(",", ":"))
+            # Snapshot the plain remap dicts (not the PerKeyQuantileScaler itself --
+            # its histogram uses a lambda-defaulted defaultdict, which isn't
+            # picklable) so worker processes can transform values independently.
+            svc_remap = {k: self._scaler._remap.get(k, {}) for k in self.services}
+            cap_remap = {k: self._scaler._remap.get(k, {}) for k in self.capabilities}
 
         shard_files: list[str] = []
-        for part_name in sorted(os.listdir(self._tmp_dir)):
-            if not part_name.endswith(".part"):
-                continue
-            shard = part_name[: -len(".part")]
-            hexmap: dict[str, list[Any]] = {}
-            with open(os.path.join(self._tmp_dir, part_name), encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    hex_id, records = json.loads(line)
-                    hexmap[hex_id] = self._rescale_records(records)
-            payload = json.dumps(hexmap, ensure_ascii=False, separators=(",", ":"))
-            packed = base64.b64encode(zlib.compress(payload.encode("utf-8"), 9)).decode("ascii")
-            out_name = f"{shard}.js"
-            with open(os.path.join(self.out_dir, out_name), "w", encoding="utf-8") as f:
-                f.write(f'{SHARD_CALLBACK}("{shard}","{packed}");')
-            shard_files.append(out_name)
+        pool_workers = max(1, min(workers or (os.cpu_count() or 1), len(part_names) or 1))
+        tasks = [
+            (self._tmp_dir, self.out_dir, part_name, svc_remap, cap_remap, self.services, self.capabilities)
+            for part_name in part_names
+        ]
+        progress = tqdm(total=len(tasks), desc="[HexShardWriter] finalizing shards", unit="shard")
+        if pool_workers <= 1 or not tasks:
+            for task in tasks:
+                shard_files.append(_finalize_shard(task))
+                progress.update(1)
+        else:
+            with mp.Pool(processes=pool_workers) as pool:
+                for out_name in pool.imap_unordered(_finalize_shard, tasks):
+                    shard_files.append(out_name)
+                    progress.update(1)
+        progress.close()
         shutil.rmtree(self._tmp_dir)
 
         manifest = {

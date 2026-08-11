@@ -217,6 +217,98 @@ def _select_best_snap_for_origin(origin, source_coord, candidates):
     return source_coord
 
 
+def build_snap_compact(poi_mode_snap_info_by_type):
+    """Collapse the nested per-mode snap dict into compact, refcount-immune arrays.
+
+    The routing stage previously handed every worker
+    `poi_mode_snap_info_by_type` = {poi_key: {mode: {src_key: {source_coord, candidates}}}}
+    -- ~10M small Python objects (~1.4 GB live from a 186 MB pickle), duplicated three
+    times across walk/bike/drive even though the three modes carry *identical* src_keys,
+    coords and candidates. Forked workers then fault the whole thing private via refcount
+    writes as they traverse it, so each of N workers ends up with a near-private 1.4 GB
+    copy. This rebuilds it, once in the parent, as a per-poi_key bundle of numpy arrays
+    plus one src_key list:
+
+      src_keys:      bytes  (N,) 'S' dtype    fixed-width ASCII, mode-independent
+      source_coords: float64 (N, 2)
+      cand_coords:   float64 (M, 2)           all candidates, concatenated
+      cand_dists:    float64 (M,)             matching snap distances
+      cand_ptr:      int64  (N + 1,)          CSR offsets; src i -> [ptr[i]:ptr[i+1]]
+
+    Traversing a numpy array does not touch per-element Python refcounts, so the numeric
+    bulk stays genuinely shared copy-on-write across all forked workers (~186 MB total
+    instead of N x 1.4 GB), and worker respawns (maxtasksperchild) re-share it for free.
+    Order matches the old dedup exactly: src_keys are taken in `walk`'s insertion order
+    (identical across modes), skipping any src with an invalid source_coord -- so
+    `accessibility_non_bus_from_snap_map`'s source_items line up positionally as before.
+    """
+    import numpy as np
+
+    compact: dict = {}
+    for poi_key, mode_infos in (poi_mode_snap_info_by_type or {}).items():
+        info = mode_infos.get("walk")
+        if info is None:
+            info = next(iter(mode_infos.values()), {}) if mode_infos else {}
+        src_keys: list = []
+        coords: list = []
+        cand_coords: list = []
+        cand_dists: list = []
+        cand_ptr: list = [0]
+        for src_key, src_info in info.items():
+            if isinstance(src_info, dict):
+                source_coord = src_info.get("source_coord")
+                candidates = src_info.get("candidates")
+            else:
+                source_coord = src_key
+                candidates = None
+            if not isinstance(source_coord, (list, tuple)) or len(source_coord) < 2:
+                continue
+            src_keys.append(src_key)
+            coords.append((float(source_coord[0]), float(source_coord[1])))
+            m = 0
+            if isinstance(candidates, list):
+                for cand in candidates:
+                    if not isinstance(cand, (list, tuple)) or len(cand) < 2:
+                        continue
+                    cc = cand[0]
+                    cand_coords.append((float(cc[0]), float(cc[1])))
+                    cand_dists.append(float(cand[1]))
+                    m += 1
+            cand_ptr.append(cand_ptr[-1] + m)
+        compact[poi_key] = {
+            # Fixed-width ASCII bytes array (numpy auto-sizes the width), so the src_keys
+            # are refcount-immune too -- the whole bundle is now numpy and fork shares it
+            # genuinely COW across every worker. Decoded back to str per kept POI at
+            # read time (a per-origin transient, not the static floor).
+            "src_keys": np.asarray(src_keys, dtype="S"),
+            "source_coords": np.asarray(coords, dtype=np.float64).reshape(-1, 2),
+            "cand_coords": np.asarray(cand_coords, dtype=np.float64).reshape(-1, 2),
+            "cand_dists": np.asarray(cand_dists, dtype=np.float64),
+            "cand_ptr": np.asarray(cand_ptr, dtype=np.int64),
+        }
+    return compact
+
+
+def _best_snap_candidate_coord(origin, coord, cand_coords, cand_dists):
+    """Origin-dependent best snapped coordinate among a src's candidates.
+
+    Bit-identical to snapping_stage._select_best_snap_candidate_for_origin's list branch
+    (min by (haversine-to-origin, snap_distance); falls back to the raw coord when there
+    are no candidates), but reads the candidates straight from the compact CSR arrays so
+    no per-src Python dict/list has to exist in the worker.
+    """
+    best = None
+    for k in range(cand_coords.shape[0]):
+        cand_coord = (float(cand_coords[k, 0]), float(cand_coords[k, 1]))
+        origin_dist_m = _haversine_m(origin[0], origin[1], cand_coord[0], cand_coord[1])
+        score = (origin_dist_m, float(cand_dists[k]))
+        if best is None or score < best[0]:
+            best = (score, cand_coord)
+    if best is not None:
+        return best[1]
+    return (float(coord[0]), float(coord[1]))
+
+
 def _get_mode_graph(network_type, cfg: PipelineConfig | None = None):
     """Get the full unsimplified mode graph from in-memory cache or disk.
 
@@ -587,179 +679,175 @@ def accessibility_from_rra(RRA, poi_type=None, contribution_coefficient=None):
     return out
 
 
-def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origine, poi_snap_info_by_mode, feature=None, radius_m=None, tags=None, origin_nodes_by_mode=None):
-    """Compute non-bus impedance ingredients for one origin/POI type from snap maps.
+def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origine, snap_compact, feature=None, radius_m=None, tags=None, origin_nodes_by_mode=None):
+    """Compute non-bus impedance ingredients for one origin/POI type.
 
     Inputs:
     - poi_type: POI type key.
     - origine: origin coordinate `(lat, lon)`.
-    - poi_snap_info_by_mode: snapped candidate map grouped by mode.
+    - snap_compact: this poi_key's compact snap bundle from `build_snap_compact`
+      (src_keys list + source_coords / cand_coords / cand_dists / cand_ptr arrays).
     - feature: optional explicit OSM feature key.
     - radius_m: optional routing radius.
     - tags: optional tags filter used for query identity.
 
     Outputs:
-    - dict with cache metadata and non-bus modal impedance arrays.
+    - dict with per-POI impedance arrays plus the origin-snapped destination coords
+      (`poi_coords`), source keys and source coords, positionally aligned.
     """
+    import numpy as np
+
     _feature, _value, _tags = _resolve_query(poi_type, feature, tags)
 
-    mode_infos = poi_snap_info_by_mode or {}
-    # Individual-profile runs narrow the routed non-bus modes (e.g. walk-only for someone with
-    # no car/bike, walk+drive for a car owner). Baseline keeps all three. Disabled modes are
-    # simply never routed here, so their impedance arrays stay empty/None downstream.
+    compact = snap_compact or {}
+    src_keys_all = compact.get("src_keys")
+    source_coords_all = compact.get("source_coords")
+    # src_keys_all is a numpy bytes array (or None) -- avoid array truthiness.
+    n_all = 0 if src_keys_all is None else len(src_keys_all)
+
+    empty = {
+        "source_coords": [], "poi_coords": [], "source_keys": [],
+        "imp_walk": [], "imp_bike": [], "imp_drive": [], "walk_path_scores": [],
+    }
+    if n_all == 0 or source_coords_all is None or len(source_coords_all) == 0:
+        return empty
+
+    # Individual-profile runs narrow the routed non-bus modes (e.g. walk-only for someone
+    # with no car/bike). Baseline keeps all three. Disabled modes are never routed, so
+    # their impedance arrays stay all-None downstream.
     enabled_modes = tuple(
         m for m in ("walk", "bike", "drive")
         if m in getattr(config, "enabled_non_bus_modes", ("walk", "bike", "drive"))
     )
-    source_keys_seen = set()
-    source_items: list[dict[str, object]] = []
-    for mode in enabled_modes:
-        info = mode_infos.get(mode) or {}
-        for src_key, src_info in info.items():
-            if src_key in source_keys_seen:
-                continue
-            source_keys_seen.add(src_key)
-            if isinstance(src_info, dict):
-                source_coord = src_info.get("source_coord")
-            else:
-                source_coord = src_key
-            if not isinstance(source_coord, (list, tuple)) or len(source_coord) < 2:
-                continue
-            source_items.append(
-                {
-                    "source_key": src_key,
-                    "source_coord": (float(source_coord[0]), float(source_coord[1])),
-                }
-            )
 
+    # Radius filter, preserving src order. Kept on the scalar _haversine_m (same math as
+    # before) so a POI right at the radius boundary lands on the exact same side as the
+    # old per-item filter -- vectorised trig could differ by an ULP and flip membership.
     if radius_m is not None:
-        source_items = [
-            item for item in source_items
-            if _haversine_m(origine[0], origine[1], item["source_coord"][0], item["source_coord"][1]) <= radius_m
+        kept = [
+            i for i in range(n_all)
+            if _haversine_m(origine[0], origine[1],
+                            float(source_coords_all[i, 0]), float(source_coords_all[i, 1])) <= radius_m
         ]
+        kept_idx = np.asarray(kept, dtype=np.intp)
+    else:
+        kept_idx = np.arange(n_all, dtype=np.intp)
 
-    if not source_items:
-        return {
-            "source_items": [],
-            "source_coords": [],
-            "imp_walk": [],
-            "imp_bike": [],
-            "imp_drive": [],
-        }
+    n = int(kept_idx.shape[0])
+    if n == 0:
+        return empty
 
-    # Bound Dijkstra exploration to a generous multiple of the POI radius. Source items
-    # are already pre-filtered to haversine <= radius_m, so a detour factor above the
-    # urban street-network detour ratio keeps every in-radius POI inside the cutoff.
+    source_coords = source_coords_all[kept_idx]  # (n, 2), routed coord == source_coord
+    # Decode the kept src_keys back to str (bytes array -> the exact original ASCII keys).
+    src_keys = [src_keys_all[int(i)].decode("ascii") for i in kept_idx]
+
+    # Bound Dijkstra exploration to a generous multiple of the POI radius. Sources are
+    # already pre-filtered to haversine <= radius_m, so a detour factor above the urban
+    # street-network detour ratio keeps every in-radius POI inside the cutoff.
     cutoff_m = None
     if radius_m is not None:
         cutoff_m = float(radius_m) * float(getattr(config, "non_bus_dijkstra_detour_factor", 1.6))
 
-    mode_distances = {}
+    # Vectorised over all POIs of this (origin, poi_type). Per mode: one batched KD-tree
+    # query snaps every POI to its nearest full-graph node (same tree/metric/snap_indices
+    # as _snap_node_idx, so indices are identical), then one fancy-index into the Dijkstra
+    # distance array + one elementwise impedance (closed forms ported verbatim from
+    # get_impedance.impedance_base, default lambda_walk=0.15). The previous per-item loop
+    # (n snaps + 3n scalar calls, all boxed Python objects) dominated runtime and the
+    # per-origin transient for dense types (perceived_nature ~ 280k in-radius POIs).
+    imp_by_mode: dict[str, list] = {m: [None] * n for m in ("walk", "bike", "drive")}
+    walk_reachable_mask = None
+
     for mode in enabled_modes:
-        info = mode_infos.get(mode) or {}
-        chosen_coords = []
-        for item in source_items:
-            src = item["source_coord"]
-            src_key = item["source_key"]
-            chosen_coords.append(_select_best_snap_for_origin(origine, src, info.get(src_key)))
         try:
             if origin_nodes_by_mode and mode in origin_nodes_by_mode:
                 origin_idx = origin_nodes_by_mode[mode]
             else:
                 origin_idx = _snap_node_idx(mode, origine[0], origine[1], config)
-            # Snap each POI precisely to the nearest full-graph node (exact, no chains).
-            poi_idxs = [
-                _snap_node_idx(mode, coord[0], coord[1], config)
-                for coord in chosen_coords
-            ]
+
+            bundle = graphml.get_mode_csr(mode, config)
+            tree = bundle["tree"]
+            snap_indices = bundle["snap_indices"]
+            m_per_deg_lon, m_per_deg_lat = bundle["scale"]
+            query_xy = np.column_stack(
+                (source_coords[:, 1] * m_per_deg_lon, source_coords[:, 0] * m_per_deg_lat)
+            )
+            _, knn = tree.query(query_xy)
+            poi_idxs = np.asarray(snap_indices)[np.asarray(knn, dtype=np.intp)].astype(np.intp, copy=False)
 
             dist, _pred, _ = _get_mode_lengths_and_paths(
                 origine, mode, radius_m, origin_idx=origin_idx, cfg=config, cutoff_m=cutoff_m
             )
-
-            # dist is keyed by node index; values are exact full-graph metres, inf
-            # beyond the cutoff/unreachable.
-            leg = []
-            for pidx in poi_idxs:
-                d = dist[pidx]
-                leg.append(float(d) if math.isfinite(d) else None)
-            mode_distances[mode] = leg
-
         except (KeyError, ValueError, TypeError, IndexError, MemoryError) as exc:
             logger.warning("Non-bus routing fallback: mode=%s origin=%s reason=%s", mode, origine, exc)
-            mode_distances[mode] = [None] * len(source_items)
+            continue  # leaves imp_by_mode[mode] all-None, matching the old fallback
 
-    imp_walk = []
-    imp_bike = []
-    imp_drive = []
-    walk_distances = mode_distances.get("walk", [None] * len(source_items))
-    walk_paths_scores: list = []
+        # dist is keyed by node index; values are exact full-graph metres, inf beyond the
+        # cutoff/unreachable.
+        dist_m = np.asarray(dist)[poi_idxs]
+        reachable = np.isfinite(dist_m)
+        dist_km = dist_m / 1000.0
 
-    for i in range(len(source_items)):
-        iw = ib = idr = None
+        if mode == "walk":
+            walk_reachable_mask = reachable
+            # Real per-edge walkability isn't wired into the CSR yet -- every edge carries
+            # the same placeholder score (WALK_EDGE_DEFAULT_SCORE), so the length-weighted
+            # average along ANY path is provably that same constant, making the walkability
+            # coefficient a single scalar (this used to cost ~94% of a Paris origin's time
+            # via path reconstruction; profiled 523/555s/origin 2026-07-15). Re-derive
+            # per-path scores here if real wscore data is ever added.
+            coef = 1.0 + 0.15 * ((5.0 - float(DEFAULT_WALK_SCORE)) / 4.0)
+            imp = coef * ((dist_km / config.speed_walk_kmh) * 60.0)
+        elif mode == "bike":
+            imp = (dist_km / config.speed_bike_kmh) * 60.0
+        else:  # drive
+            monetary_cost = config.cost_per_liter / config.distance_for_liter
+            imp = (
+                config.drive_access_time_min
+                + (dist_km / config.speed_drive_kmh) * 60.0
+                + config.vot * monetary_cost
+            )
 
-        # Walkability score of the origin->POI walk path. Real per-edge walkability
-        # isn't wired into the CSR yet -- every edge carries the same placeholder
-        # score (WALK_EDGE_DEFAULT_SCORE in utils/graphml.py), so the length-weighted
-        # average along ANY path is provably always that same constant. Reconstructing
-        # the actual path node-by-node and averaging it (the old behaviour) therefore
-        # never changed the result, yet profiled at ~94% of a Paris origin's routing
-        # time (523 of 555s/origin, 2026-07-15) because some queries have hundreds of
-        # thousands of in-radius POIs. Assign the constant directly instead. Swap this
-        # back to reconstruct-and-average (see git history of this function, or
-        # `_reconstruct_path_idx`/`_csr_path_walkability`) once real per-edge
-        # walkability data is wired into `wscore`.
-        w_i = DEFAULT_WALK_SCORE if walk_distances[i] is not None else None
-        walk_paths_scores.append(w_i)
+        col = imp_by_mode[mode]
+        for j, v in zip(np.nonzero(reachable)[0].tolist(), imp[reachable].tolist()):
+            col[j] = v
 
-        for mode in enabled_modes:
-            dist_m = mode_distances[mode][i]
-            if dist_m is None:
-                continue
+    imp_walk = imp_by_mode["walk"]
+    imp_bike = imp_by_mode["bike"]
+    imp_drive = imp_by_mode["drive"]
 
-            dist_km = dist_m / 1000.0
-            if mode == "walk":
-                imp = get_impedance.impedance_base(
-                    dist_km, mode, w_i,
-                    vot=config.vot,
-                    cost_per_liter=config.cost_per_liter,
-                    distance_for_liter=config.distance_for_liter,
-                    speed_walk_kmh=config.speed_walk_kmh,
-                    speed_bike_kmh=config.speed_bike_kmh,
-                    speed_drive_kmh=config.speed_drive_kmh,
-                    drive_access_time_min=config.drive_access_time_min,
-                )
-            else:
-                imp = get_impedance.impedance_base(
-                    dist_km, mode,
-                    vot=config.vot,
-                    cost_per_liter=config.cost_per_liter,
-                    distance_for_liter=config.distance_for_liter,
-                    speed_walk_kmh=config.speed_walk_kmh,
-                    speed_bike_kmh=config.speed_bike_kmh,
-                    speed_drive_kmh=config.speed_drive_kmh,
-                    drive_access_time_min=config.drive_access_time_min,
-                )
-            
-            if imp is None:
-                continue
-            if mode == "walk":
-                iw = imp
-            elif mode == "bike":
-                ib = imp
-            else:
-                idr = imp
-        imp_walk.append(iw)
-        imp_bike.append(ib)
-        imp_drive.append(idr)
+    if walk_reachable_mask is None:
+        walk_paths_scores: list = [None] * n
+    else:
+        walk_paths_scores = [DEFAULT_WALK_SCORE if r else None for r in walk_reachable_mask.tolist()]
+
+    # Origin-dependent best bus-snapped destination coord per POI, read straight from the
+    # compact CSR candidate arrays (bit-identical to the old
+    # _process_node -> select_best_snap_candidate_for_origin path). Candidates are indexed
+    # by the ORIGINAL src position, so use kept_idx, not the filtered position.
+    cand_coords = compact.get("cand_coords")
+    cand_dists = compact.get("cand_dists")
+    cand_ptr = compact.get("cand_ptr")
+    poi_coords: list = []
+    source_coords_out: list = []
+    for i in kept_idx:
+        i = int(i)
+        sc = (float(source_coords_all[i, 0]), float(source_coords_all[i, 1]))
+        source_coords_out.append(sc)
+        if cand_ptr is not None and cand_coords is not None:
+            a = int(cand_ptr[i]); b = int(cand_ptr[i + 1])
+            poi_coords.append(_best_snap_candidate_coord(origine, sc, cand_coords[a:b], cand_dists[a:b]))
+        else:
+            poi_coords.append(sc)
 
     return {
-        "source_items": source_items,
-        "source_coords": [item["source_coord"] for item in source_items],
+        "source_coords": source_coords_out,
+        "poi_coords": poi_coords,
+        "source_keys": src_keys,
         "imp_walk": imp_walk,
         "imp_bike": imp_bike,
         "imp_drive": imp_drive,
-        "walk_path_scores": walk_paths_scores
+        "walk_path_scores": walk_paths_scores,
     }
 
 
