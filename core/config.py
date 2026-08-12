@@ -3,7 +3,20 @@ import datetime as dt
 import os
 import unicodedata
 import re
+from typing import TypedDict, NotRequired
 
+class PresetDict(TypedDict):
+    city_name : str
+    use_shapefile : bool
+    name_shapefile : str
+    poi_from_shp : bool
+    poi_shapefile_paths : list[str]
+    poi_label_field : str
+    bus_ticket_price : float
+    osm_extract_url : str
+    enable_subway: NotRequired[bool]
+    gtfs_feeds : NotRequired[list[str]]
+    bus_departure_dt : NotRequired[dt.datetime]
 
 def normalize_study_city(study_city: str) -> str:
     """Normalize a study city identifier to a stable lookup key."""
@@ -20,7 +33,7 @@ ELECTRE_P_FACTOR: float = 0.8   # preference threshold    p = std(x) * P_FACTOR
 # here must come with an explicit justification.
 ELECTRE_LAMBDA_CUT: float = 0.75
 
-CITY_PRESETS: dict[str, dict[str, object]] = {
+CITY_PRESETS: dict[str, PresetDict] = {
     "cagliari": {
         "city_name": "Cagliari, Sardinia, Italy",
         "use_shapefile": False,

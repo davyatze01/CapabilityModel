@@ -4,6 +4,7 @@ from pathlib import Path
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 import numpy as np
 
 # -----------------------------
@@ -43,7 +44,7 @@ INTERVAL_COLORS = (
     "#1A9850",  # green: beyond the last boundary
 )
 
-def plot_form_of_access() -> plt.Figure:
+def plot_form_of_access() -> Figure:
     fig, ax = plt.subplots(
         figsize=(10 * CM_TO_INCH, 10 * CM_TO_INCH),
         dpi=300,

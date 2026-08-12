@@ -403,7 +403,7 @@ def _build_step2(
     cfg: PipelineConfig,
     drop_map: dict[str, set[str]] | None = None,
     poi_names: dict[str, str] | None = None,
-) -> dict:
+) -> tuple[dict, dict[str, float]]:
     """Step 2 — accessibility decay applied per mode and merged into poi_type scores."""
     # Deduplicate POI entries by poi_type across services.
     entry_by_poi_type: dict[str, dict] = {}
