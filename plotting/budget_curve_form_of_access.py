@@ -30,11 +30,13 @@ UPPER_RESOURCES_THRESHOLD = 840.0
 N_POINTS = 500
 CM_TO_INCH = 1 / 2.54
 THRESHOLD_COLOR = "#C000D9"
+INCOME = 1200.0
+HOUSING_OPPORTUNITIES = {"buying": 15.0, "renting": 19.0}
 
 ACCESS_CURVES = (
     # (resources intercept, slope, color, line width, description)
-    (1200.0, 15.0, "#0071B2", 1.0, "renting"),
-    (1200.0, 19.0, "#FFB300", 1, "buying"),
+    (INCOME, HOUSING_OPPORTUNITIES["renting"], "#0071B2", 1.0, "renting"),
+    (INCOME, HOUSING_OPPORTUNITIES["buying"], "#FFB300", 1, "buying"),
 )
 
 

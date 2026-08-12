@@ -634,7 +634,9 @@ def _run_r5r_script(
     resolved_output_csv = output_csv or paths["routing_matrix"]
     env["R5_OUTPUT_PATH"] = resolved_output_csv
     env["R5_CHUNK_DIR"] = chunk_dir or os.path.join(os.path.dirname(paths["routing_matrix"]), "r5r_chunks")
-    env["R5_DEPARTURE_DATETIME"] = cfg.bus_departure_dt.strftime("%Y-%m-%d %H:%M:%S")
+    env["R5_DEPARTURE_DATETIME"] = (cfg.subway_departure_dt if transport_type in ("subway", "metro") else cfg.bus_departure_dt).strftime("%Y-%m-%d %H:%M:%S")
+    # If we are routing subway or metro we are using the subway time, otherwise the bus time. This fix was needed since Cagliari's CTM and metrocagliari data
+    # do not overlap in time
     env["R5_TRANSIT_MODE"] = _resolve_transit_mode(cfg, transport_type)
     budget_gb = float(os.environ.get("CAP_MEM_BUDGET_GB", "0") or "0")
     # JVM heap for r5r. Smaller than the raw budget so Python + R side-tables fit
@@ -1453,7 +1455,7 @@ def run_public_transport_routing_stage(ctx: PipelineContext, snap: SnappingStage
     """
     cfg = ctx.config
     paths = cfg.public_transport_paths(transport_type)
-    departure_iso = cfg.bus_departure_dt.isoformat()
+    departure_iso = (cfg.subway_departure_dt if transport_type in ("subway","metro") else cfg.bus_departure_dt).isoformat()
     routing_csv = paths["routing_matrix"]
     routing_cache = paths["routing_cache"]
 

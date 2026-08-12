@@ -17,6 +17,7 @@ class PresetDict(TypedDict):
     enable_subway: NotRequired[bool]
     gtfs_feeds : NotRequired[list[str]]
     bus_departure_dt : NotRequired[dt.datetime]
+    subway_departure_dt : NotRequired[dt.datetime]
     subway_transit_mode : NotRequired[str]
 
 def normalize_study_city(study_city: str) -> str:
@@ -76,6 +77,7 @@ CITY_PRESETS: dict[str, PresetDict] = {
         # the selected date". Pin a normal weekday well inside the feed's calendar (a
         # Wednesday, before the holiday tail) for Paris only.
         "bus_departure_dt": dt.datetime(2025, 12, 17, 12, 0, 0),
+        "subway_departure_dt": dt.datetime(2025, 12, 17, 12, 0, 0),
         "osm_extract_url": "https://download.geofabrik.de/europe/france/ile-de-france-latest.osm.pbf",
     },
 }
@@ -106,6 +108,8 @@ def apply_study_city(cfg: "PipelineConfig", study_city: str) -> None:
         cfg.osm_extract_url = str(preset["osm_extract_url"])
     if "subway_transit_mode" in preset:
         cfg.subway_transit_mode = str(preset["subway_transit_mode"])
+    if "subway_departure_dt" in preset:
+        cfg.subway_departure_dt = preset["subway_departure_dt"]
 
 
 
@@ -284,6 +288,7 @@ class PipelineConfig:
     origin_hex_enabled: bool = True
 
     bus_departure_dt: dt.datetime = dt.datetime(2025, 10, 15, 12, 0, 0)
+    subway_departure_dt: dt.datetime = dt.datetime(2026, 1, 7, 12, 0, 0)
     time_indifference_bus: float = 60.0
     routing_data_dir: str = "gtfs"
     osm_pbf_autobuild: bool = True

@@ -24,7 +24,7 @@ WORKER_COUNT = None
 #   capability CSVs, the GeoPackage, and the QGIS project. Meant for colleagues starting
 #   from a shipped impedances.npz who only need to inspect results in QGIS.
 #   Also settable without editing this file: CAP_LIGHT_OUTPUT=1 python main.py
-LIGHT_OUTPUT = True
+LIGHT_OUTPUT = False
 # NOTIFY_CRASH: send a Telegram message when the run stops for ANY reason — unhandled
 #   exception, Ctrl+C, OOM/cgroup SIGKILL, hard crash, terminal dying — plus one on a clean
 #   finish. Uses a detached watchdog process (outside the run_safe.sh cgroup) so even a
@@ -40,14 +40,14 @@ NOTIFY_CRASH = True
 #   artifacts/<slug>/non_bus_r<radius> / impedances_r<radius>.npz so a rerun at the SAME
 #   radius still hits cache, while ARTIFACT_SLUG_SUFFIX below keeps this run's final outputs
 #   (gpkg/QGIS project) from overwriting the normal run's.
-POI_RADIUS_KM = 5.0
+POI_RADIUS_KM = None
 # ARTIFACT_SLUG_SUFFIX: namespaces every output path under artifacts/<slug>_<suffix>/ and
 #   outputs/.../<slug>_<suffix> (see PipelineConfig.artifact_slug_suffix), so a radius/profile
 #   experiment never overwrites the normal run's outputs. Snapping and bus/subway routing are
 #   radius-independent (see config.py's radius_bucket comment) — symlink those subfolders from
 #   the normal artifacts/<slug>/ dir into the new one before running to reuse them instead of
 #   re-routing from scratch.
-ARTIFACT_SLUG_SUFFIX = "r5km"
+ARTIFACT_SLUG_SUFFIX = None
 
 
 def _reexec_under_run_safe_if_needed() -> None:
