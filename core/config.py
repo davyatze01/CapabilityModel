@@ -17,6 +17,7 @@ class PresetDict(TypedDict):
     enable_subway: NotRequired[bool]
     gtfs_feeds : NotRequired[list[str]]
     bus_departure_dt : NotRequired[dt.datetime]
+    subway_transit_mode : NotRequired[str]
 
 def normalize_study_city(study_city: str) -> str:
     """Normalize a study city identifier to a stable lookup key."""
@@ -49,6 +50,9 @@ CITY_PRESETS: dict[str, PresetDict] = {
         "poi_label_field": "poiType",
         "bus_ticket_price": 1.3,
         "osm_extract_url": "https://download.geofabrik.de/europe/italy/isole-latest.osm.pbf",
+        "enable_subway" : True,
+        "gtfs_feeds" : [os.path.join("gtfs", "GTFS.zip"), os.path.join("gtfs","gtfs_metrocagliari.zip")],
+        "subway_transit_mode" : "TRAM"
     },
     "paris": {
         "city_name": "Paris, France",
@@ -100,6 +104,9 @@ def apply_study_city(cfg: "PipelineConfig", study_city: str) -> None:
         cfg.bus_departure_dt = preset["bus_departure_dt"]  # type: ignore[assignment]
     if "osm_extract_url" in preset:
         cfg.osm_extract_url = str(preset["osm_extract_url"])
+    if "subway_transit_mode" in preset:
+        cfg.subway_transit_mode = str(preset["subway_transit_mode"])
+
 
 
 def derive_city_slug(city_name: str) -> str:
