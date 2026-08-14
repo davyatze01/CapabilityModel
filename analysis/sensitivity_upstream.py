@@ -319,7 +319,7 @@ def build_report() -> None:
 
     from analysis.sensitivity_analysis import electre_assign, CAT_MIDPOINTS, LAMBDA_BASELINE
     from utils.capabilities import CAPABILITY_SERVICES, _CATEGORIES, _ELECTRE_PARAMS
-    from core.config import ELECTRE_Q_FACTOR, ELECTRE_P_FACTOR, PipelineConfig
+    from core.config import ELECTRE_Q, ELECTRE_P, PipelineConfig
 
     base_csv = _work_root() / BASELINE_NAME / "service_scores.csv"
     if not base_csv.exists():
@@ -333,7 +333,7 @@ def build_report() -> None:
             X = df[[f"service_{s}" for s in services]].to_numpy(dtype=float)
             m = X.shape[1]
             out[capability] = electre_assign(
-                X, np.full(m, 1.0 / m), ELECTRE_Q_FACTOR, ELECTRE_P_FACTOR,
+                X, np.full(m, 1.0 / m), ELECTRE_Q, ELECTRE_P,
                 LAMBDA_BASELINE, float(_ELECTRE_PARAMS[capability]["v"]),
             )
         return out

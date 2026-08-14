@@ -7,7 +7,7 @@ implementation before any analysis runs, so the results are guaranteed to be
 about the real model, not a drifted copy.
 
 This covers sensitivity only (how much do the *parameters* matter?):
-  * OAT sweeps of q_factor, p_factor, lambda cutting level, and veto threshold:
+  * OAT sweeps of q (indifference), p (preference), lambda cutting level, and veto threshold:
     for each value, % of nodes whose assigned category changes vs baseline and
     the mean |score delta|, per capability.
   * Weight perturbation: Dirichlet draws around the uniform weights; distribution
@@ -46,7 +46,7 @@ from utils.capabilities import (
     _ELECTRE_PARAMS,
     electre_tri_integration,
 )
-from core.config import ELECTRE_Q_FACTOR, ELECTRE_P_FACTOR, ELECTRE_LAMBDA_CUT
+from core.config import ELECTRE_Q, ELECTRE_P, ELECTRE_LAMBDA_CUT
 
 # The lambda actually used by the assignments. Historically the code cut at 0.65
 # while the debug details reported 0.70; both now read config.ELECTRE_LAMBDA_CUT,
@@ -70,8 +70,8 @@ SEED = 42
 def electre_assign(
     X: np.ndarray,
     weights: np.ndarray,
-    q_factor: float,
-    p_factor: float,
+    q: float,
+    p: float,
     lam: float,
     veto: float,
 ) -> np.ndarray:
@@ -79,6 +79,8 @@ def electre_assign(
 
     X: (n_nodes, n_services) service scores in [0, 1].
     weights: (n_services,) positive, will be normalized.
+    q, p: absolute indifference/preference thresholds (ELECTRE_Q/ELECTRE_P), fixed
+    across all rows -- mirrors electre_tri_details, not std-scaled per node.
     Returns int array (n_nodes,) of category indices.
     """
     X = np.asarray(X, dtype=float)
@@ -86,18 +88,16 @@ def electre_assign(
     w = np.asarray(weights, dtype=float)
     w = w / w.sum()
 
-    std = X.std(axis=1)  # population std, same as statistics.pstdev
-    const = std < 1e-9
-    q = std * q_factor
-    p = std * p_factor
-    pq = np.where(const, 1.0, p - q)  # avoid /0 on constant rows (overridden later)
+    std = X.std(axis=1)  # population std, same as statistics.pstdev -- only used
+    const = std < 1e-9   # to detect the "all scores equal" collapse case below
+    pq_range = p - q
 
     assigned = np.zeros(n, dtype=int)
     inf_veto = np.isinf(veto)
     for k, b in enumerate(BOUNDS):
         d = X - b
         # partial concordance c_j: 1 if d >= -q, 0 if d <= -p, linear between.
-        cj = np.clip((d + p[:, None]) / pq[:, None], 0.0, 1.0)
+        cj = np.clip((d + p) / pq_range, 0.0, 1.0)
         C = cj @ w
         cred = C
         if not inf_veto:
@@ -105,7 +105,7 @@ def electre_assign(
             # full veto: any service more than v below the boundary
             full = (gap > veto).any(axis=1)
             # partial discordance for p < gap <= v, attenuates when dj > C
-            dj = np.clip((gap - p[:, None]) / np.maximum(veto - p[:, None], 1e-12), 0.0, 1.0)
+            dj = np.clip((gap - p) / max(veto - p, 1e-12), 0.0, 1.0)
             with np.errstate(divide="ignore", invalid="ignore"):
                 factor = np.where(
                     dj > C[:, None],
@@ -131,7 +131,7 @@ def validate_against_reference(X: np.ndarray, capability: str, rng: np.random.Ge
     idx = rng.choice(len(X), size=min(250, len(X)), replace=False)
     veto = float(_ELECTRE_PARAMS[capability]["v"])
     ours = electre_assign(
-        X[idx], np.full(m, 1.0 / m), ELECTRE_Q_FACTOR, ELECTRE_P_FACTOR, LAMBDA_BASELINE, veto
+        X[idx], np.full(m, 1.0 / m), ELECTRE_Q, ELECTRE_P, LAMBDA_BASELINE, veto
     )
     ours_scores = CAT_MIDPOINTS[ours]
     ref_scores = np.array([electre_tri_integration(list(X[i]), capability) for i in idx])
@@ -161,13 +161,13 @@ def run_oat_sweeps(caps_X: dict[str, np.ndarray], baseline: dict[str, np.ndarray
     # Each parameter tests exactly one value below and one above its baseline
     # (plus the baseline itself, for the tornado plots' centre row).
     sweeps = {
-        "q_factor": [0.20, 0.25, 0.30],
-        "p_factor": [0.65, 0.75, 0.85],
+        "q": [0.01, 0.02, 0.03],
+        "p": [0.04, 0.06, 0.08],
         "lambda": [0.60, 0.65, 0.70],
     }
     base = {
-        "q_factor": ELECTRE_Q_FACTOR,
-        "p_factor": ELECTRE_P_FACTOR,
+        "q": ELECTRE_Q,
+        "p": ELECTRE_P,
         "lambda": LAMBDA_BASELINE,
         "veto": float("inf"),
     }
@@ -177,12 +177,12 @@ def run_oat_sweeps(caps_X: dict[str, np.ndarray], baseline: dict[str, np.ndarray
         for value in values:
             kw = dict(base)
             kw[param] = value
-            if kw["q_factor"] >= kw["p_factor"]:
+            if kw["q"] >= kw["p"]:
                 continue  # q < p is a structural requirement of the model
             for capability, X in caps_X.items():
                 m = X.shape[1]
                 assigned = electre_assign(
-                    X, np.full(m, 1.0 / m), kw["q_factor"], kw["p_factor"], kw["lambda"], kw["veto"]
+                    X, np.full(m, 1.0 / m), kw["q"], kw["p"], kw["lambda"], kw["veto"]
                 )
                 rows.append(
                     {
@@ -224,7 +224,7 @@ def run_weight_perturbation(
         for draw in range(n_draws):
             w = rng.dirichlet(alphas)
             assigned = electre_assign(
-                X, w, ELECTRE_Q_FACTOR, ELECTRE_P_FACTOR, LAMBDA_BASELINE, float("inf")
+                X, w, ELECTRE_Q, ELECTRE_P, LAMBDA_BASELINE, float("inf")
             )
             rows.append(
                 {
@@ -274,8 +274,8 @@ def load_capability_matrices(
         capability: electre_assign(
             X,
             np.full(X.shape[1], 1.0 / X.shape[1]),
-            ELECTRE_Q_FACTOR,
-            ELECTRE_P_FACTOR,
+            ELECTRE_Q,
+            ELECTRE_P,
             LAMBDA_BASELINE,
             float(_ELECTRE_PARAMS[capability]["v"]),
         )
@@ -305,7 +305,7 @@ def write_report(
         "# Capability model — parameter sensitivity (Cagliari)",
         "",
         f"* Input: `{csv_path}` ({n_nodes} nodes)",
-        f"* Baseline: q_factor={ELECTRE_Q_FACTOR}, p_factor={ELECTRE_P_FACTOR}, "
+        f"* Baseline: q={ELECTRE_Q}, p={ELECTRE_P}, "
         f"lambda={LAMBDA_BASELINE}, veto=inf, uniform weights",
         "",
         "## Parameter sensitivity (OAT sweeps)",

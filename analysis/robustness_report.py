@@ -132,7 +132,7 @@ perturbed. This answers a different question from sensitivity: <b>given the para
 resulting map trustworthy, or is it noise-sensitive?</b></p>
 
 <h2>1. How this analysis works</h2>
-<p>Holds every parameter fixed at baseline (q_factor, p_factor, &lambda; cut, ELECTRE weights, all upstream
+<p>Holds every parameter fixed at baseline (q indifference, p preference, &lambda; cut, ELECTRE weights, all upstream
 config) and adds gaussian noise (&sigma;) to the service scores, clipped to [0,1], repeated many times per
 &sigma; per node. <b>Stability</b> = share of repetitions that assign a node its single most common
 ("modal") class; 1.0 = solid, 0.5 = coin-flip. This is a structural question, independent of parameter

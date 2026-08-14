@@ -44,6 +44,8 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
     ]
     capability_names = [name for name, _ in capabilities]
 
+    print(f"[Capability] ELECTRE TRI boundaries: {cap._BOUNDARIES}", flush=True)
+
     # Build a deduplicated ordered list of all services across all capabilities.
     all_services: list[str] = []
     seen_services: set[str] = set()

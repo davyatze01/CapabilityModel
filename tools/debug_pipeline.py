@@ -1202,8 +1202,8 @@ function renderChain(chain){
       p4.body.insertAdjacentHTML("beforeend",`
         <div class="muted" style="margin:5px 0 2px">
           std(x) = <b>${e.std?.toFixed(4)}</b>
-          &nbsp;|&nbsp; q = ${e.q_factor} × std = <b>${e.q?.toFixed(4)}</b>
-          &nbsp;|&nbsp; p = ${e.p_factor} × std = <b>${e.p?.toFixed(4)}</b>
+          &nbsp;|&nbsp; q (indifference) = <b>${e.q?.toFixed(4)}</b>
+          &nbsp;|&nbsp; p (preference) = <b>${e.p?.toFixed(4)}</b>
           &nbsp;|&nbsp; v = <b>${vStr}</b>
           &nbsp;|&nbsp; λ-cut = <b>${e.lambda_cut}</b>
         </div>

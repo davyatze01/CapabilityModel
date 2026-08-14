@@ -35,8 +35,8 @@ import numpy as np
 import pandas as pd
 
 from analysis.sensitivity_analysis import (
-    ELECTRE_P_FACTOR,
-    ELECTRE_Q_FACTOR,
+    ELECTRE_P,
+    ELECTRE_Q,
     LAMBDA_BASELINE,
     default_experiment_csv,
     electre_assign,
@@ -72,7 +72,7 @@ def run_input_noise(
             for rep in range(n_mc):
                 noisy = np.clip(X + rng.normal(0.0, sigma, size=X.shape), 0.0, 1.0)
                 assigned = electre_assign(
-                    noisy, w, ELECTRE_Q_FACTOR, ELECTRE_P_FACTOR, LAMBDA_BASELINE, float("inf")
+                    noisy, w, ELECTRE_Q, ELECTRE_P, LAMBDA_BASELINE, float("inf")
                 )
                 counts[np.arange(len(X)), assigned] += 1
                 if (rep + 1) % max(1, n_mc // 4) == 0:
@@ -111,7 +111,7 @@ def write_report(out_dir: Path, csv_path: Path, n_nodes: int, mc_summary: pd.Dat
         "# Capability model — robustness to input noise (Cagliari)",
         "",
         f"* Input: `{csv_path}` ({n_nodes} nodes)",
-        f"* Baseline: q_factor={ELECTRE_Q_FACTOR}, p_factor={ELECTRE_P_FACTOR}, "
+        f"* Baseline: q={ELECTRE_Q}, p={ELECTRE_P}, "
         f"lambda={LAMBDA_BASELINE}, veto=inf, uniform weights (all held fixed -- only the "
         "input service scores are perturbed)",
         "",

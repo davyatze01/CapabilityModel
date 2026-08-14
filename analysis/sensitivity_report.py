@@ -25,7 +25,7 @@ from pathlib import Path
 
 import matplotlib
 
-from analysis.sensitivity_analysis import LAMBDA_BASELINE
+from analysis.sensitivity_analysis import ELECTRE_Q, ELECTRE_P, LAMBDA_BASELINE
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -100,7 +100,7 @@ def _classify(pct: float) -> tuple[str, str]:
 # have to re-learn a new ordering per section. "weights" has no place in the
 # five-step chain (it's a Dirichlet perturbation of ELECTRE's service weights,
 # not a single scalar), so it's appended last.
-PARAM_ORDER = ["decay", "rra", "contribution", "capacity", "interactions", "q_factor", "p_factor", "lambda", "weights"]
+PARAM_ORDER = ["decay", "rra", "contribution", "capacity", "interactions", "q", "p", "lambda", "weights"]
 
 PARAM_LABELS = {
     "decay": "decay_coefficient",
@@ -109,8 +109,8 @@ PARAM_LABELS = {
     "capacity": "choquet_capacity",
     "interactions": "choquet_interactions",
     "lambda": "lambda cut level",
-    "q_factor": "q_factor",
-    "p_factor": "p_factor",
+    "q": "q (indifference threshold)",
+    "p": "p (preference threshold)",
     "weights": "ELECTRE service weights",
 }
 
@@ -413,7 +413,7 @@ LEVELS = ["Very Low", "Low", "Medium", "High", "Very High"]
 
 # Every parameter that has a genuine (min, max) perturbation pair -- excludes
 # "weights" (a Dirichlet distribution, not a single min/max).
-LEVEL_TORNADO_PARAMS = ["decay", "rra", "contribution", "capacity", "interactions", "q_factor", "p_factor", "lambda"]
+LEVEL_TORNADO_PARAMS = ["decay", "rra", "contribution", "capacity", "interactions", "q", "p", "lambda"]
 
 
 def _param_min_max_config(R: dict, key: str) -> tuple[str, str] | None:
@@ -651,9 +651,9 @@ def _params_tested_html(R: dict) -> str:
 <table><tr><th>Parameter</th><th>Acts on</th><th>How the perturbation is built</th></tr>{up_rows}</table>
 <h3>Downstream ELECTRE TRI OAT sweeps (one parameter at a time, others at baseline)</h3>
 <table><tr><th>Parameter</th><th>Baseline</th><th>Values tested</th></tr>{oat_rows}</table>
-<p>These knobs enter the assignment as follows: with &sigma;(x) the standard deviation of a node's
-service scores, the indifference and preference thresholds are</p>
-<div class="formula">q = q_factor &middot; &sigma;(x), &nbsp;&nbsp; p = p_factor &middot; &sigma;(x),</div>
+<p>These knobs enter the assignment as follows: q and p are fixed absolute indifference/preference
+thresholds (not derived from each node's own score spread):</p>
+<div class="formula">q = {ELECTRE_Q}, &nbsp;&nbsp; p = {ELECTRE_P},</div>
 <p>and a node is promoted above boundary b<sub>k</sub> exactly when its outranking credibility clears
 the cutting level (with no service vetoing, i.e. no deficit beyond v):</p>
 <div class="formula">&rho;(x, b<sub>k</sub>) &ge; &lambda;.</div>
@@ -679,8 +679,8 @@ def build_html(R: dict, V: dict, out_path: Path) -> None:
 
     up_pivot = _pivot(up, "config", "capability", "pct_nodes_changed")
     svc_pivot = _pivot(R["up_service"], "config", "service", "mean_abs_delta")
-    q_pivot = _pivot(R["oat"][R["oat"].parameter == "q_factor"], "value", "capability", "pct_nodes_changed")
-    p_pivot = _pivot(R["oat"][R["oat"].parameter == "p_factor"], "value", "capability", "pct_nodes_changed")
+    q_pivot = _pivot(R["oat"][R["oat"].parameter == "q"], "value", "capability", "pct_nodes_changed")
+    p_pivot = _pivot(R["oat"][R["oat"].parameter == "p"], "value", "capability", "pct_nodes_changed")
     l_pivot = _pivot(R["oat"][R["oat"].parameter == "lambda"], "value", "capability", "pct_nodes_changed")
     wsum = R["weights"].groupby("capability")["pct_nodes_changed"].describe()[["mean", "std", "50%", "max"]]
     drop = R["up_dropout"]
@@ -727,8 +727,8 @@ def build_html(R: dict, V: dict, out_path: Path) -> None:
         if axis in axes_present and axis in param_by_key
         for note in (axis_notes.get(axis, ""),)
     )
-    chart_q = chart_tornado_oat(R["oat"], "q_factor", _oat_baseline("q_factor"), caps)
-    chart_p = chart_tornado_oat(R["oat"], "p_factor", _oat_baseline("p_factor"), caps)
+    chart_q = chart_tornado_oat(R["oat"], "q", _oat_baseline("q"), caps)
+    chart_p = chart_tornado_oat(R["oat"], "p", _oat_baseline("p"), caps)
     chart_l = chart_tornado_oat(R["oat"], "lambda", _oat_baseline("lambda"), caps)
     chart_w = chart_weight_stats(wsum, caps)
     chart_ranking = chart_ranked_bar(V["param_rows"])
@@ -756,8 +756,8 @@ def build_html(R: dict, V: dict, out_path: Path) -> None:
         m = oat[(oat["parameter"] == param) & (oat["capability"] == cap)]
         return float(m["pct_nodes_changed"].max()) if len(m) else float("nan")
 
-    q_max = oat_max("q_factor", fragile)
-    p_max = oat_max("p_factor", fragile)
+    q_max = oat_max("q", fragile)
+    p_max = oat_max("p", fragile)
     n_nodes = int(R["up_dropout"]["n_nodes"].max()) if len(R["up_dropout"]) else 0
 
     params_tested = _params_tested_html(R)
@@ -811,10 +811,10 @@ that a human chose:</p>
     <td>{chain_values['capacity']}</td></tr>
 <tr><td></td><td></td><td></td><td><code>choquet_interactions</code></td>
     <td>{chain_values['interactions']}</td></tr>
-<tr><td>⑤ ELECTRE TRI</td><td>service scores</td><td>3 capability classes</td><td><code>q_factor</code></td>
-    <td>{chain_values['q_factor']}</td></tr>
-<tr><td></td><td></td><td></td><td><code>p_factor</code></td>
-    <td>{chain_values['p_factor']}</td></tr>
+<tr><td>⑤ ELECTRE TRI</td><td>service scores</td><td>3 capability classes</td><td><code>q</code> (indifference)</td>
+    <td>{chain_values['q']}</td></tr>
+<tr><td></td><td></td><td></td><td><code>p</code> (preference)</td>
+    <td>{chain_values['p']}</td></tr>
 <tr><td></td><td></td><td></td><td>&lambda; cut</td>
     <td>{chain_values['lambda']}</td></tr>
 </table>
@@ -883,12 +883,12 @@ vs baseline (0% at baseline). The tornado plots below put the baseline value in 
 left for the below-baseline value and right for the above-baseline value, so <b>an asymmetric shape (one
 side much longer than the other) is itself the finding</b> — it means the model responds differently to
 tightening vs loosening that parameter right around its current value.</p>
-<h3>q_factor (baseline 0.25) — near-symmetric</h3>
-<p>Nudging q_factor one step either side of baseline moves at most ~{q_max:.0f}% of {fragile}, and both
+<h3>q, indifference threshold (baseline {ELECTRE_Q}) — near-symmetric</h3>
+<p>Nudging q one step either side of baseline moves at most ~{q_max:.0f}% of {fragile}, and both
 directions respond similarly: the baseline is not sitting on an edge.</p>
 {_df_html(q_pivot)}
 {chart_q}
-<h3>p_factor (baseline 0.75) — near-symmetric</h3>
+<h3>p, preference threshold (baseline {ELECTRE_P}) — near-symmetric</h3>
 <p>Same benign signature (up to ~{p_max:.0f}% of {fragile} for the immediate neighbor on either side).
 Baseline sits in a safe local neighborhood.</p>
 {_df_html(p_pivot)}
@@ -981,7 +981,7 @@ QGIS stability layer.</p>
 <li><b>Calibrate the load-bearing upstream parameters</b> (decay / contribution), especially for {fragile}'s services.</li>
 <li><b>Freeze the inert parameters</b> (interactions) at any defensible value — do not spend calibration effort there.</li>
 <li><b>Check the robustness report</b> for which capabilities/nodes need to be presented with uncertainty.</li>
-<li><b>Leave q_factor / p_factor at baseline</b> — they sit in proven-safe interior regions.</li>
+<li><b>Leave q / p at baseline</b> — they sit in proven-safe interior regions.</li>
 </ol>
 <p class="sub">Generated automatically from the sensitivity analysis result tables; re-running the
 analyses refreshes every figure and verdict.</p>

@@ -26,9 +26,21 @@ def normalize_study_city(study_city: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", study_city.strip().lower()).strip("_")
 
 
-# ELECTRE TRI threshold factors — multiplied by std(service scores) at runtime.
+# Absolute ELECTRE TRI thresholds, in use since <this fix>. Originally derived as
+# std(x) * the factors below on a representative run, then frozen as fixed values --
+# every implementation (production classifier, vectorized sensitivity analysis) must
+# use these same absolute numbers, not recompute std(x) per node.
+ELECTRE_Q: float = 0.02   # indifference threshold
+ELECTRE_P: float = 0.06   # preference threshold
+# Historical factors used to originally derive ELECTRE_Q/ELECTRE_P from std(x).
+# Provenance only -- not read at runtime anymore.
 ELECTRE_Q_FACTOR: float = 0.2   # indifference threshold  q = std(x) * Q_FACTOR
 ELECTRE_P_FACTOR: float = 0.8   # preference threshold    p = std(x) * P_FACTOR
+# ELECTRE TRI's 5-class boundaries (Very Low/Low/Medium/High/Very High cut points),
+# frozen from a Jenks natural-breaks calibration against the Cagliari baseline run's
+# capability score distribution -- see analysis/calibrate_electre_boundaries.py.
+# Recalibrating means rerunning that script and pasting its output here.
+ELECTRE_BOUNDARIES: list[float] = [0.31, 0.44, 0.56, 0.71]
 # Cutting level λ: minimum outranking credibility for a node to be assigned above a
 # boundary. The single source of truth — the assignment code, the debug details, and
 # the sensitivity baseline all read this value. The sensitivity report flags λ as the

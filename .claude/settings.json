@@ -9,7 +9,19 @@
       "PowerShell(if \\($?\\) { \"OK: all modules compile\" })",
       "PowerShell(& python -c \"import psutil, os; print\\('psutil OK', psutil.__version__\\)\")",
       "PowerShell(& python -c \"import os; os.environ['CAP_STUDY_CITY']='cagliari'; from config import PipelineConfig; c=PipelineConfig\\(study_city='cagliari'\\); print\\('use_shapefile=',c.use_shapefile\\); print\\('artifact_slug=',getattr\\(c,'artifact_slug',None\\)\\)\")",
-      "PowerShell(& python test_mem_flat.py)"
+      "PowerShell(& python test_mem_flat.py)",
+      "Bash(python -m py_compile analysis/sensitivity_report.py analysis/robustness_analysis.py analysis/sensitivity_upstream.py analysis/sensitivity_analysis.py core/config.py utils/capabilities.py main.py)",
+      "Bash(python -m py_compile main.py core/config.py utils/capabilities.py analysis/sensitivity_analysis.py analysis/robustness_analysis.py analysis/robustness_report.py analysis/sensitivity_upstream.py analysis/sensitivity_report.py tools/debug_pipeline.py)",
+      "Bash(python -m py_compile utils/capabilities.py)",
+      "Bash(python -c ' *)",
+      "Bash(python -m py_compile analysis/calibrate_electre_boundaries.py)",
+      "Bash(python analysis/calibrate_electre_boundaries.py)",
+      "Bash(python -m analysis.calibrate_electre_boundaries)",
+      "Bash(python analysis/sensitivity_analysis.py)",
+      "Bash(python -m py_compile utils/capabilities.py analysis/calibrate_electre_boundaries.py)",
+      "Bash(python -m py_compile core/config.py utils/capabilities.py)",
+      "Bash(python -m py_compile stages/capability_stage.py)",
+      "Bash(python -m py_compile main.py core/config.py utils/capabilities.py analysis/sensitivity_analysis.py analysis/robustness_analysis.py analysis/robustness_report.py analysis/sensitivity_upstream.py analysis/sensitivity_report.py analysis/calibrate_electre_boundaries.py tools/debug_pipeline.py stages/capability_stage.py)"
     ]
   }
 }

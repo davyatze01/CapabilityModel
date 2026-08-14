@@ -26,7 +26,7 @@ from collections import Counter, OrderedDict
 from pathlib import Path
 from statistics import pstdev
 
-from core.config import ELECTRE_Q_FACTOR, ELECTRE_P_FACTOR, ELECTRE_LAMBDA_CUT
+from core.config import ELECTRE_Q, ELECTRE_P, ELECTRE_BOUNDARIES, ELECTRE_LAMBDA_CUT
 
 
 # Per-capability singleton measures used by the legacy Choquet-based capability
@@ -112,7 +112,7 @@ def choquet_integral(x, capability):
         prev = x_sorted[j]
     return total
 
-_BOUNDARIES  = [0.35, 0.6, 0.8, 0.95]
+_BOUNDARIES  = ELECTRE_BOUNDARIES
 _CATEGORIES  = ["Very Low", "Low", "Medium", "High", "Very High"]
 _CAT_SCORE   = {cat: (lo + hi) / 2
                 for cat, lo, hi in zip(
@@ -161,8 +161,6 @@ def electre_tri_details(x, capability):
         "services": list(services),
         "service_scores": service_scores,
         "std": std,
-        "q_factor": float(ELECTRE_Q_FACTOR),
-        "p_factor": float(ELECTRE_P_FACTOR),
         "veto_threshold": float(v),
         "lambda_cut": float(ELECTRE_LAMBDA_CUT),
         "boundaries": [],
@@ -184,8 +182,8 @@ def electre_tri_details(x, capability):
         )
         return details
 
-    q = 0.02
-    p = 0.06
+    q = ELECTRE_Q
+    p = ELECTRE_P
     inf_veto = v == float("inf")
     pq_range = p - q
     # Per-service ELECTRE weights (from CAP_ELECTRE_W / the electre_weight column
@@ -299,8 +297,8 @@ def electre_tri_integration(x, capability):
     assigned category as a continuous score in (0, 1).
 
     Thresholds (uniform across all services):
-    - q = std(x) * ELECTRE_Q_FACTOR  (indifference; factors from config.py)
-    - p = std(x) * ELECTRE_P_FACTOR  (preference)
+    - q = ELECTRE_Q  (indifference; absolute, from config.py)
+    - p = ELECTRE_P  (preference; absolute, from config.py)
     - v = read from config/capability.csv column veto_threshold
     """
     return float(electre_tri_details(x, capability)["score"])
