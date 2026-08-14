@@ -14,6 +14,7 @@ class PresetDict(TypedDict):
     poi_label_field : str
     bus_ticket_price : float
     osm_extract_url : str
+    metro_ticket_price : NotRequired[float]
     enable_subway: NotRequired[bool]
     gtfs_feeds : NotRequired[list[str]]
     bus_departure_dt : NotRequired[dt.datetime]
@@ -50,6 +51,7 @@ CITY_PRESETS: dict[str, PresetDict] = {
         # classification attribute under this column name.
         "poi_label_field": "poiType",
         "bus_ticket_price": 1.3,
+        "metro_ticket_price": 1.3,
         "osm_extract_url": "https://download.geofabrik.de/europe/italy/isole-latest.osm.pbf",
         "enable_subway" : True,
         "gtfs_feeds" : [os.path.join("gtfs", "GTFS.zip"), os.path.join("gtfs","gtfs_metrocagliari.zip")],
@@ -98,6 +100,8 @@ def apply_study_city(cfg: "PipelineConfig", study_city: str) -> None:
         cfg.poi_label_field = str(preset["poi_label_field"])
     if "bus_ticket_price" in preset:
         cfg.bus_ticket_price = float(preset["bus_ticket_price"])  # type: ignore[arg-type]
+    if "metro_ticket_price" in preset:
+        cfg.metro_ticket_price = float(preset["metro_ticket_price"])
     if "enable_subway" in preset:
         cfg.enable_subway = bool(preset["enable_subway"])
     if "gtfs_feeds" in preset:

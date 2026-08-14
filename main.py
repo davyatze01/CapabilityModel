@@ -6,6 +6,7 @@ import traceback
 import core.notify as notify
 from core.runtime_setup import run_runtime_setup
 
+
 faulthandler.enable(all_threads=True)
 
 # Change this to "paris" to switch the whole pipeline to Paris.
@@ -48,7 +49,12 @@ POI_RADIUS_KM = None
 #   the normal artifacts/<slug>/ dir into the new one before running to reuse them instead of
 #   re-routing from scratch.
 ARTIFACT_SLUG_SUFFIX = None
-
+# If true, main will generate an interactive dashboard for inspecting the results
+DEBUG_REPORT = True
+# If true, main will generate a robustness analysis dashboard
+ROBUSTNESS_REPORT = True
+# If true, main will generate a dashboard that evaluates the model's sensitivity when changing the parameters
+SENSITIVITY_REPORT = True
 
 def _reexec_under_run_safe_if_needed() -> None:
     """Re-run this entrypoint through run_safe.sh when not already in a cgroup scope.
@@ -126,6 +132,10 @@ def main():
     from exports.artifact_bundle import load_impedance_bundle, write_impedance_bundle
     from exports.poi_exports import generate_poi_exports
     from core.pipeline_runner import generate_spatial_outputs
+    from tools.debug_pipeline import run_debug_pipeline
+    from analysis.robustness_analysis import run_robustness_pipeline
+    from analysis.sensitivity_analysis import run_sensitivity_pipeline
+    from analysis.sensitivity_upstream import run_upstream
 
     shutup.please()
 
@@ -285,6 +295,20 @@ def main():
 
     if NOTIFY_CRASH:
         notify.mark_success(f"Spatial output: {gpkg_path or shapefile_path}")
+
+    if DEBUG_REPORT:
+        print("\n[Stage] Generating debug report...", flush=True)
+        run_debug_pipeline(cfg.city_slug)
+
+    if ROBUSTNESS_REPORT:
+        print("\n[Stage] Generating robustness report...", flush=True)
+        run_robustness_pipeline(cfg.artifact_slug)
+
+    if SENSITIVITY_REPORT:
+        print("\n[Stage] Generating sensitivity report (downstream)...", flush=True)
+        run_sensitivity_pipeline(cfg.artifact_slug)
+        print("\n[Stage] Generating sensitivity report (upstream)...", flush=True)
+        run_upstream()
 
 if __name__ == "__main__":
     try:

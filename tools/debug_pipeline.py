@@ -209,23 +209,18 @@ def _select_hexagons(
 # Artifact context loaders
 # ---------------------------------------------------------------------------
 
-def _load_bus_context(cfg: PipelineConfig) -> dict | None:
-    """Load bus impedance matrix and destination mapping."""
-    paths = [
-        cfg.bus_impedance_matrix_path,
-        cfg.bus_source_id_to_row_path,
-        cfg.bus_dest_id_to_col_path,
-        cfg.bus_routing_destinations_input_path,
-    ]
-    if not all(os.path.exists(p) for p in paths):
+def _load_pt_context(cfg: PipelineConfig, mode: str = "bus") -> dict | None:
+    """Load public transport (bus or subway, depending on mode) impedance matrix and destination mapping."""
+    paths = cfg.public_transport_paths(mode)
+    if not all(os.path.exists(paths[k]) for k in ("source_id_to_row", "dest_id_to_col", "routing_destinations_input", "impedance_matrix")):
         return None
     try:
-        with open(cfg.bus_source_id_to_row_path, encoding="utf-8") as f:
+        with open(paths["source_id_to_row"], encoding="utf-8") as f:
             source_to_row: dict[str, int] = {str(k): int(v) for k, v in json.load(f).items()}
-        with open(cfg.bus_dest_id_to_col_path, encoding="utf-8") as f:
+        with open(paths["dest_id_to_col"], encoding="utf-8") as f:
             dest_id_to_col: dict[str, int] = {str(k): int(v) for k, v in json.load(f).items()}
         coord_to_col: dict[tuple, int] = {}
-        with open(cfg.bus_routing_destinations_input_path, newline="", encoding="utf-8") as f:
+        with open(paths["routing_destinations_input"], newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 coord = (round(float(row["lat"]), 6), round(float(row["lon"]), 6))
                 col = dest_id_to_col.get(row["id"])
@@ -233,10 +228,10 @@ def _load_bus_context(cfg: PipelineConfig) -> dict | None:
                     coord_to_col[coord] = int(col)
         n_src = len(source_to_row)
         n_dst = len(dest_id_to_col)
-        mat = np.memmap(cfg.bus_impedance_matrix_path, dtype=np.float32, mode="r", shape=(n_src, n_dst))
+        mat = np.memmap(paths["impedance_matrix"], dtype=np.float32, mode="r", shape=(n_src, n_dst))
         return {"mat": mat, "source_to_row": source_to_row, "coord_to_col": coord_to_col}
     except Exception as exc:
-        print(f"[Debug] Bus context load failed: {exc}")
+        print(f"[Debug] {mode} context load failed: {exc}")
         return None
 
 
@@ -295,7 +290,7 @@ def _bus_time(poi_coord: tuple, source_row: int | None, bus_ctx: dict | None) ->
     return v if v > 0 else None
 
 
-def _build_step1(non_bus: dict, source_row: int | None, bus_ctx: dict | None, poi_names: dict[str, str] | None = None) -> dict:
+def _build_step1(non_bus: dict, source_row: int | None, bus_ctx: dict | None, subway_source_row: int | None, subway_ctx: dict | None, poi_names: dict[str, str] | None = None) -> dict:
     """Step 1 — raw impedances from the non-bus pickle."""
     services_out = []
     for svc in serv.SERVICE_KEYS:
@@ -330,6 +325,7 @@ def _build_step1(non_bus: dict, source_row: int | None, bus_ctx: dict | None, po
                     "bike_min": float(imp_bike_list[i]) if i < len(imp_bike_list) and imp_bike_list[i] is not None else None,
                     "drive_min": float(imp_drive_list[i]) if i < len(imp_drive_list) and imp_drive_list[i] is not None else None,
                     "bus_min": _bus_time(poi_coord, source_row, bus_ctx) if poi_coord[0] is not None else None,
+                    "subway_min": _bus_time(poi_coord, subway_source_row, subway_ctx) if poi_coord[0] is not None else None,
                     "walk_score": float(walk_scores[i]) if i < len(walk_scores) and walk_scores[i] is not None else None,
                 })
             pois_out.sort(key=lambda p: p["walk_min"] if p["walk_min"] is not None else float("inf"))
@@ -397,7 +393,9 @@ def _delta_g_details(rra: list[float], poi_type: str) -> dict:
 def _build_step2(
     non_bus: dict,
     source_row: int | None,
+    subway_source_row: int | None,
     bus_ctx: dict | None,
+    subway_ctx: dict | None,
     acc_ctx: dict | None,
     acc_node_row: int | None,
     cfg: PipelineConfig,
@@ -444,6 +442,7 @@ def _build_step2(
             dm = float(imp_drive_list[i]) if i < len(imp_drive_list) and imp_drive_list[i] is not None else None
             poi_coord = poi_coords[i] if i < len(poi_coords) else (None, None)
             bus_m = _bus_time(poi_coord, source_row, bus_ctx) if poi_coord[0] is not None else None
+            subway_m = _bus_time(poi_coord, subway_source_row, subway_ctx) if poi_coord[0] is not None else None
             src_coord = source_coords[i] if i < len(source_coords) else (None, None)
             src_key = str(source_keys[i]) if i < len(source_keys) else ""
 
@@ -451,10 +450,14 @@ def _build_step2(
             db = math.exp(-beta * bm) if bm is not None else 0.0
             dd = math.exp(-beta * dm) if dm is not None else 0.0
             dbus = math.exp(-beta * bus_m) if bus_m is not None else 0.0
+            if subway_ctx is None:
+                dsub = None
+            else:
+                dsub = math.exp(-beta * subway_m) if subway_m is not None else 0.0
 
             # Per-POI accessibility A^i_k(x, y) is exactly the RRA over modes; the
             # Delta-g aggregation happens only at the POI-type level downstream.
-            rra = calculate_rra(dw, db, dd, dbus)
+            rra = calculate_rra(dw, db, dd, dbus, dsub)
             poi_acc = rra
             poi_accs.append(poi_acc)
 
@@ -467,10 +470,12 @@ def _build_step2(
                 "bike_min": round(bm, 2) if bm is not None else None,
                 "drive_min": round(dm, 2) if dm is not None else None,
                 "bus_min": round(bus_m, 2) if bus_m is not None else None,
+                "subway_min": round(subway_m, 2) if subway_m is not None else None,
                 "d_walk": round(dw, 4),
                 "d_bike": round(db, 4),
                 "d_drive": round(dd, 4),
                 "d_bus": round(dbus, 4),
+                "d_subway": round(dsub, 4) if dsub is not None else None,
                 "rra": round(rra, 4),
                 "poi_acc": round(poi_acc, 4),
             })
@@ -756,6 +761,7 @@ def _build_chain(
     bus_ctx: dict | None,
     acc_ctx: dict | None,
     svc_ctx: dict | None,
+    subway_ctx : dict | None,
     hex_source: Path,
     gpkg_path: Path | None,
     drop_map: dict[str, set[str]] | None = None,
@@ -802,6 +808,10 @@ def _build_chain(
     if bus_ctx:
         bus_source_row = bus_ctx["source_to_row"].get(str(node_id))
 
+    subway_source_row: int | None = None
+    if subway_ctx:
+        subway_source_row = subway_ctx["source_to_row"].get(str(node_id))
+
     acc_node_row: int | None = None
     if acc_ctx:
         acc_node_row = acc_ctx["node_to_row"].get(str(node_id))
@@ -811,8 +821,8 @@ def _build_chain(
         svc_node_row = svc_ctx["node_to_row"].get(str(node_id))
 
     chain["has_data"] = True
-    chain["step1"] = _build_step1(non_bus, bus_source_row, bus_ctx, poi_names)
-    chain["step2"], acc_by_source_key = _build_step2(non_bus, bus_source_row, bus_ctx, acc_ctx, acc_node_row, cfg, drop_map, poi_names)
+    chain["step1"] = _build_step1(non_bus, bus_source_row, bus_ctx, subway_source_row, subway_ctx, poi_names)
+    chain["step2"], acc_by_source_key = _build_step2(non_bus, bus_source_row, subway_source_row, bus_ctx, subway_ctx, acc_ctx, acc_node_row, cfg, drop_map, poi_names)
     chain["step3"] = _build_step3(acc_ctx, acc_node_row, svc_ctx, svc_node_row)
     chain["step4"] = _build_step4(svc_ctx, svc_node_row)
     chain["verify"] = _build_step_verify(
@@ -929,6 +939,7 @@ _HTML_TEMPLATE = """\
   integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 <script>
 const CHAIN_DATA = __CHAIN_DATA__;
+const SUBWAY_ENABLED = __SUBWAY_ENABLED__;
 
 // ---- Map ----
 const map = L.map("map");
@@ -1037,9 +1048,10 @@ function renderChain(chain){
             <td class="${timeClass(p.bike_min)}">${fmt(p.bike_min)}</td>
             <td class="${timeClass(p.drive_min)}">${fmt(p.drive_min)}</td>
             <td class="${timeClass(p.bus_min)}">${fmt(p.bus_min)}</td>
+            ${SUBWAY_ENABLED? `<td class="${timeClass(p.subway_min)}">${fmt(p.subway_min)}</td>` : ""}
           </tr>`);
         p1.body.insertAdjacentHTML("beforeend", makeToggleTable(
-          `<thead><tr><th>POI</th><th>Walk</th><th>Bike</th><th>Drive</th><th>Bus</th></tr></thead>`,
+          `<thead><tr><th>POI</th><th>Walk</th><th>Bike</th><th>Drive</th><th>Bus</th>${SUBWAY_ENABLED? "<th>Subway</th>" : ""}</tr></thead>`,
           rows, 10));
       });
     });
@@ -1073,16 +1085,17 @@ function renderChain(chain){
           <td>${fmtD(p.d_bike)}</td>
           <td>${fmtD(p.d_drive)}</td>
           <td>${fmtD(p.d_bus)}</td>
+          ${SUBWAY_ENABLED? `<td>${fmtD(p.d_subway)}</td>` : ""}
           <td>${fmtD(p.rra)}</td>
           <td>${fmtD(acc)}<div class="acc-bar-wrap"><div class="acc-bar" style="width:${(acc*100).toFixed(0)}%"></div></div></td>
         </tr>`;
       });
       p2.body.insertAdjacentHTML("beforeend", makeToggleTable(
-        `<thead><tr><th>POI</th><th>d_walk</th><th>d_bike</th><th>d_drive</th><th>d_bus</th><th>RRA</th><th>poi_acc</th></tr></thead>`,
+        `<thead><tr><th>POI</th><th>d_walk</th><th>d_bike</th><th>d_drive</th><th>d_bus</th>${SUBWAY_ENABLED? "<th>d_subway</th>" : ""} <th>RRA</th><th>poi_acc</th></tr></thead>`,
         rows, 10));
       p2.body.insertAdjacentHTML("beforeend",`
         <div class="muted" style="margin:2px 0 4px">
-          <span class="formula">RRA = 1−∏(1−λ_i·d_i), λ=[1,½,⅓,¼]</span>
+          <span class="formula">RRA = 1−∏(1−λ_i·d_i), λ=[1,½,⅓,¼${SUBWAY_ENABLED? ",⅕]" : "]"}</span>
         </div>`);
 
       // --- POI aggregation (Delta-g marginal saturation): collect one summary row per poi_type ---
@@ -1426,10 +1439,9 @@ function timeClass(v){
 """
 
 
-def _build_html(chain_data: dict, slug: str) -> str:
+def _build_html(chain_data: dict, slug: str, subway_enabled: bool) -> str:
     payload = json.dumps(chain_data, ensure_ascii=False, separators=(",", ":"))
-    return _HTML_TEMPLATE.replace("__CHAIN_DATA__", payload)
-
+    return _HTML_TEMPLATE.replace("__SUBWAY_ENABLED__", json.dumps(subway_enabled)).replace("__CHAIN_DATA__", payload)
 
 # ---------------------------------------------------------------------------
 # This function is called by main.py to generate the debug pipeline 
@@ -1482,11 +1494,15 @@ def run_debug_pipeline(study_city = STUDY_CITY, output = None) -> None:
     selected = _select_hexagons(grid_params, hex_source, capability_points)
     print(f"[Debug] Selected {len(selected)} hexagons: {[h['hex_id'] for h in selected]}")
 
-    bus_ctx = _load_bus_context(cfg)
+    bus_ctx = _load_pt_context(cfg, "bus")
+    subway_ctx = _load_pt_context(cfg, "metro") if cfg.enable_subway else None
     acc_ctx = _load_accessibility_context(cfg)
     svc_ctx = _load_service_context(cfg)
-    print(f"[Debug] bus={'ok' if bus_ctx else 'missing'} acc={'ok' if acc_ctx else 'missing'} svc={'ok' if svc_ctx else 'missing'}")
-
+    print(f"[Debug] bus={'ok' if bus_ctx else 'missing'} acc={'ok' if acc_ctx else 'missing'} subway={'ok' if subway_ctx else 'missing'} svc={'ok' if svc_ctx else 'missing'}")
+    if cfg.enable_subway and subway_ctx is None:
+        raise RuntimeError(f"Subway is none even if enabled, please check the subway artifacts in artifacts/{cfg.artifact_slug}/subway and the paths in" \
+        f" {cfg.public_transport_paths("metro")}")
+        
     # Same per-service ownership drop map the accessibility + export stages apply, so the
     # debug recomputation/verification matches the pipeline's deduplicated values.
     from utils import poi_dedup
@@ -1501,9 +1517,9 @@ def run_debug_pipeline(study_city = STUDY_CITY, output = None) -> None:
     for hex_entry in selected:
         hid = hex_entry["hex_id"]
         print(f"[Debug] Building chain for {hid} ({hex_entry['group']}) node={hex_entry['node_id']}")
-        chain_data[hid] = _build_chain(hex_entry, cfg, bus_ctx, acc_ctx, svc_ctx, hex_source, gpkg_path, poi_drop_map, poi_names)
+        chain_data[hid] = _build_chain(hex_entry, cfg, bus_ctx, acc_ctx, svc_ctx, subway_ctx, hex_source, gpkg_path, poi_drop_map, poi_names)
 
-    html = _build_html(chain_data, slug)
+    html = _build_html(chain_data, slug, cfg.enable_subway)
 
     out_path = os.path.join("outputs", f"debug/{slug}/debug_pipeline.html") if output is None else output 
     # I haven't used " output or ..." because output = "" would count as False

@@ -22,19 +22,14 @@ QGIS (join on node_id) via robustness_report.py.
 Outputs (under --out-dir, default outputs/sensitivity/):
   * robustness_node_stability.csv  one row per (node, capability, sigma)
   * robustness_report.md           human-readable summary
-
-Usage
------
-  python robustness_analysis.py                    # newest experiments/Cagliari_*.csv
-  python robustness_analysis.py --csv path.csv --n-mc 500 --seed 7
 """
 
 from __future__ import annotations
 
-import argparse
-import sys
 import time
 from pathlib import Path
+from analysis.robustness_report import generate_robustness_report
+from analysis.robustness_report import SIGMA, COORDS_CSV, BUILD_QGIS
 
 import numpy as np
 import pandas as pd
@@ -48,6 +43,11 @@ from analysis.sensitivity_analysis import (
     load_capability_matrices,
 )
 from utils.capabilities import _CATEGORIES
+
+OUT_DIR : Path | None = None
+N_MC : int = 200
+SIGMAS: list[float] = [0.02,0.05,0.10]
+SEED: int = 42
 
 
 def run_input_noise(
@@ -129,39 +129,42 @@ def write_report(out_dir: Path, csv_path: Path, n_nodes: int, mc_summary: pd.Dat
     return report
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--csv", type=Path, default=None, help="experiment CSV (default: newest experiments/Cagliari_*.csv)")
-    ap.add_argument("--out-dir", type=Path, default=Path("outputs/sensitivity"))
-    ap.add_argument("--n-mc", type=int, default=200, help="Monte Carlo repetitions per sigma")
-    ap.add_argument("--sigmas", type=float, nargs="+", default=[0.02, 0.05, 0.10])
-    ap.add_argument("--seed", type=int, default=42)
-    args = ap.parse_args()
+def run_robustness_pipeline(
+        city_slug : str = "Cagliari", 
+        csv_path : Path | None = None, 
+        out_dir : Path | None = OUT_DIR, 
+        n_mc : int = N_MC, 
+        sigmas: list[float] = SIGMAS,
+        seed: int = SEED,
+        sigma : float = SIGMA,
+        coords_csv : Path | None = COORDS_CSV,
+        build_qgis : bool = BUILD_QGIS) -> None:
 
-    csv_path = args.csv or default_experiment_csv()
+    csv_path = csv_path or default_experiment_csv(city_slug)
     if csv_path is None:
-        print("ERROR: no experiments/Cagliari_capability_*.csv found; pass --csv.", file=sys.stderr)
-        return 1
+        raise RuntimeError(f"[Robustness] ERROR: no experiments /{city_slug}_capability_*.csv found")
     print(f"[load] {csv_path}", flush=True)
 
-    rng = np.random.default_rng(args.seed)
+    if out_dir is None:
+        out_dir = Path(f"outputs/debug/{city_slug}")
+
+    rng = np.random.default_rng(seed)
     try:
         df, caps_X, _baseline = load_capability_matrices(csv_path, rng)
     except ValueError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+        raise RuntimeError("[Robustness] ERROR in loading capability matrices") from exc
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     node_ids = df["node_id"].to_numpy()
 
-    node_stab, mc_summary = run_input_noise(caps_X, node_ids, args.sigmas, args.n_mc, rng)
-    node_stab.to_csv(args.out_dir / "robustness_node_stability.csv", index=False)
+    node_stab, mc_summary = run_input_noise(caps_X, node_ids, sigmas, n_mc, rng)
+    node_stab.to_csv(out_dir / "robustness_node_stability.csv", index=False)
 
-    report = write_report(args.out_dir, csv_path, len(df), mc_summary, args.n_mc)
+    report = write_report(out_dir, csv_path, len(df), mc_summary, n_mc)
     print(f"\n[done] Report: {report}")
-    print(f"[done] Table: {args.out_dir}/robustness_node_stability.csv")
-    return 0
+    print(f"[done] Table: {out_dir}/robustness_node_stability.csv")
+    generate_robustness_report(sigma, coords_csv or csv_path, build_qgis, out_dir)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run_robustness_pipeline()

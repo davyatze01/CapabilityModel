@@ -32,10 +32,8 @@ Usage
 
 from __future__ import annotations
 
-import argparse
 import glob
 import os
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -59,6 +57,12 @@ CAT_MIDPOINTS = np.array(
     [(lo + hi) / 2 for lo, hi in zip([0.0] + _BOUNDARIES, _BOUNDARIES + [1.0])]
 )
 BOUNDS = np.asarray(_BOUNDARIES, dtype=float)
+
+CSV : Path | None = None
+OUT_DIR : Path | None = None
+N_WEIGHT_DRAWS = 200
+WEIGHT_CONCENTRATION = 20.0
+SEED = 42
 
 
 # ── Vectorized ELECTRE TRI (mirrors utils/capabilities.electre_tri_details) ──
@@ -237,11 +241,11 @@ def run_weight_perturbation(
 
 # ── Shared loading (used by both sensitivity_analysis.py and robustness_analysis.py) ──
 
-def default_experiment_csv() -> Path | None:
+def default_experiment_csv(city_slug : str = "Cagliari") -> Path | None:
     # Pick the most recently written CSV (the current run). A lexical sort here
     # is wrong: "Cagliari_capability_9.csv" sorts after "..._80.csv", so string
     # ordering silently grabs a stale file.
-    candidates = glob.glob("experiments/Cagliari_capability_*.csv")
+    candidates = glob.glob(f"experiments/{city_slug}_capability_*.csv")
     if not candidates:
         return None
     return Path(max(candidates, key=lambda p: os.path.getmtime(p)))
@@ -332,45 +336,42 @@ def write_report(
     report.write_text("\n".join(lines), encoding="utf-8")
     return report
 
+def run_sensitivity_pipeline(
+        city_slug : str = "Cagliari",
+        csv : Path | None = CSV,
+        out_dir : Path | None = OUT_DIR,
+        n_weight_draws : int = N_WEIGHT_DRAWS,
+        weight_concentration : float = WEIGHT_CONCENTRATION,
+        seed : int = SEED
+) -> None:
 
-# ── Main ─────────────────────────────────────────────────────────────────────
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--csv", type=Path, default=None, help="experiment CSV (default: newest experiments/Cagliari_*.csv)")
-    ap.add_argument("--out-dir", type=Path, default=Path("outputs/sensitivity"))
-    ap.add_argument("--n-weight-draws", type=int, default=200)
-    ap.add_argument("--weight-concentration", type=float, default=20.0, help="Dirichlet alpha (higher = closer to uniform)")
-    ap.add_argument("--seed", type=int, default=42)
-    args = ap.parse_args()
-
-    csv_path = args.csv or default_experiment_csv()
+    csv_path = csv or default_experiment_csv(city_slug)
     if csv_path is None:
-        print("ERROR: no experiments/Cagliari_capability_*.csv found; pass --csv.", file=sys.stderr)
-        return 1
+        raise RuntimeError(f"[Sensitivity] ERROR: no experiments/{city_slug}_*.csv found")
     print(f"[load] {csv_path}", flush=True)
 
-    rng = np.random.default_rng(args.seed)
+    rng = np.random.default_rng(seed)
     try:
         df, caps_X, baseline = load_capability_matrices(csv_path, rng)
     except ValueError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+        raise RuntimeError("[Sensitivity] ERROR: unable to load capability matrices") from exc
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
+    if out_dir is None:
+        out_dir = Path(f"outputs/debug/{city_slug}")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     oat, oat_levels = run_oat_sweeps(caps_X, baseline)
-    oat.to_csv(args.out_dir / "sensitivity_oat.csv", index=False)
-    oat_levels.to_csv(args.out_dir / "sensitivity_oat_levels.csv", index=False)
+    oat.to_csv(out_dir / "sensitivity_oat.csv", index=False)
+    oat_levels.to_csv(out_dir / "sensitivity_oat_levels.csv", index=False)
 
-    wdf = run_weight_perturbation(caps_X, baseline, args.n_weight_draws, args.weight_concentration, rng)
-    wdf.to_csv(args.out_dir / "sensitivity_weights.csv", index=False)
+    wdf = run_weight_perturbation(caps_X, baseline, n_weight_draws, weight_concentration, rng)
+    wdf.to_csv(out_dir / "sensitivity_weights.csv", index=False)
 
-    report = write_report(args.out_dir, csv_path, len(df), oat, wdf)
+    report = write_report(out_dir, csv_path, len(df), oat, wdf)
     print(f"\n[done] Report: {report}")
-    print(f"[done] Tables: {args.out_dir}/sensitivity_oat.csv, sensitivity_oat_levels.csv, sensitivity_weights.csv")
-    return 0
+    print(f"[done] Tables: {out_dir}/sensitivity_oat.csv, sensitivity_oat_levels.csv, sensitivity_weights.csv")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run_sensitivity_pipeline()

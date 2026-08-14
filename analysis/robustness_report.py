@@ -15,37 +15,36 @@ a parameter sweep to be rerun to refresh its numbers, or vice versa.
 Reads outputs/sensitivity/robustness_node_stability.csv (from robustness_analysis.py).
 Reuses the chart/CSS infrastructure from sensitivity_report.py so both reports
 look like one system.
-
-Usage:
-  python robustness_report.py                 # both deliverables
-  python robustness_report.py --sigma 0.05    # stability sigma for the map default
-  python robustness_report.py --no-layer      # HTML only
 """
 
 from __future__ import annotations
 
-import argparse
 import sqlite3
-import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from analysis.sensitivity_report import CHART_INK, CSS, VERDICT_HEX, _cap_colors, _df_html, _fig_html, _style_ax
-
+from typing import cast
 import matplotlib.pyplot as plt
-
+from matplotlib.patches import Rectangle
+from matplotlib.collections import PolyCollection
 SENS_DIR = Path("outputs/sensitivity")
 
 
+
+# —— Knobs for robustness report ——————————————————————————————————————————————————————————
+SIGMA = 0.05
+COORDS_CSV : Path | None = None
+BUILD_QGIS = True
+
 # ── Load ─────────────────────────────────────────────────────────────────────
 
-def load_stability() -> pd.DataFrame:
-    path = SENS_DIR / "robustness_node_stability.csv"
+def load_stability(out_dir : Path) -> pd.DataFrame:
+    path = out_dir / "robustness_node_stability.csv"
     if not path.exists():
-        print(f"ERROR: expected {path}. Run robustness_analysis.py first.", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(f"[Robustness] ERROR: expected {path}")
     return pd.read_csv(path)
 
 
@@ -68,13 +67,13 @@ def chart_robustness(stability: pd.DataFrame, caps: list[str]) -> str:
         offset = (i - (n_series - 1) / 2) * width
         positions = [s_idx + offset for s_idx in range(len(sigmas))]
         data = [
-            stability.loc[(stability["capability"] == cap) & (stability["sigma"] == s), "stability"].to_numpy()
+            stability["stability"].loc[(stability["capability"] == cap) & (stability["sigma"] == s)].to_numpy()
             for s in sigmas
         ]
         parts = ax.violinplot(
             data, positions=positions, widths=width * 0.9, showmeans=True, showextrema=True
         )
-        for body in parts["bodies"]:
+        for body in cast(list[PolyCollection], parts["bodies"]):
             body.set_facecolor(colors[cap])
             body.set_edgecolor(colors[cap])
             body.set_alpha(0.65)
@@ -91,7 +90,7 @@ def chart_robustness(stability: pd.DataFrame, caps: list[str]) -> str:
     ax.set_ylabel("per-node stability")
     ax.set_title("Distribution of per-node class stability by σ", fontsize=10.5, color=CHART_INK, loc="left")
     _style_ax(ax)
-    handles = [plt.Rectangle((0, 0), 1, 1, color=colors[c], alpha=0.65) for c in cols]
+    handles = [Rectangle((0, 0), 1, 1, color=colors[c], alpha=0.65) for c in cols]
     ax.legend(handles, cols, frameon=False, fontsize=9, ncols=n_series, loc="upper center", bbox_to_anchor=(0.5, -0.16))
     fig.tight_layout()
     return _fig_html(fig)
@@ -154,7 +153,7 @@ one that is uniformly middling, even if their means match; the dashed line marks
 <h2>3. Conclusions</h2>
 <div class="callout">
 <p>{("Mean class stability at &sigma;=" + f"{sigma:g}" + ": " + rob_mean + ". ") if rob_mean else ""}
-{("<b>" + fragile + "</b> is the least stable capability here" + (f" — <b>{frag_row['pct_lt_08']:.0f}%</b> of its nodes are unstable (fewer than 80% of noisy repetitions agree on a class)" if frag_row is not None else "") + ".") if rob_mean else ""}
+{("<b>" + str(fragile) + "</b> is the least stable capability here" + (f" — <b>{frag_row['pct_lt_08']:.0f}%</b> of its nodes are unstable (fewer than 80% of noisy repetitions agree on a class)" if frag_row is not None else "") + ".") if rob_mean else ""}
 So {fragile} classes should be presented with uncertainty, not as hard categories. The QGIS layer
 (<code>capability_stability.gpkg</code>) maps this per node — red = coin-flip, green = solid — so a viewer
 can see exactly where on the map to trust the classification and where not to.</p>
@@ -262,28 +261,27 @@ def build_qgis_layer(stability: pd.DataFrame, coords_csv: Path, sigma: float, ou
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sigma", type=float, default=0.05, help="input-noise sigma used for the map + summary")
-    ap.add_argument("--coords-csv", type=Path, default=None, help="CSV with node_id,lat,lon (default: sensitivity upstream baseline service_scores.csv)")
-    ap.add_argument("--no-layer", action="store_true", help="HTML only")
-    args = ap.parse_args()
+def generate_robustness_report(
+        sigma : float = SIGMA,
+        coords_csv : Path | None = COORDS_CSV,
+        build_qgis : bool = BUILD_QGIS,
+        out_dir : Path = SENS_DIR
+) -> None:
 
-    stability = load_stability()
 
-    html_path = SENS_DIR / "robustness_report.html"
-    build_html(stability, args.sigma, html_path)
-    print(f"[report] {html_path}")
+    stability = load_stability(out_dir)
 
-    if not args.no_layer:
-        coords_csv = args.coords_csv or (SENS_DIR / "upstream" / "baseline" / "service_scores.csv")
+    html_path = out_dir / "robustness_report.html"
+    build_html(stability, sigma, html_path)
+    print(f"[Robustness] {html_path}")
+
+    if build_qgis:
+        coords_csv = coords_csv or (SENS_DIR / "upstream" / "baseline" / "service_scores.csv")
         if not coords_csv.exists():
-            print(f"WARNING: {coords_csv} missing for coordinates; skipping QGIS layer. "
-                  "Pass --coords-csv <experiment csv>.", file=sys.stderr)
+            print(f"WARNING: {coords_csv} missing for coordinates; skipping QGIS layer. ")
         else:
-            build_qgis_layer(stability, coords_csv, args.sigma, SENS_DIR / "capability_stability.gpkg")
-    return 0
+            build_qgis_layer(stability, coords_csv, sigma, out_dir / "capability_stability.gpkg")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    generate_robustness_report()

@@ -26,16 +26,13 @@ compared against the baseline configuration: % of nodes changing final capabilit
 class and mean |service-score delta| per service.
 
 Usage:
-  python sensitivity_upstream.py                 # run all configs (resumable)
-  python sensitivity_upstream.py --only decay_x0.8
-  python sensitivity_upstream.py --report-only   # recompute comparisons only
+  Edit UPSTREAM_ONLY / UPSTREAM_REPORT_ONLY below, then `python sensitivity_upstream.py`.
 
 Runs are resumable: a config with an existing service_scores.csv is skipped.
 """
 
 from __future__ import annotations
 
-import argparse
 import ast
 import csv
 import hashlib
@@ -46,11 +43,25 @@ import sys
 import time
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
+from typing import Callable
 
 CONFIG_DIR = Path("config")
 MUTABLE_CSVS = ["poi_types.csv", "services.csv"]
-WORK_ROOT = Path("outputs/sensitivity/upstream")
+def _work_root() -> Path:
+    """outputs/debug/<slug>/sensitivity_upstream — resolved per-call so worker
+    subprocesses (which inherit CAP_STUDY_CITY via os.environ) agree with the
+    parent process on where results live."""
+    from core.config import PipelineConfig
+    return Path("outputs/debug") / PipelineConfig().artifact_slug / "sensitivity_upstream"
+WORKER_ENV_VAR = "CAP_UPSTREAM_WORKER"
 BASELINE_NAME = "baseline"
+
+# Name of a single key in CONFIGS to run (e.g. "decay_x0.8"), skipping every other
+# config -- None means no filter, run the full sweep.
+UPSTREAM_ONLY: str | None = None
+# True = skip the sweep entirely and just rebuild upstream_report.md from whatever
+# per-config service_scores.csv files already exist under _work_root().
+UPSTREAM_REPORT_ONLY: bool = False
 
 
 # ── CSV mutations ────────────────────────────────────────────────────────────
@@ -130,7 +141,7 @@ def _cap_contribution(rows: list[dict], value: int) -> None:
 # name -> (csv filename, mutation function). RRA lambda-mode configs mutate no
 # CSV (mutation=None, like baseline) -- their perturbation is an env var applied
 # to the worker subprocess instead; see ENV_CONFIGS below.
-CONFIGS: dict[str, tuple[str, object] | None] = {
+CONFIGS: dict[str, tuple[str, Callable[[list[dict]], None]] | None] = {
     BASELINE_NAME: None,
     "decay_x0.8": ("poi_types.csv", lambda rows: _scale_decay(rows, 0.8)),
     "decay_x1.2": ("poi_types.csv", lambda rows: _scale_decay(rows, 1.2)),
@@ -185,7 +196,7 @@ def _sha1(path: Path) -> str:
 
 def run_worker(config_name: str) -> int:
     """Run accessibility + service stages into the per-config workspace."""
-    workdir = (WORK_ROOT / config_name).resolve()
+    workdir = (_work_root() / config_name).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
 
     from core.config import PipelineConfig
@@ -243,8 +254,8 @@ def run_worker(config_name: str) -> int:
 # ── Orchestrator ─────────────────────────────────────────────────────────────
 
 def run_configs(only: str | None) -> None:
-    WORK_ROOT.mkdir(parents=True, exist_ok=True)
-    backup_dir = WORK_ROOT / "_config_backup"
+    _work_root().mkdir(parents=True, exist_ok=True)
+    backup_dir = _work_root() / "_config_backup"
     backup_dir.mkdir(exist_ok=True)
 
     pristine: dict[str, tuple[list[str], list[dict], str]] = {}
@@ -265,7 +276,7 @@ def run_configs(only: str | None) -> None:
         for config_name, mutation in CONFIGS.items():
             if only and config_name != only:
                 continue
-            done_marker = WORK_ROOT / config_name / "service_scores.csv"
+            done_marker = _work_root() / config_name / "service_scores.csv"
             if done_marker.exists():
                 print(f"[skip] {config_name}: already computed ({done_marker})", flush=True)
                 continue
@@ -283,12 +294,12 @@ def run_configs(only: str | None) -> None:
             env_overrides = ENV_CONFIGS.get(config_name)
             if env_overrides:
                 print(f"[config] {config_name}: worker env {env_overrides}", flush=True)
-            worker_env = {**os.environ, **env_overrides} if env_overrides else None
+            worker_env = {**os.environ, WORKER_ENV_VAR: config_name, **(env_overrides or {})}
 
             t0 = time.time()
             print(f"[run] {config_name}: launching stage subprocess...", flush=True)
             result = subprocess.run(
-                [sys.executable, __file__, "--worker", config_name],
+                [sys.executable, __file__],
                 timeout=3600,  # fail fast: one config must not take longer than a full run
                 env=worker_env,
             )
@@ -308,9 +319,9 @@ def build_report() -> None:
 
     from analysis.sensitivity_analysis import electre_assign, CAT_MIDPOINTS, LAMBDA_BASELINE
     from utils.capabilities import CAPABILITY_SERVICES, _CATEGORIES, _ELECTRE_PARAMS
-    from core.config import ELECTRE_Q_FACTOR, ELECTRE_P_FACTOR
+    from core.config import ELECTRE_Q_FACTOR, ELECTRE_P_FACTOR, PipelineConfig
 
-    base_csv = WORK_ROOT / BASELINE_NAME / "service_scores.csv"
+    base_csv = _work_root() / BASELINE_NAME / "service_scores.csv"
     if not base_csv.exists():
         print(f"ERROR: baseline results missing ({base_csv}); run without --report-only first.", file=sys.stderr)
         sys.exit(1)
@@ -349,7 +360,7 @@ def build_report() -> None:
     for config_name in CONFIGS:
         if config_name == BASELINE_NAME:
             continue
-        cfg_csv = WORK_ROOT / config_name / "service_scores.csv"
+        cfg_csv = _work_root() / config_name / "service_scores.csv"
         if not cfg_csv.exists():
             print(f"[report] {config_name}: missing, skipped", flush=True)
             continue
@@ -394,13 +405,13 @@ def build_report() -> None:
     svc_summary = pd.DataFrame(svc_rows)
     dropout = pd.DataFrame(dropout_rows)
     level_dist = pd.DataFrame(level_rows)
-    level_dist.to_csv(WORK_ROOT / "upstream_level_distribution.csv", index=False)
-    summary.to_csv(WORK_ROOT / "upstream_summary.csv", index=False)
-    svc_summary.to_csv(WORK_ROOT / "upstream_service_deltas.csv", index=False)
-    dropout.to_csv(WORK_ROOT / "upstream_node_dropout.csv", index=False)
+    level_dist.to_csv(_work_root() / "upstream_level_distribution.csv", index=False)
+    summary.to_csv(_work_root() / "upstream_summary.csv", index=False)
+    svc_summary.to_csv(_work_root() / "upstream_service_deltas.csv", index=False)
+    dropout.to_csv(_work_root() / "upstream_node_dropout.csv", index=False)
 
     lines = [
-        "# Upstream config sensitivity (Cagliari)",
+        f"# Upstream config sensitivity ({PipelineConfig().city_name})",
         "",
         f"Baseline: {len(base)} reachable nodes. Class/score comparisons below are on the "
         "nodes shared with the baseline; nodes gained/lost are reported separately.",
@@ -418,26 +429,22 @@ def build_report() -> None:
         "```\n" + dropout.to_string(index=False) + "\n```",
         "",
     ]
-    report = WORK_ROOT / "upstream_report.md"
+    report = _work_root() / "upstream_report.md"
     report.write_text("\n".join(lines), encoding="utf-8")
     print(f"[report] {report}")
     print(summary.pivot_table(index="config", columns="capability", values="pct_nodes_changed").to_string())
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--worker", metavar="CONFIG", help="(internal) run stages for one config")
-    ap.add_argument("--only", metavar="CONFIG", help="run a single configuration")
-    ap.add_argument("--report-only", action="store_true", help="skip runs, rebuild comparison report")
-    args = ap.parse_args()
+def run_upstream(only=None, report_only=False) -> None:
 
-    if args.worker:
-        return run_worker(args.worker)
-    if not args.report_only:
-        run_configs(args.only)
+    if not report_only:
+        run_configs(only)
     build_report()
-    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    worker = os.environ.get(WORKER_ENV_VAR)
+    if worker:
+        run_worker(worker)
+    else:
+        run_upstream(only=UPSTREAM_ONLY, report_only=UPSTREAM_REPORT_ONLY)

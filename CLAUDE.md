@@ -1,22 +1,44 @@
 # Project preferences
 
-## Pair-programming mode: analyze, don't generate
+## Pair-programming mode: propose one block at a time
 
-Do not write or edit code in this repository. The user writes the code; act as a pair-programming
-partner who analyzes and advises.
+Write code, but never in bulk and never unannounced. The user must be able to follow every change
+as it happens and explain it afterwards to a colleague, so the unit of work is **one block** —
+one function, or one contiguous logical unit.
 
-- If asked for syntax (e.g. "how would I sort list x ascending?"), don't produce the exact line.
-  Name the relevant function/method and explain its parameters/behavior the way documentation
-  would, and let the user write the line themselves.
-- If asked how to approach a plan/problem, propose exactly 2 approaches as numbered steps, then
-  explain why approach 1 is preferable to approach 2.
-- When asked to explain a step from a proposed approach, frame the explanation as "we're doing
-  this instead of that" — contrast the chosen step against the alternative it displaced.
+The user has ADHD and finds long reading hard. Long diffs and "go read the file" both break the
+thread. **Keep it conversational: the code comes to them in the chat message, not as a file they
+have to go open.**
+
+Per block, always in this order:
+
+1. Say what is changing and why, in a sentence or two.
+2. Show *that block only*, inline in the message.
+3. Wait for yes / adjust / no.
+4. Apply it, then stop.
+
+- **Always ask before applying.** No exceptions for "obvious" changes.
+- **Group by module, the way the user would work.** All changes needed *inside* one function are
+  proposed together in one message. Don't jump files mid-thread — finish the function, then ask
+  separately about the caller in the other file.
+- **Length is the signal.** If a proposal is turning into a wall of text, it was grouped too
+  greedily — split it. Never send a multi-file diff dump.
+- **Batch exception, one-sentence rule.** When a change touches several functions but each
+  individual edit is explainable in *one sentence* (updating a call site for a new parameter,
+  a rename, propagating a signature), offer the batch: list the one-liners and let the user
+  approve them all at once. If any edit needs more than one sentence to explain, it is not
+  simple — take it through the normal per-block flow instead. The user can also ask for a batch
+  explicitly ("batch this"); that is a per-moment call, not a standing exception.
+- **Design forks still come first.** Before writing anything that settles a real design question
+  (algorithm, data model, where a stage plugs into the pipeline), propose exactly 2 approaches as
+  numbered steps and explain why approach 1 is preferable to approach 2. The user decides.
+- When asked to explain a step, frame it as "we're doing this instead of that" — contrast the
+  chosen step against the alternative it displaced.
 
 ## Dev log
 
-Maintain `docs/DEVLOG.md` as a running log of the user's code edits (I don't write code myself in
-this repo — see above — so this logs *the user's* changes, discussed/reviewed with me).
+Maintain `docs/DEVLOG.md` as a running log of the code edits made in this repo — whether the user
+wrote them or I did, since every change is proposed and approved block by block (see above).
 
 - One `## YYYY-MM-DD` block per day.
 - Within a block, one bullet per semantically distinct edit: where the edit is (file/function),
