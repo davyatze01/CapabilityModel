@@ -45,6 +45,16 @@ from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Callable
 
+# Allow running directly (python analysis/sensitivity_upstream.py) -- this is how
+# run_configs() below relaunches itself as the per-config worker subprocess.
+# Without this, the worker's sys.path[0] is analysis/ (not the repo root), so
+# `import core...` fails before the worker even creates its output folder.
+# Mirrors the bootstrap in ops/*.py and analysis/scenarios.py.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+os.chdir(_PROJECT_ROOT)
+
 CONFIG_DIR = Path("config")
 MUTABLE_CSVS = ["poi_types.csv", "services.csv"]
 def _work_root() -> Path:
@@ -202,6 +212,9 @@ def run_worker(config_name: str) -> int:
     from core.config import PipelineConfig
     from core.context import build_context
 
+    # CAP_POI_RADIUS_M (set by run_configs() below) freezes poi_radius_m for this whole
+    # worker process, including any PipelineConfig() built deep in the call graph (e.g.
+    # utils.graphml.get_poi()) -- see the field's comment in core/config.py.
     cfg = PipelineConfig()
     # Rebase every artifact path from artifacts/<slug>/ into the workspace so
     # nothing of the baseline caches is read or written by this run.
@@ -265,6 +278,16 @@ def run_configs(only: str | None) -> None:
         fieldnames, rows = _read_csv(src)
         pristine[name] = (fieldnames, rows, _sha1(src))
 
+    # Freeze the candidate node/graph set across the whole sweep: get_global_radius_m()
+    # derives its buffer from poi_types.csv's decay_coefficient, which the decay axis
+    # mutates -- left alone, that silently points decay_x0.8/x1.2 at a DIFFERENT OSM
+    # graph extract than baseline, invalidating the shared impedances.npz they're
+    # supposed to reuse. Compute it once from the still-pristine config and pin every
+    # worker to it, so only the aggregation math (not the reachable universe) varies.
+    from core.config import PipelineConfig
+    from utils.services import get_global_radius_m
+    baseline_radius_m = get_global_radius_m(PipelineConfig())
+
     def restore() -> None:
         for name in MUTABLE_CSVS:
             shutil.copy2(backup_dir / name, CONFIG_DIR / name)
@@ -294,7 +317,11 @@ def run_configs(only: str | None) -> None:
             env_overrides = ENV_CONFIGS.get(config_name)
             if env_overrides:
                 print(f"[config] {config_name}: worker env {env_overrides}", flush=True)
-            worker_env = {**os.environ, WORKER_ENV_VAR: config_name, **(env_overrides or {})}
+            worker_env = {
+                **os.environ, WORKER_ENV_VAR: config_name,
+                "CAP_POI_RADIUS_M": str(baseline_radius_m),
+                **(env_overrides or {}),
+            }
 
             t0 = time.time()
             print(f"[run] {config_name}: launching stage subprocess...", flush=True)
@@ -319,7 +346,7 @@ def build_report() -> None:
 
     from analysis.sensitivity_analysis import electre_assign, CAT_MIDPOINTS, LAMBDA_BASELINE
     from utils.capabilities import CAPABILITY_SERVICES, _CATEGORIES, _ELECTRE_PARAMS
-    from core.config import ELECTRE_Q, ELECTRE_P, PipelineConfig
+    from core.config import ELECTRE_Q, ELECTRE_P
 
     base_csv = _work_root() / BASELINE_NAME / "service_scores.csv"
     if not base_csv.exists():
@@ -410,28 +437,6 @@ def build_report() -> None:
     svc_summary.to_csv(_work_root() / "upstream_service_deltas.csv", index=False)
     dropout.to_csv(_work_root() / "upstream_node_dropout.csv", index=False)
 
-    lines = [
-        f"# Upstream config sensitivity ({PipelineConfig().city_name})",
-        "",
-        f"Baseline: {len(base)} reachable nodes. Class/score comparisons below are on the "
-        "nodes shared with the baseline; nodes gained/lost are reported separately.",
-        "",
-        "% of nodes whose final capability class changes vs the baseline config:",
-        "",
-        "```\n" + summary.pivot_table(index="config", columns="capability", values="pct_nodes_changed").to_string() + "\n```",
-        "",
-        "Mean |service score delta| vs baseline (which services move, per config):",
-        "",
-        "```\n" + svc_summary.pivot_table(index="config", columns="service", values="mean_abs_delta").to_string() + "\n```",
-        "",
-        "Reachable-node changes per config (nodes dropping out is itself a sensitivity signal):",
-        "",
-        "```\n" + dropout.to_string(index=False) + "\n```",
-        "",
-    ]
-    report = _work_root() / "upstream_report.md"
-    report.write_text("\n".join(lines), encoding="utf-8")
-    print(f"[report] {report}")
     print(summary.pivot_table(index="config", columns="capability", values="pct_nodes_changed").to_string())
 
 
@@ -445,6 +450,6 @@ def run_upstream(only=None, report_only=False) -> None:
 if __name__ == "__main__":
     worker = os.environ.get(WORKER_ENV_VAR)
     if worker:
-        run_worker(worker)
+        sys.exit(run_worker(worker))
     else:
         run_upstream(only=UPSTREAM_ONLY, report_only=UPSTREAM_REPORT_ONLY)

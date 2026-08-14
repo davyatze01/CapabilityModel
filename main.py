@@ -136,6 +136,7 @@ def main():
     from analysis.robustness_analysis import run_robustness_pipeline
     from analysis.sensitivity_analysis import run_sensitivity_pipeline
     from analysis.sensitivity_upstream import run_upstream
+    from analysis.sensitivity_report import main as build_sensitivity_report
 
     shutup.please()
 
@@ -309,6 +310,8 @@ def main():
         run_sensitivity_pipeline(cfg.artifact_slug)
         print("\n[Stage] Generating sensitivity report (upstream)...", flush=True)
         run_upstream()
+        print("\n[Stage] Generating sensitivity HTML dashboard...", flush=True)
+        build_sensitivity_report()
 
 if __name__ == "__main__":
     try:

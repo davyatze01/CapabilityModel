@@ -161,9 +161,9 @@ def run_oat_sweeps(caps_X: dict[str, np.ndarray], baseline: dict[str, np.ndarray
     # Each parameter tests exactly one value below and one above its baseline
     # (plus the baseline itself, for the tornado plots' centre row).
     sweeps = {
-        "q": [0.01, 0.02, 0.03],
-        "p": [0.04, 0.06, 0.08],
-        "lambda": [0.60, 0.65, 0.70],
+        "q": [ELECTRE_Q - 0.01, ELECTRE_Q, ELECTRE_Q + 0.01],
+        "p": [ELECTRE_P - 0.02, ELECTRE_P, ELECTRE_P + 0.02],
+        "lambda": [LAMBDA_BASELINE - 0.05, LAMBDA_BASELINE, LAMBDA_BASELINE + 0.05],
     }
     base = {
         "q": ELECTRE_Q,
@@ -294,47 +294,6 @@ def load_capability_matrices(
 
 # ── Report ───────────────────────────────────────────────────────────────────
 
-def write_report(
-    out_dir: Path,
-    csv_path: Path,
-    n_nodes: int,
-    oat: pd.DataFrame,
-    wdf: pd.DataFrame,
-) -> Path:
-    lines = [
-        "# Capability model — parameter sensitivity (Cagliari)",
-        "",
-        f"* Input: `{csv_path}` ({n_nodes} nodes)",
-        f"* Baseline: q={ELECTRE_Q}, p={ELECTRE_P}, "
-        f"lambda={LAMBDA_BASELINE}, veto=inf, uniform weights",
-        "",
-        "## Parameter sensitivity (OAT sweeps)",
-        "",
-        "% of nodes whose assigned class changes vs baseline:",
-        "",
-    ]
-    for param in oat["parameter"].unique():
-        piv = oat[oat["parameter"] == param].pivot_table(
-            index="value", columns="capability", values="pct_nodes_changed"
-        )
-        lines.append(f"### {param}")
-        lines.append("")
-        lines.append("```\n" + piv.round(2).to_string() + "\n```")
-        lines.append("")
-    lines += [
-        "## Weight perturbation (Dirichlet around uniform)",
-        "",
-        wdf.groupby("capability")["pct_nodes_changed"]
-        .describe()[["mean", "std", "50%", "max"]]
-        .round(2)
-        .to_string(),
-        "",
-        "Robustness to input noise now lives in robustness_analysis.py / robustness_report.py.",
-        "",
-    ]
-    report = out_dir / "report.md"
-    report.write_text("\n".join(lines), encoding="utf-8")
-    return report
 
 def run_sensitivity_pipeline(
         city_slug : str = "Cagliari",
@@ -368,9 +327,7 @@ def run_sensitivity_pipeline(
     wdf = run_weight_perturbation(caps_X, baseline, n_weight_draws, weight_concentration, rng)
     wdf.to_csv(out_dir / "sensitivity_weights.csv", index=False)
 
-    report = write_report(out_dir, csv_path, len(df), oat, wdf)
-    print(f"\n[done] Report: {report}")
-    print(f"[done] Tables: {out_dir}/sensitivity_oat.csv, sensitivity_oat_levels.csv, sensitivity_weights.csv")
+    print(f"\n[done] Tables: {out_dir}/sensitivity_oat.csv, sensitivity_oat_levels.csv, sensitivity_weights.csv")
 
 
 if __name__ == "__main__":

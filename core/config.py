@@ -294,7 +294,14 @@ class PipelineConfig:
     poi_radius_enabled: bool = True
     poi_radius_decay_threshold: float = 0.5    # used when poi_radius_m is None
     poi_radius_max_speed_kmh: float = 20.0     # used when poi_radius_m is None
-    poi_radius_m: float | None = None          # if set, use this fixed radius and skip the decay computation
+    # if set, use this fixed radius and skip the decay computation. CAP_POI_RADIUS_M lets a
+    # fresh PipelineConfig() built deep in the call graph (e.g. utils.graphml.get_poi(), which
+    # constructs its own cfg rather than taking one) pick up the same override as the top-level
+    # run -- without it, such call sites silently re-derive the radius from the live
+    # poi_types.csv instead of honoring a frozen/overridden radius.
+    poi_radius_m: float | None = field(
+        default_factory=lambda: float(os.environ["CAP_POI_RADIUS_M"]) if os.environ.get("CAP_POI_RADIUS_M") else None
+    )
 
     # Network-distance cutoff for non-bus Dijkstra = poi_radius * factor. A factor > typical urban
     # street-network detour ratio guarantees no in-radius POI is dropped (bit-exact vs full Dijkstra)

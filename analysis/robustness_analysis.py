@@ -106,29 +106,6 @@ def run_input_noise(
     return pd.concat(node_rows, ignore_index=True), pd.DataFrame(summary_rows)
 
 
-def write_report(out_dir: Path, csv_path: Path, n_nodes: int, mc_summary: pd.DataFrame, n_mc: int) -> Path:
-    lines = [
-        "# Capability model — robustness to input noise (Cagliari)",
-        "",
-        f"* Input: `{csv_path}` ({n_nodes} nodes)",
-        f"* Baseline: q={ELECTRE_Q}, p={ELECTRE_P}, "
-        f"lambda={LAMBDA_BASELINE}, veto=inf, uniform weights (all held fixed -- only the "
-        "input service scores are perturbed)",
-        "",
-        f"## Robustness to input noise (Monte Carlo, {n_mc} reps per sigma)",
-        "",
-        "Stability = share of repetitions assigning the node's modal class.",
-        "",
-        mc_summary.round(3).to_string(index=False),
-        "",
-        "Per-node stability (for QGIS join on node_id): `robustness_node_stability.csv`",
-        "",
-    ]
-    report = out_dir / "robustness_report.md"
-    report.write_text("\n".join(lines), encoding="utf-8")
-    return report
-
-
 def run_robustness_pipeline(
         city_slug : str = "Cagliari", 
         csv_path : Path | None = None, 
@@ -157,12 +134,10 @@ def run_robustness_pipeline(
     out_dir.mkdir(parents=True, exist_ok=True)
     node_ids = df["node_id"].to_numpy()
 
-    node_stab, mc_summary = run_input_noise(caps_X, node_ids, sigmas, n_mc, rng)
+    node_stab, _mc_summary = run_input_noise(caps_X, node_ids, sigmas, n_mc, rng)
     node_stab.to_csv(out_dir / "robustness_node_stability.csv", index=False)
 
-    report = write_report(out_dir, csv_path, len(df), mc_summary, n_mc)
-    print(f"\n[done] Report: {report}")
-    print(f"[done] Table: {out_dir}/robustness_node_stability.csv")
+    print(f"\n[done] Table: {out_dir}/robustness_node_stability.csv")
     generate_robustness_report(sigma, coords_csv or csv_path, build_qgis, out_dir)
 
 

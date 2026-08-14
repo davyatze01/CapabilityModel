@@ -29,10 +29,6 @@ MAX_POIS_PER_TYPE = 30
 # first). Kept as a knob alongside MAX_POIS_PER_TYPE rather than a hardcoded constant.
 MAX_VERIFY_ROWS = 150
 
-# How many hexagons to sample (kept as a knob for symmetry with the caps above; the
-# selection logic below assumes up to 4 centre + 1 per corner).
-MAX_CENTER_HEXAGONS = 4
-
 # The Δg aggregation table only ever renders the top 10 ranks per poi_type client-side
 # (see `agg.steps.slice(0, 10)`); keep at most this many in the exported JSON too. The
 # running `total` is still summed over every POI regardless of this cap.
@@ -117,11 +113,32 @@ def _grid_extent(grid_params: dict) -> tuple[float, float, float, float]:
 
 
 def _select_hexagons(
+    cfg: PipelineConfig,
     grid_params: dict,
     hex_source: Path,
     capability_points: list[dict],
 ) -> list[dict]:
-    """Select 4 centre + 4 corner hexagons and resolve their representative nodes."""
+    """Select one representative hexagon per named quartiere (neighbourhood), so the
+    debug report covers real neighbourhoods across the city instead of an arbitrary
+    center+corner sample -- lets you tell whether a missing result (e.g. subway) is a
+    genuine bug or just because none of the sampled hexes are near that mode's
+    coverage. Reads the quartiere labels main.py already cached to
+    outputs/poi_exports/<slug>/place_labels.gpkg; run the full pipeline first if that
+    file doesn't exist yet.
+    """
+    import geopandas as gpd
+
+    place_labels_path = Path(cfg.poi_export_dir) / "place_labels.gpkg"
+    if not place_labels_path.exists():
+        raise RuntimeError(
+            f"{place_labels_path} not found -- run the full pipeline (main.py) for "
+            f"{cfg.study_city} first so quartiere labels exist."
+        )
+    places = gpd.read_file(place_labels_path)
+    quartieri = places[places["place_kind"] == "quartiere"]
+    if quartieri.empty:
+        raise RuntimeError(f"No quartiere entries found in {place_labels_path}.")
+
     hex_ids = _list_hex_ids(hex_source)
     if not hex_ids:
         raise RuntimeError(f"No hex files found in {hex_source}")
@@ -134,74 +151,33 @@ def _select_hexagons(
         except Exception:
             pass
 
-    lats = [lat for lat, _ in centroids.values()]
-    lons = [lon for _, lon in centroids.values()]
-    mid_lat = (min(lats) + max(lats)) / 2.0
-    mid_lon = (min(lons) + max(lons)) / 2.0
-
-    # Sort by distance to centre; take up to 4, deduplicating by resolved node_id.
-    by_dist = sorted(centroids.items(), key=lambda kv: _haversine_m(kv[1][0], kv[1][1], mid_lat, mid_lon))
-    centre_group: list[str] = []
+    selected: list[dict] = []
     seen_nodes: set[str] = set()
-    for hid, (clat, clon) in by_dist:
-        node = _nearest_capability_point(clat, clon, capability_points)
-        nid = str(node["node_id"]) if node else None
-        if nid and nid not in seen_nodes:
-            centre_group.append(hid)
-            seen_nodes.add(nid)
-        if len(centre_group) >= MAX_CENTER_HEXAGONS:
-            break
-
-    # One hex per corner.
-    corners = {
-        "NW": (max(lats), min(lons)),
-        "NE": (max(lats), max(lons)),
-        "SW": (min(lats), min(lons)),
-        "SE": (min(lats), max(lons)),
-    }
-    corner_group: dict[str, str] = {}
-    for label, (clat, clon) in corners.items():
-        for candidate_hid, _ in sorted(
-            centroids.items(), key=lambda kv: _haversine_m(kv[1][0], kv[1][1], clat, clon)
+    seen_hexes: set[str] = set()
+    for _, row in quartieri.iterrows():
+        name = str(row["name"])
+        qlat, qlon = row.geometry.y, row.geometry.x
+        for candidate_hid, (clat, clon) in sorted(
+            centroids.items(), key=lambda kv: _haversine_m(kv[1][0], kv[1][1], qlat, qlon)
         ):
-            if candidate_hid in centre_group or candidate_hid in corner_group.values():
+            if candidate_hid in seen_hexes:
                 continue
-            node = _nearest_capability_point(
-                centroids[candidate_hid][0], centroids[candidate_hid][1], capability_points
-            )
+            node = _nearest_capability_point(clat, clon, capability_points)
             nid = str(node["node_id"]) if node else None
             if nid and nid not in seen_nodes:
-                corner_group[label] = candidate_hid
+                seen_hexes.add(candidate_hid)
                 seen_nodes.add(nid)
+                selected.append({
+                    "hex_id": candidate_hid,
+                    "group": name,
+                    "group_type": "neighborhood",
+                    "hex_centroid": (clat, clon),
+                    "node_id": nid,
+                    "node_lat": float(node["lat"]),
+                    "node_lon": float(node["lon"]),
+                    "hex_vertices": _hex_geometry(candidate_hid, grid_params),
+                })
                 break
-
-    selected: list[dict] = []
-    for i, hid in enumerate(centre_group):
-        clat, clon = centroids[hid]
-        node = _nearest_capability_point(clat, clon, capability_points)
-        selected.append({
-            "hex_id": hid,
-            "group": f"center_{i + 1}",
-            "group_type": "center",
-            "hex_centroid": (clat, clon),
-            "node_id": str(node["node_id"]) if node else None,
-            "node_lat": float(node["lat"]) if node else None,
-            "node_lon": float(node["lon"]) if node else None,
-            "hex_vertices": _hex_geometry(hid, grid_params),
-        })
-    for label, hid in sorted(corner_group.items()):
-        clat, clon = centroids[hid]
-        node = _nearest_capability_point(clat, clon, capability_points)
-        selected.append({
-            "hex_id": hid,
-            "group": f"corner_{label}",
-            "group_type": "corner",
-            "hex_centroid": (clat, clon),
-            "node_id": str(node["node_id"]) if node else None,
-            "node_lat": float(node["lat"]) if node else None,
-            "node_lon": float(node["lon"]) if node else None,
-            "hex_vertices": _hex_geometry(hid, grid_params),
-        })
     return selected
 
 
@@ -861,10 +837,8 @@ _HTML_TEMPLATE = """\
     #map{flex:1}
     .hex-list{padding:8px 10px;background:#fffdf8;border-top:1px solid #d9d3c7;overflow-y:auto;max-height:160px}
     .hex-btn{display:inline-block;margin:3px;padding:4px 10px;border:1px solid #bbb;border-radius:20px;cursor:pointer;font-size:12px;background:#fff}
-    .hex-btn.center{border-color:#1d4ed8;color:#1d4ed8}
-    .hex-btn.corner{border-color:#c26a00;color:#c26a00}
+    .hex-btn.neighborhood{border-color:#1d4ed8;color:#1d4ed8}
     .hex-btn.active{font-weight:bold;background:#1d4ed8;color:#fff;border-color:#1d4ed8}
-    .hex-btn.active.corner{background:#c26a00;border-color:#c26a00}
     h2{margin:0 0 10px;font-size:17px}
     h3{margin:6px 0 4px;font-size:14px;color:#374151}
     .panel{background:#fffdf8;border:1px solid #d9d3c7;border-radius:10px;margin-bottom:12px;overflow:hidden}
@@ -953,13 +927,12 @@ const hexLayers = {};
 const allBounds = [];
 
 for(const [hexId, chain] of Object.entries(CHAIN_DATA)){
-  const isCenter = chain.group_type === "center";
-  const color = isCenter ? "#1d4ed8" : "#c26a00";
-  const fillColor = isCenter ? "#60a5fa" : "#f1a340";
+  const color = "#1d4ed8";
+  const fillColor = "#60a5fa";
   const poly = L.polygon(chain.hex_vertices, {
     color, weight:2, fillColor, fillOpacity:0.15
   }).addTo(map);
-  poly.bindTooltip(`<b>${hexId}</b><br>${chain.group}`);
+  poly.bindTooltip(`<b>${chain.group}</b><br>${hexId}`);
   poly.on("click", () => selectHex(hexId));
   hexLayers[hexId] = poly;
   chain.hex_vertices.forEach(ll => allBounds.push(ll));
@@ -973,7 +946,7 @@ const hexList = document.getElementById("hex-list");
 for(const [hexId, chain] of Object.entries(CHAIN_DATA)){
   const btn = document.createElement("span");
   btn.className = "hex-btn " + chain.group_type;
-  btn.textContent = hexId + " (" + chain.group + ")";
+  btn.textContent = chain.group + " (" + hexId + ")";
   btn.dataset.hexId = hexId;
   btn.onclick = () => selectHex(hexId);
   hexList.appendChild(btn);
@@ -1019,7 +992,7 @@ function renderChain(chain){
 
   // Header
   el.insertAdjacentHTML("beforeend", `
-    <h2>${chain.hex_id} <small style="font-weight:400;color:#6b7280">${chain.group}</small></h2>
+    <h2>${chain.group} <small style="font-weight:400;color:#6b7280">${chain.hex_id}</small></h2>
     <div class="meta-row">
       <span>Node: <span class="meta-val">${chain.node_id ?? "—"}</span></span>
       <span>Lat: <span class="meta-val">${chain.node_lat?.toFixed(5) ?? "—"}</span></span>
@@ -1491,7 +1464,7 @@ def run_debug_pipeline(study_city = STUDY_CITY, output = None) -> None:
         capability_points = [p for p in capability_points if str(p["node_id"]) in cached_nodes]
     print(f"[Debug] Capability points with non-bus cache: {len(capability_points)}")
 
-    selected = _select_hexagons(grid_params, hex_source, capability_points)
+    selected = _select_hexagons(cfg, grid_params, hex_source, capability_points)
     print(f"[Debug] Selected {len(selected)} hexagons: {[h['hex_id'] for h in selected]}")
 
     bus_ctx = _load_pt_context(cfg, "bus")

@@ -31,8 +31,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-SENS_DIR = Path("outputs/sensitivity")
-UP_DIR = SENS_DIR / "upstream"
+from core.config import PipelineConfig
+
+SENS_DIR = Path("outputs/debug") / PipelineConfig().artifact_slug
+UP_DIR = SENS_DIR / "sensitivity_upstream"
 
 # Thresholds (in % of nodes changing class) for the automatic parameter verdicts.
 LOAD_BEARING = 20.0
