@@ -13,19 +13,22 @@ per-node .npz files written by the accessibility stage; no large structure is ev
 held in full.  POI metadata is loaded from the GPKG (source_key, poi_types, svc_map).
 """
 
+import ctypes
+import gc
 import json
 import multiprocessing as mp
 import os
+import shutil
 import sqlite3
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from tqdm import tqdm
 
 from core.config import PipelineConfig
 from core.context import build_context
-from exports.hex_shard_writer import HexShardWriter
+from exports.hex_shard_writer import HexShardWriter, SCORING_DONE_MARKER, read_shard_poi_ids, shard_name_for_hex
 from utils import capabilities as cap_mod
 from utils import graphml
 from utils import services as serv
@@ -46,8 +49,8 @@ def _read_poi_table(gpkg_path: str) -> tuple[dict[int, dict], dict[str, int]]:
         raise FileNotFoundError(f"POI GeoPackage not found: {gpkg_path}")
     con = sqlite3.connect(f"file:{gpkg_path}?mode=ro", uri=True)
     try:
-        for source_key, pid, poi_types_json, svc_map_json in con.execute(
-            "SELECT source_key, id, poi_types, svc_map FROM pois_used"
+        for source_key, pid, poi_types_json, svc_map_json, lat, lon in con.execute(
+            "SELECT source_key, id, poi_types, svc_map, lat, lon FROM pois_used"
         ):
             pid = int(pid)
             poi_types: list[str] = json.loads(poi_types_json) if poi_types_json else []
@@ -56,6 +59,8 @@ def _read_poi_table(gpkg_path: str) -> tuple[dict[int, dict], dict[str, int]]:
                 "source_key": source_key,
                 "poi_types": poi_types,
                 "svc_map": svc_map,
+                "lat": float(lat) if lat is not None else None,
+                "lon": float(lon) if lon is not None else None,
             }
             source_key_to_id[str(source_key)] = pid
     finally:
@@ -139,43 +144,85 @@ def _precompute_poi_weights(
 # per worker at pool startup, not per task).
 _WORKER_POI_WEIGHTS: dict[int, tuple[dict[str, float], dict[str, float]]] = {}
 _WORKER_POI_BY_NODE_DIR: str = ""
+# poi_exports.py's finished id-only shards, moved aside before this pass's HexShardWriter
+# wipes hex_pois_dir -- see generate_score_report. Already radius-filtered at export time,
+# so no haversine filtering is needed here.
+_WORKER_POI_EXPORT_SRC_DIR: str = ""
+
+try:
+    _LIBC = ctypes.CDLL("libc.so.6")
+except OSError:
+    _LIBC = None
+
+
+def _trim_score_memory() -> None:
+    """Return freed heap memory to the OS. Mirrors non_bus_routing_stage._trim_worker_memory:
+    gc.collect() clears reference cycles (glibc can't reclaim memory still reachable via
+    one), then malloc_trim(0) asks glibc to release now-free top-of-heap arenas back to the
+    kernel. No-op off glibc Linux."""
+    gc.collect()
+    if _LIBC is not None:
+        try:
+            _LIBC.malloc_trim(0)
+        except Exception:
+            pass
 
 
 def _init_score_worker(
     poi_weights: dict[int, tuple[dict[str, float], dict[str, float]]],
     poi_by_node_dir: str,
+    poi_export_src_dir: str,
 ) -> None:
-    global _WORKER_POI_WEIGHTS, _WORKER_POI_BY_NODE_DIR
+    global _WORKER_POI_WEIGHTS, _WORKER_POI_BY_NODE_DIR, _WORKER_POI_EXPORT_SRC_DIR
     _WORKER_POI_WEIGHTS = poi_weights
     _WORKER_POI_BY_NODE_DIR = poi_by_node_dir
+    _WORKER_POI_EXPORT_SRC_DIR = poi_export_src_dir
 
 
-def _score_node_worker(args: tuple) -> tuple[str, list[dict]] | None:
-    """Score one node: load its sparse accessibility, apply the precomputed per-POI
-    weights, and return its hexagon's POI entries (or None if it contributes nothing)."""
-    node_id, hex_id = args
-    acc_by_poi_id = _load_node_sparse(node_id, _WORKER_POI_BY_NODE_DIR)
-    if not acc_by_poi_id:
-        return None
+def _score_shard_worker(task: tuple[str, list[tuple[Any, str]]]) -> tuple[int, int, list[tuple[str, list[dict]]]]:
+    """Score every node whose hex falls in one shard.
 
-    poi_entries: list[dict] = []
-    for poi_id, acc_val in acc_by_poi_id.items():
-        weights = _WORKER_POI_WEIGHTS.get(poi_id)
-        if weights is None:
+    Reads that shard's poi_exports.py candidate membership (already radius-filtered at
+    export time -- no haversine filtering needed here) exactly once, then scores every
+    assigned node against it. Grouping work by shard this way means a worker never reads
+    more shard files than the ones it's actually assigned. Returns (nodes_processed,
+    nodes_skipped, results) so the caller's progress bar advances by input count
+    regardless of how many nodes produced no output.
+    """
+    shard_name, node_list = task
+    candidates_by_hex = read_shard_poi_ids(_WORKER_POI_EXPORT_SRC_DIR, shard_name)
+    results: list[tuple[str, list[dict]]] = []
+    skipped = 0
+    for node_id, hex_id in node_list:
+        acc_by_poi_id = _load_node_sparse(node_id, _WORKER_POI_BY_NODE_DIR)
+        candidate_ids = candidates_by_hex.get(hex_id)
+        if not acc_by_poi_id or not candidate_ids:
+            skipped += 1
             continue
-        svc_w, cap_w = weights
-        entry: dict = {"i": poi_id}
-        if svc_w:
-            entry["sp"] = {k: round(acc_val * w, 7) for k, w in svc_w.items()}
-        if cap_w:
-            entry["cp"] = {k: round(acc_val * w, 7) for k, w in cap_w.items()}
-        if "sp" in entry or "cp" in entry:
-            poi_entries.append(entry)
+        poi_entries: list[dict] = []
+        for poi_id in candidate_ids:
+            acc_val = acc_by_poi_id.get(poi_id)
+            if not acc_val:
+                continue
+            weights = _WORKER_POI_WEIGHTS.get(poi_id)
+            if weights is None:
+                continue
+            svc_w, cap_w = weights
+            entry: dict = {"i": poi_id}
+            if svc_w:
+                entry["sp"] = {k: round(acc_val * w, 7) for k, w in svc_w.items()}
+            if cap_w:
+                entry["cp"] = {k: round(acc_val * w, 7) for k, w in cap_w.items()}
+            if "sp" in entry or "cp" in entry:
+                poi_entries.append(entry)
+        if poi_entries:
+            poi_entries.sort(key=lambda e: e["i"])
+            results.append((hex_id, poi_entries))
+        else:
+            skipped += 1
 
-    if not poi_entries:
-        return None
-    poi_entries.sort(key=lambda e: e["i"])
-    return hex_id, poi_entries
+    _trim_score_memory()  # one shard's worth of nodes is already a bounded unit of work
+    return len(node_list), skipped, results
 
 
 def _migrate_json_to_sparse(json_path: str, poi_by_node_dir: str, source_key_to_id: dict[str, int]) -> None:
@@ -254,6 +301,23 @@ def generate_score_report(city: str | None = None, ctx: "PipelineContext | None"
         ctx = build_context(cfg)
         print("[ScoreReport] Context ready.", flush=True)
 
+    # poi_exports.py (post-routing pass) and this script share cfg.hex_pois_dir -- its
+    # id-only shards are this pass's POI-membership source (already radius-filtered at
+    # export time), but HexShardWriter wipes hex_pois_dir on construction unless resuming
+    # ITS OWN prior pass. Move poi_exports's shards aside first so workers can still read
+    # them; _parts_tmp/ (this pass's own resume marker, if any) is left in place so
+    # self-resume keeps working.
+    own_marker = os.path.join(cfg.hex_pois_dir, "_parts_tmp", SCORING_DONE_MARKER)
+    poi_export_src_dir = cfg.hex_pois_dir.rstrip(os.sep) + "_poi_export_src"
+    if not os.path.isfile(own_marker) and os.path.isdir(cfg.hex_pois_dir):
+        if os.path.isdir(poi_export_src_dir):
+            shutil.rmtree(poi_export_src_dir)
+        os.makedirs(poi_export_src_dir, exist_ok=True)
+        for name in os.listdir(cfg.hex_pois_dir):
+            if name == "_parts_tmp":
+                continue
+            shutil.move(os.path.join(cfg.hex_pois_dir, name), os.path.join(poi_export_src_dir, name))
+
     # Streaming shard writer: each hexagon is flushed to its shard part file as
     # soon as it is computed, so memory never scales with hexagon count.
     # scale_powers: remap every exported sp/cp to its per-key empirical quantile
@@ -275,33 +339,44 @@ def generate_score_report(city: str | None = None, ctx: "PipelineContext | None"
         )
     else:
         nodes = ctx.nodes_with_coords
-        node_args = [(node_id, data.get("hex_id") or str(node_id)) for node_id, data in nodes]
-        total = len(node_args)
+        # Group nodes by the poi_exports shard covering their hex, so each pool task is
+        # "score every node in one shard" -- a worker reads exactly the shard file(s) it's
+        # assigned, once each, instead of recomputing POI membership per node.
+        nodes_by_shard: dict[str, list[tuple[Any, str]]] = {}
+        for node_id, data in nodes:
+            hex_id = data.get("hex_id") or str(node_id)
+            nodes_by_shard.setdefault(shard_name_for_hex(hex_id), []).append((node_id, hex_id))
+        shard_tasks = list(nodes_by_shard.items())
+        total = len(nodes)
         skipped = 0
 
         print("[ScoreReport] Precomputing per-POI service/capability weights...", flush=True)
         poi_weights = _precompute_poi_weights(poi_by_id, drop_set)
+        # poi_coords / export_hex_radius_m no longer needed here -- poi_exports.py already
+        # applied the radius filter when it built the candidate shards this pass reads.
 
-        # Node scoring is embarrassingly parallel (each node reads its own .npz and is
-        # otherwise independent), so it's farmed out to a worker pool the same way the
+        # Node scoring is embarrassingly parallel (each shard's nodes are independent of
+        # every other shard's), so it's farmed out to a worker pool the same way the
         # routing/accessibility stages are -- this is normally the slowest part of this
         # script by far. ctx.workers is already sized for this machine's cores/memory by
         # build_context, but capped again here by score_report_max_workers (see its
         # definition in config.py) since this pool hasn't been proven safe yet at full
         # worker count the way non_bus_max_workers was tuned down after a real OOM.
         # Only the main process touches `writer` (shard part-file appends aren't safe to
-        # parallelize), so workers just return each node's computed entries.
-        pool_workers = max(1, min(ctx.workers, ctx.config.score_report_max_workers, total or 1))
-        chunksize = max(1, total // (pool_workers * 4)) if total else 1
+        # parallelize), so workers just return each shard's computed entries.
+        pool_workers = max(1, min(ctx.workers, ctx.config.score_report_max_workers, len(shard_tasks) or 1))
 
-        # Workers here only read per-node .npz files and the precomputed weights dict --
-        # they never touch a NetworkX graph. But this script commonly runs at the tail of
-        # a long-lived main.py process, where the full mode graphs non_bus_routing_stage
-        # loaded earlier can still be cached in-process. Forking a pool without releasing
-        # them first inherits that multi-GB baseline copy-on-write, which turns into N
-        # private copies as each worker's refcounting touches pages -- this is the exact
-        # OOM pattern non_bus_max_workers exists to bound in that stage's own pool; clear
-        # it here too instead of re-learning that lesson in a second stage.
+        # Workers here only read per-node .npz files, one poi_exports shard file per task,
+        # and the precomputed weights dict -- they never touch a NetworkX graph. This
+        # script commonly runs at the tail of a long-lived main.py process, where
+        # routing/accessibility can leave a multi-GB heap resident; a `fork`-context pool
+        # would inherit all of it as a copy-on-write snapshot per worker (2026-08-19 OOM:
+        # workers spiked before scoring a single node, i.e. before any of their own
+        # per-node work could explain it). The pool below uses the `spawn` context
+        # instead, so each worker starts a fresh interpreter and only holds what
+        # `_init_score_worker`'s initargs explicitly pass it -- worker memory no longer
+        # depends on whatever earlier stages left resident. clear_mode_graph_cache() is
+        # kept anyway as cheap insurance.
         graphml.clear_mode_graph_cache()
         progress = tqdm(
             total=total,
@@ -311,24 +386,25 @@ def generate_score_report(city: str | None = None, ctx: "PipelineContext | None"
             mininterval=0.5,
             dynamic_ncols=True,
         )
-        with mp.Pool(
+        with mp.get_context("spawn").Pool(
             processes=pool_workers,
+            maxtasksperchild=200,  # mirrors poi_exports.py's export pool
             initializer=_init_score_worker,
-            initargs=(poi_weights, poi_by_node_dir),
+            initargs=(poi_weights, poi_by_node_dir, poi_export_src_dir),
         ) as pool:
-            for idx, result in enumerate(
-                pool.imap_unordered(_score_node_worker, node_args, chunksize=chunksize), start=1
+            for processed_count, skipped_count, shard_results in pool.imap_unordered(
+                _score_shard_worker, shard_tasks, chunksize=1
             ):
-                if result is None:
-                    skipped += 1
-                else:
-                    hex_id, poi_entries = result
+                skipped += skipped_count
+                for hex_id, poi_entries in shard_results:
                     writer.add_hexagon(hex_id, poi_entries)
-                progress.update(1)
-                if idx % 500 == 0:
-                    progress.set_postfix_str(f"{writer.hex_count} hexagons, {skipped} empty")
+                progress.update(processed_count)
+                progress.set_postfix_str(f"{writer.hex_count} hexagons, {skipped} empty")
         progress.close()
         writer.mark_scoring_complete()
+        # poi_exports's id-only shards are now fully superseded by this pass's scored
+        # output -- no reason to keep the moved-aside copy around.
+        shutil.rmtree(poi_export_src_dir, ignore_errors=True)
 
     print(f"[ScoreReport] Finalizing {writer.hex_count} hexagons into shards (fitting scaler + writing)...", flush=True)
     info = writer.finalize(zip_path=cfg.hex_pois_zip_path)

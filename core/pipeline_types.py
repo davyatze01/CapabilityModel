@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Any
 from core.config import PipelineConfig
+from core.profiles import Profile
 
 @dataclass
 class PipelineContext:
@@ -13,6 +14,10 @@ class PipelineContext:
     # utils.capabilities.CAPABILITY_SERVICES) -- not fixed to any particular set of
     # capability names.
     capability_services: dict[str, list[str]]
+    # Individual-profile override (see core.profiles.Profile) -- set by main.py/scenarios.py
+    # after construction, never by build_context itself. None reproduces the baseline
+    # universal traveler exactly (see accessibility_stage's getattr(ctx, "profile", None) reads).
+    profile: Profile | None = None
 
 
 @dataclass
@@ -37,6 +42,10 @@ class NonBusRoutingStageResult:
     cache_paths: dict[Any, str]
     cached_nodes: int
     computed_nodes: int
+    # Origin-invariant POI identity, one entry per poi_type: {"src_keys": bytes array,
+    # "source_coords": float64 (N, 2)}. Written once into the artifact bundle; each
+    # node's per-POI "kept_idx" indexes into this instead of duplicating keys/coords.
+    poi_catalog: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass

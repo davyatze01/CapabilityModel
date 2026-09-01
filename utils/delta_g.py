@@ -706,8 +706,11 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
     n_all = 0 if src_keys_all is None else len(src_keys_all)
 
     empty = {
-        "source_coords": [], "poi_coords": [], "source_keys": [],
-        "imp_walk": [], "imp_bike": [], "imp_drive": [], "walk_path_scores": [],
+        "kept_idx": np.empty(0, dtype=np.int32),
+        "poi_coords": np.empty((0, 2), dtype=np.float64),
+        "imp_walk": np.empty(0, dtype=np.float32),
+        "imp_bike": np.empty(0, dtype=np.float32),
+        "imp_drive": np.empty(0, dtype=np.float32),
     }
     if n_all == 0 or source_coords_all is None or len(source_coords_all) == 0:
         return empty
@@ -738,8 +741,6 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
         return empty
 
     source_coords = source_coords_all[kept_idx]  # (n, 2), routed coord == source_coord
-    # Decode the kept src_keys back to str (bytes array -> the exact original ASCII keys).
-    src_keys = [src_keys_all[int(i)].decode("ascii") for i in kept_idx]
 
     # Bound Dijkstra exploration to a generous multiple of the POI radius. Sources are
     # already pre-filtered to haversine <= radius_m, so a detour factor above the urban
@@ -755,8 +756,9 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
     # get_impedance.impedance_base, default lambda_walk=0.15). The previous per-item loop
     # (n snaps + 3n scalar calls, all boxed Python objects) dominated runtime and the
     # per-origin transient for dense types (perceived_nature ~ 280k in-radius POIs).
-    imp_by_mode: dict[str, list] = {m: [None] * n for m in ("walk", "bike", "drive")}
-    walk_reachable_mask = None
+    imp_by_mode: dict[str, np.ndarray] = {
+        m: np.full(n, np.nan, dtype=np.float32) for m in ("walk", "bike", "drive")
+    }
 
     for mode in enabled_modes:
         try:
@@ -789,7 +791,6 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
         dist_km = dist_m / 1000.0
 
         if mode == "walk":
-            walk_reachable_mask = reachable
             # Real per-edge walkability isn't wired into the CSR yet -- every edge carries
             # the same placeholder score (WALK_EDGE_DEFAULT_SCORE), so the length-weighted
             # average along ANY path is provably that same constant, making the walkability
@@ -808,18 +809,11 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
                 + config.vot * monetary_cost
             )
 
-        col = imp_by_mode[mode]
-        for j, v in zip(np.nonzero(reachable)[0].tolist(), imp[reachable].tolist()):
-            col[j] = v
+        imp_by_mode[mode][reachable] = imp[reachable].astype(np.float32)
 
     imp_walk = imp_by_mode["walk"]
     imp_bike = imp_by_mode["bike"]
     imp_drive = imp_by_mode["drive"]
-
-    if walk_reachable_mask is None:
-        walk_paths_scores: list = [None] * n
-    else:
-        walk_paths_scores = [DEFAULT_WALK_SCORE if r else None for r in walk_reachable_mask.tolist()]
 
     # Origin-dependent best bus-snapped destination coord per POI, read straight from the
     # compact CSR candidate arrays (bit-identical to the old
@@ -828,26 +822,21 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
     cand_coords = compact.get("cand_coords")
     cand_dists = compact.get("cand_dists")
     cand_ptr = compact.get("cand_ptr")
-    poi_coords: list = []
-    source_coords_out: list = []
-    for i in kept_idx:
-        i = int(i)
+    poi_coords = np.empty((n, 2), dtype=np.float64)
+    for pos, i in enumerate(kept_idx.tolist()):
         sc = (float(source_coords_all[i, 0]), float(source_coords_all[i, 1]))
-        source_coords_out.append(sc)
         if cand_ptr is not None and cand_coords is not None:
             a = int(cand_ptr[i]); b = int(cand_ptr[i + 1])
-            poi_coords.append(_best_snap_candidate_coord(origine, sc, cand_coords[a:b], cand_dists[a:b]))
+            poi_coords[pos] = _best_snap_candidate_coord(origine, sc, cand_coords[a:b], cand_dists[a:b])
         else:
-            poi_coords.append(sc)
+            poi_coords[pos] = sc
 
     return {
-        "source_coords": source_coords_out,
+        "kept_idx": kept_idx.astype(np.int32),
         "poi_coords": poi_coords,
-        "source_keys": src_keys,
         "imp_walk": imp_walk,
         "imp_bike": imp_bike,
         "imp_drive": imp_drive,
-        "walk_path_scores": walk_paths_scores,
     }
 
 

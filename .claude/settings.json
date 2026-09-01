@@ -54,7 +54,50 @@
       "Bash(curl -sL -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36' -X POST https://www1.agenziaentrate.gov.it/servizi/Consultazione/ricerca.htm --data-urlencode level=2 --data-urlencode lingua=IT --data-urlencode pr=CA --data-urlencode co=B354 --data-urlencode anno_semestre=20252 -o /tmp/claude-1000/-home-aurora-CapabilityModel/c01f6774-bb64-4b88-afa3-19684c1a6404/scratchpad/omi_step3.html -w 'HTTP %{http_code}, %{size_download} bytes\\\\n')",
       "Bash(curl -sL -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36' -X POST https://www1.agenziaentrate.gov.it/servizi/Consultazione/ricerca.htm --data-urlencode level=4 --data-urlencode lingua=IT --data-urlencode pr=CA --data-urlencode co=B354 --data-urlencode anno_semestre=20252 --data-urlencode linkzonastrada=CA00001562 -o /tmp/claude-1000/-home-aurora-CapabilityModel/c01f6774-bb64-4b88-afa3-19684c1a6404/scratchpad/omi_step4.html -w 'HTTP %{http_code}, %{size_download} bytes\\\\n')",
       "Bash(curl -sL -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36' -X POST https://www1.agenziaentrate.gov.it/servizi/Consultazione/risultato.php --data-urlencode pr=CA --data-urlencode co=B354 --data-urlencode anno_semestre=20252 --data-urlencode linkzona=CA00001562 --data-urlencode idstrada= --data-urlencode 'fasciazona=Centrale/MARINA - STAMPACE' --data-urlencode codzona=B1 --data-urlencode lingua=IT --data-urlencode level=4 --data-urlencode utilizzo=Residenziale -o /tmp/claude-1000/-home-aurora-CapabilityModel/c01f6774-bb64-4b88-afa3-19684c1a6404/scratchpad/omi_result.html -w 'HTTP %{http_code}, %{size_download} bytes\\\\n')",
-      "Bash(CAP_UPSTREAM_WORKER=decay_x1.2 CAP_POI_RADIUS_M=15000.0 timeout 90 python analysis/sensitivity_upstream.py)"
+      "Bash(CAP_UPSTREAM_WORKER=decay_x1.2 CAP_POI_RADIUS_M=15000.0 timeout 90 python analysis/sensitivity_upstream.py)",
+      "Bash(python -c \"import requests; print\\(requests.__version__\\)\")",
+      "Bash(python -c \"import bs4; print\\(bs4.__version__\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(python -m py_compile housing/fetch_omi_prices.py)",
+      "Bash(python housing/fetch_omi_prices.py)",
+      "Bash(python -m py_compile housing/housing_capability.py housing/housing_affordability.py)",
+      "Bash(python -m py_compile housing/generate_cagliari_nodes_omi.py)",
+      "Bash(python housing/generate_cagliari_nodes_omi.py)",
+      "Bash(python -m py_compile housing/housing_affordability.py)",
+      "Bash(MPLBACKEND=Agg python housing/housing_affordability.py)",
+      "Bash(MPLBACKEND=Agg python -m housing.housing_affordability)",
+      "Bash(python -m py_compile housing/housing_capability.py)",
+      "Bash(python housing/housing_capability.py)",
+      "Bash(sqlite3 housing/Cagliari_housing_capability_grid.gpkg \"SELECT f_table_name, styleName, useAsDefault, length\\(styleQML\\) FROM layer_styles;\")",
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Bash(cp /home/aurora/CapabilityModel/.claude/settings.json /tmp/settings_backup.json)",
+      "Bash(cp /tmp/settings_test_check.json /home/aurora/CapabilityModel/.claude/settings.json)",
+      "Bash(cp /tmp/settings_backup.json /home/aurora/CapabilityModel/.claude/settings.json)",
+      "Bash(git -C /home/aurora/CapabilityModel diff --stat main.py .claude/settings.json)",
+      "Bash(timeout 60 python3 -c ' *)",
+      "Bash(timeout 180 python -c \"from tools.debug_pipeline import run_debug_pipeline; run_debug_pipeline\\('cagliari'\\)\")",
+      "Bash(grep -o '\"H0044_0040\":{\"hex_id\":\"H0044_0040\"[^}]*\"housing\":[^,]*' outputs/debug/Cagliari/debug_pipeline.html)",
+      "Bash(python -m py_compile core/config.py)",
+      "Bash(timeout 180 python3 -c ' *)",
+      "Bash(timeout 300 python3 -c ' *)",
+      "Bash(python -m py_compile exports/poi_exports.py)",
+      "Bash(python -m py_compile analysis/score_report.py exports/poi_exports.py core/config.py)",
+      "Bash(python -m py_compile /home/aurora/CapabilityModel/housing/housing_affordability_standalone.py)",
+      "Bash(MPLBACKEND=Agg python housing/housing_affordability_standalone.py)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"Reminder (CLAUDE.md pair-programming mode): this Edit/Write must already have been proposed as one block in chat, with the user explicitly approving it (yes/adjust/no), before being applied. If that did not just happen, stop now and propose the block in chat instead of applying it.\"}}'"
+          }
+        ]
+      }
     ]
   }
 }

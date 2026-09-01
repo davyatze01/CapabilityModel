@@ -72,6 +72,25 @@ UPSTREAM_ONLY: str | None = None
 # True = skip the sweep entirely and just rebuild upstream_report.md from whatever
 # per-config service_scores.csv files already exist under _work_root().
 UPSTREAM_REPORT_ONLY: bool = False
+# Wall-clock cap per config's subprocess, in seconds -- fail fast if one config hangs
+# instead of running forever. Sized for the study city: a small city's full pass
+# (routing restore + accessibility + scoring) fits well inside 3600s, but Paris's
+# accessibility stage alone can run 60-90+ min (2026-08-19: still at 80% after 44 min),
+# so this needs raising for Paris runs -- e.g. 10800 (3h).
+UPSTREAM_CONFIG_TIMEOUT_S = 3600
+# Per-city override: Paris's node universe is large enough that a full-node sensitivity
+# sweep is impractically slow (see UPSTREAM_CONFIG_TIMEOUT_S's Paris note above), so it
+# subsamples. Cagliari runs on all nodes -- it must match what the cached impedances
+# bundle was actually routed for, or load_impedance_bundle()'s origins_sig check fails
+# and the worker can't recompute (it only symlinks the cached bundle, doesn't reroute).
+UPSTREAM_LIGHT_MAX_NODES_BY_CITY: dict[str, int | None] = {
+    "paris": 3000,
+}
+# Minimum free disk space (GB) required before launching each config's subprocess -- abort
+# loudly instead of letting a routing-reroute bug (or anything else) silently fill the disk,
+# as happened 2026-08-26 (a worker wrote 500+ GB into its own workspace before crashing).
+# Sized well above one config's expected footprint; raise if legitimately tight on space.
+MIN_FREE_DISK_GB: float = 100.0
 
 
 # ── CSV mutations ────────────────────────────────────────────────────────────
@@ -129,17 +148,6 @@ def _exaggerate_capacity(rows: list[dict], factor: float) -> None:
         row["choquet_capacity"] = "[" + ", ".join(f"{v:g}" for v in normalized) + "]"
 
 
-# contribution_coefficient values are drawn from a small discrete tier set --
-# "how many POIs of this type to reach 90% saturation" -- not a continuous
-# quantity (config/services.csv only ever contains 1, 2, 3, 5, 8: a Fibonacci-
-# like class assignment; see accessibility_from_rra() in utils/delta_g.py).
-# Scaling by an arbitrary factor lands off-tier (3*0.5=1.5 is not a class a
-# modeler could have picked). Mirroring the choquet_interactions bracketing
-# design: assign every POI type the minimum observed tier (1 -- generous,
-# saturates after a single POI) or the maximum observed tier (8 -- strict,
-# needs 8 POIs) instead of scaling around the baseline.
-CONTRIBUTION_MIN_TIER = 1
-CONTRIBUTION_MAX_TIER = 8
 
 
 def _cap_contribution(rows: list[dict], value: int) -> None:
@@ -171,7 +179,7 @@ CONFIGS: dict[str, tuple[str, Callable[[list[dict]], None]] | None] = {
 # baseline pair (there's no continuous "baseline +/- step" for a weighting
 # scheme), this axis brackets the two structural extremes:
 #   uniform  -- every mode counted at full weight (lambda=1), i.e. no
-#               redundancy discount at all: having 3 slow backup modes is
+#               redundancy discount at all: having several slow backup modes is
 #               worth exactly as much as 1 fast one.
 #   reversed -- the taper is flipped: the WORST mode gets lambda=1 and the
 #               BEST gets the smallest weight -- the polar opposite of the
@@ -185,10 +193,38 @@ ENV_CONFIGS: dict[str, dict[str, str]] = {
 }
 
 
+def _check_disk_space(min_free_gb: float = MIN_FREE_DISK_GB) -> None:
+    free_gb = shutil.disk_usage(".").free / 1e9
+    if free_gb < min_free_gb:
+        raise RuntimeError(
+            f"Only {free_gb:.1f} GB free disk space (< {min_free_gb:g} GB minimum) -- "
+            "aborting the sweep before launching another subprocess. Free up space and rerun "
+            "(resumable: configs with an existing service_scores.csv are skipped)."
+        )
+
+
 def _read_csv(path: Path) -> tuple[list[str], list[dict]]:
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         return list(reader.fieldnames or []), list(reader)
+
+
+# contribution_coefficient values are drawn from a small discrete tier set --
+# "how many POIs of this type to reach 90% saturation" -- not a continuous
+# quantity (see accessibility_from_rra() in utils/delta_g.py). Scaling by an
+# arbitrary factor lands off-tier (3*0.5=1.5 is not a class a modeler could
+# have picked). Mirroring the choquet_interactions bracketing design: assign
+# every POI type the minimum or maximum tier actually configured right now,
+# read live from config/services.csv so a rescale of the tier set (e.g. the
+# 2026-08 move from {1,2,3,5,8} to {5,10,30,50,80}) can't silently desync
+# this sweep from what's really configured.
+def _contribution_tier_bounds() -> tuple[int, int]:
+    _, rows = _read_csv(CONFIG_DIR / "services.csv")
+    tiers = {int(v) for row in rows for v in ast.literal_eval(row["contribution_coefficient"])}
+    return min(tiers), max(tiers)
+
+
+CONTRIBUTION_MIN_TIER, CONTRIBUTION_MAX_TIER = _contribution_tier_bounds()
 
 
 def _write_csv(path: Path, fieldnames: list[str], rows: list[dict]) -> None:
@@ -202,6 +238,15 @@ def _sha1(path: Path) -> str:
     return hashlib.sha1(path.read_bytes()).hexdigest()
 
 
+def _config_hash() -> str:
+    """sha1 of poi_types.csv + services.csv concatenated -- identifies the exact
+    config state a cached sweep was computed against."""
+    h = hashlib.sha1()
+    for name in MUTABLE_CSVS:
+        h.update((CONFIG_DIR / name).read_bytes())
+    return h.hexdigest()
+
+
 # ── Worker: runs inside the subprocess with mutated CSVs in place ────────────
 
 def run_worker(config_name: str) -> int:
@@ -209,12 +254,19 @@ def run_worker(config_name: str) -> int:
     workdir = (_work_root() / config_name).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
 
-    from core.config import PipelineConfig
+    from core.config import PipelineConfig, normalize_study_city
     from core.context import build_context
 
     # CAP_POI_RADIUS_M (set by run_configs() below) freezes poi_radius_m for this whole
     # worker process, including any PipelineConfig() built deep in the call graph (e.g.
     # utils.graphml.get_poi()) -- see the field's comment in core/config.py.
+    city = normalize_study_city(os.environ.get("CAP_STUDY_CITY", "cagliari"))
+    light_max_nodes = UPSTREAM_LIGHT_MAX_NODES_BY_CITY.get(city)
+    # debug_max_nodes is NOT passed here: build_context() would subsample nodes_with_coords
+    # before load_impedance_bundle() below validates it against the cached bundle's
+    # origins_sig (baked in from the FULL node set) -- subsampling first guarantees a
+    # mismatch (see the 2026-08-26 baseline failures, both Cagliari and Paris). Build the
+    # full node set, load the bundle against it, then subsample afterward.
     cfg = PipelineConfig()
     # Rebase every artifact path from artifacts/<slug>/ into the workspace so
     # nothing of the baseline caches is read or written by this run.
@@ -234,6 +286,33 @@ def run_worker(config_name: str) -> int:
     if not link.exists():
         os.symlink(baseline_impedances.resolve(), link)
 
+    # Every other artifact path was just rebased into the isolated workdir above ("nothing
+    # of the baseline caches is read or written by this run") -- but accessibility/service
+    # also read cached routing data straight off disk (bus/subway matrices, non-bus per-node
+    # aggregates), not just the in-memory bundle load_impedance_bundle() returns. Left
+    # rebased, those land on fresh EMPTY directories and the accessibility stage silently
+    # reroutes all of Paris from scratch to refill them (2026-08-26: two separate incidents,
+    # 500+ GB each, filled the disk both times). Symlink them back in read-only too, same as
+    # impedances.npz. non_bus_cache_dir is radius-bucketed (this worker's pinned poi_radius_m
+    # differs from the base run's, which used the decay-derived default), so its basename
+    # under base_prefix may differ from cfg's rebased one -- resolve it from what's actually
+    # on disk rather than assuming a name. bus/ and subway/ are never radius-bucketed, so
+    # their basenames always match.
+    def _link_dir(src: Path, dest: Path) -> None:
+        if dest.exists() or dest.is_symlink():
+            return
+        if not src.is_dir():
+            return
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(src.resolve(), dest)
+
+    base_non_bus_candidates = sorted(Path(base_prefix).glob("non_bus*"))
+    if base_non_bus_candidates:
+        _link_dir(base_non_bus_candidates[0], Path(cfg.non_bus_cache_dir))
+    _link_dir(Path(base_prefix) / "bus", Path(cfg.bus_routing_matrix_path).parent)
+    if cfg.enable_subway:
+        _link_dir(Path(base_prefix) / "subway", Path(cfg.subway_routing_matrix_path).parent)
+
     from exports.artifact_bundle import load_impedance_bundle
     from stages.accessibility_stage import run_accessibility_stage
     from stages.service_stage import run_service_stage
@@ -244,6 +323,12 @@ def run_worker(config_name: str) -> int:
         print("ERROR: impedance bundle failed to load in workspace.", file=sys.stderr)
         return 1
     bus, non_bus = loaded
+
+    if light_max_nodes is not None and len(ctx.nodes_with_coords) > light_max_nodes:
+        import random
+        rng = random.Random(cfg.seed)
+        ctx.nodes_with_coords = rng.sample(ctx.nodes_with_coords, light_max_nodes)
+        print(f"[worker:{config_name}] sampled down to {light_max_nodes} nodes for scoring", flush=True)
     print(f"[worker:{config_name}] impedances loaded; running accessibility stage...", flush=True)
     acc = run_accessibility_stage(ctx, non_bus, bus)
     print(f"[worker:{config_name}] accessibility done ({len(acc.node_results)} nodes); service stage...", flush=True)
@@ -268,6 +353,21 @@ def run_worker(config_name: str) -> int:
 
 def run_configs(only: str | None) -> None:
     _work_root().mkdir(parents=True, exist_ok=True)
+
+    hash_path = _work_root() / "config_hash.txt"
+    current_hash = _config_hash()
+    has_cached_runs = any((_work_root() / name / "service_scores.csv").exists() for name in CONFIGS)
+    stale = has_cached_runs and (
+        not hash_path.exists() or hash_path.read_text().strip() != current_hash
+    )
+    if stale:
+        reason = "no config_hash.txt on record (cache predates staleness tracking)" if not hash_path.exists() \
+            else "poi_types.csv/services.csv changed since the last sweep"
+        print(f"[config] {reason} — wiping cached per-config results (stale).", flush=True)
+        for name in CONFIGS:
+            shutil.rmtree(_work_root() / name, ignore_errors=True)
+    hash_path.write_text(current_hash)
+
     backup_dir = _work_root() / "_config_backup"
     backup_dir.mkdir(exist_ok=True)
 
@@ -314,6 +414,8 @@ def run_configs(only: str | None) -> None:
                 _write_csv(CONFIG_DIR / csv_name, fieldnames, rows_copy)
                 print(f"[config] {config_name}: mutated config/{csv_name}", flush=True)
 
+            _check_disk_space()
+
             env_overrides = ENV_CONFIGS.get(config_name)
             if env_overrides:
                 print(f"[config] {config_name}: worker env {env_overrides}", flush=True)
@@ -327,7 +429,7 @@ def run_configs(only: str | None) -> None:
             print(f"[run] {config_name}: launching stage subprocess...", flush=True)
             result = subprocess.run(
                 [sys.executable, __file__],
-                timeout=3600,  # fail fast: one config must not take longer than a full run
+                timeout=UPSTREAM_CONFIG_TIMEOUT_S,
                 env=worker_env,
             )
             if result.returncode != 0:

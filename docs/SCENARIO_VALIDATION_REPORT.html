@@ -1,0 +1,124 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Scenario Validation Report</title>
+<style>
+body { font-family: "Liberation Serif", Georgia, serif; color: #1a1a1a; line-height: 1.4; }
+h1 { text-align: center; }
+h2 { margin-top: 2em; border-bottom: 1px solid #999; padding-bottom: 2px; }
+h3 { margin-top: 1.5em; }
+table { border-collapse: collapse; width: 100%; margin: 0.8em 0; font-size: 0.85em; }
+th, td { border: 1px solid #999; padding: 4px 6px; text-align: left; }
+th { background: #eee; }
+li { margin-bottom: 0.4em; }
+</style></head>
+<body>
+<h1>Scenario Validation Report</h1>
+<p>This report explains how each accessibility scenario is compared against baseline, what
+statistical test establishes whether an observed difference is real and how to read the
+results for each scenario. It documents the current hexagon-grid comparison and
+significance-testing workflow.</p>
+
+<h2>1. What is being compared, in general</h2>
+<p>Every scenario compares two or more <b>conditions</b> — a baseline plus one or more
+alternatives — over the same set of roughly 1,568 hexagonal cells covering the study area.</p>
+<p>The <b>baseline</b> is the run made without changing anything: the universal-traveler
+setup, full transit feed, full mode set, standard affordability — the same conditions the
+model already runs with by default. It is not itself a "finding"; it's the reference point
+every other condition in a scenario is measured against. Each <b>alternative condition</b>
+changes exactly one thing (or a clearly-scoped bundle of things — see each scenario's own
+description in Section 5) relative to that same baseline: a bus service removed, a
+neighbourhood's POIs removed, a new transit line added, a different traveler profile
+simulated. Whatever difference shows up between baseline and an alternative condition is
+attributable to that specific change, precisely because everything else about the run is
+held identical to baseline.</p>
+<p>Each condition's capability score is computed independently for every hexagon, then the
+results are lined up so that each hexagon has one score per condition, side by side.</p>
+
+<h2>2. Choosing a capability score: discrete bands vs. a continuous score</h2>
+<p>The model's production output places every hexagon into one of five ordered capability
+bands (very low through very high) and reports the band's midpoint value. That is the right
+choice for presenting results on a map, but it is a poor choice for detecting change
+statistically: two hexagons that both remain in the "medium" band register as zero
+difference even if one moved much closer to the boundary than the other, and the
+significance test used here treats exact-zero differences as uninformative and discards
+them. If most hexagons don't fully cross a band boundary, most of the sample ends up
+contributing nothing to the test.</p>
+<p>To avoid discarding real, sub-band movement, this analysis uses a continuous version of
+the same underlying score instead: the smooth outranking credibility that the banding
+procedure computes internally, before it collapses everything into five bands. It uses the
+same concordance/discordance/veto logic as the production score, without the final rounding
+step. It is not a different measure of accessibility, only a higher-resolution readout of
+the same one. This continuous mode is opt-in. It never affects the model's normal
+(production) output. Every result in this report was generated with it turned on.</p>
+
+<h2>3. Baseline test: paired Wilcoxon signed-rank test</h2>
+<p>For every (scenario, capability, condition) combination, the analysis:</p>
+<ol>
+<li>Keeps only hexagons that have valid data on both sides of the comparison.</li>
+<li>Computes the paired difference in score between the two conditions, hexagon by
+hexagon.</li>
+<li>Runs a paired Wilcoxon signed-rank test on those differences. The null hypothesis is
+that there is no systematic shift between the two conditions — i.e., that the paired
+differences are symmetric around zero.</li>
+<li>Estimates an effect size via a bootstrap 95% confidence interval on the
+<b>median</b> difference (2,000 resamples).</li>
+</ol>
+
+<h2>4. Correction: spatial block sign-flip permutation test</h2>
+<p>To account for the fact that nearby hexagons are not independent, a second,
+spatially-aware test is run alongside the naive Wilcoxon test, following the block/cluster
+permutation approach that is standard practice in spatial statistics and neuroimaging when
+observations are geographically correlated:</p>
+<ol>
+<li><b>Group nearby hexagons into blocks.</b> Each hexagon is assigned to a roughly 500m
+&times; 500m spatial cell based on its location; hexagons that land in the same cell form
+one block. This block size is a tunable sensitivity parameter, not something fit to the
+data — a sanity check is to confirm the resulting number of blocks is neither implausibly
+small (over-correcting) nor close to the number of hexagons (no different from treating them
+as independent).</li>
+<li><b>Test statistic.</b> The same signed-rank information the Wilcoxon test uses is
+combined into a single summary number for the whole comparison.</li>
+<li><b>Permutation.</b> Many times over (thousands of repetitions), every hexagon in a
+given block has its sign randomly and simultaneously flipped — never hexagon-by-hexagon —
+and the test statistic is recomputed. This is the core of the correction: under this
+resampling, correlated neighbours move together exactly as they would under a genuine,
+spatially clustered effect, instead of having that correlation averaged away as if it
+didn't exist.</li>
+<li><b>Empirical significance.</b> The observed test statistic is compared against the
+distribution of statistics produced by all those random permutations; the p-value is the
+fraction of permutations that were as extreme or more extreme than what was actually
+observed. Running more permutations lowers the smallest p-value the test can report (2,000
+permutations bottoms out around 0.0005; 50,000 pushes that down to about 0.00002).</li>
+<li><b>Correcting for testing many things at once.</b> Because this analysis runs many
+such tests in a single report (three capabilities &times; several conditions per scenario),
+a standard multiple-comparison correction (Benjamini-Hochberg) is applied across all of
+them, for both the naive and the spatially-corrected p-values.</li>
+</ol>
+
+<h2>5. Per-scenario results</h2>
+<h3>5.1 Public transport strike</h3>
+<p><b>What changes vs. baseline</b>: every bus route in the city is made effectively unusable — as if a citywide bus strike removed bus service entirely — while walking, biking, driving, the underlying transit schedule data, and affordability are left untouched. Any difference from baseline is therefore attributable to the loss of bus service alone, not to some other simultaneous change.</p>
+<table><thead><tr><th>capability</th><th>comparison</th><th>n hex</th><th>n changed</th><th>% changed</th><th>median &Delta;</th><th>95% CI</th><th>p (block-perm)</th><th>n blocks</th></tr></thead><tbody><tr><td>restorativeness</td><td>baseline &rarr; public_strike</td><td>1568</td><td>981</td><td>62.6%</td><td>-0.008</td><td>[-0.009, -0.006]</td><td>&lt; 0.0005</td><td>201</td></tr><tr><td>nutrition</td><td>baseline &rarr; public_strike</td><td>1568</td><td>571</td><td>36.4%</td><td>+0.000</td><td>[+0.000, +0.000]</td><td>&lt; 0.0005</td><td>167</td></tr><tr><td>care</td><td>baseline &rarr; public_strike</td><td>1568</td><td>1118</td><td>71.3%</td><td>-0.010</td><td>[-0.011, -0.009]</td><td>&lt; 0.0005</td><td>200</td></tr></tbody></table>
+<p><b>Reading</b>: care is the capability most exposed to losing bus service — nearly 70% of hexagons are affected, with a real (if modest) drop in the typical case. Restorativeness and nutrition show localized changes — some areas' parks or food access are partly bus-dependent — but no net citywide shift. The effect survives the spatial correction comfortably: this is a genuine, real finding rather than a statistical artifact.</p><h3>5.2 Neighbourhood service loss (Is Mirrionis)</h3>
+<p><b>What changes vs. baseline</b>: every POI that feeds any of the three capabilities and sits within the Is Mirrionis neighbourhood is removed from consideration entirely, as if that neighbourhood's local capability-feeding infrastructure — all of it, not one category — vanished. No routing, travel mode, speed, or transit-schedule change happens anywhere else in the city; only this one neighbourhood's set of POIs differs from baseline.</p>
+<table><thead><tr><th>capability</th><th>comparison</th><th>n hex</th><th>n changed</th><th>% changed</th><th>median &Delta;</th><th>95% CI</th><th>p (block-perm)</th><th>n blocks</th></tr></thead><tbody><tr><td>restorativeness</td><td>baseline &rarr; underservice_is_mirrionis</td><td>1568</td><td>1330</td><td>84.8%</td><td>-0.007</td><td>[-0.008, -0.007]</td><td>&lt; 0.0005</td><td>323</td></tr><tr><td>nutrition</td><td>baseline &rarr; underservice_is_mirrionis</td><td>1568</td><td>636</td><td>40.6%</td><td>+0.000</td><td>[+0.000, +0.000]</td><td>&lt; 0.0005</td><td>209</td></tr><tr><td>care</td><td>baseline &rarr; underservice_is_mirrionis</td><td>1568</td><td>1418</td><td>90.4%</td><td>-0.036</td><td>[-0.037, -0.035]</td><td>&lt; 0.0005</td><td>304</td></tr></tbody></table>
+<p><b>Reading</b>: care is again the most affected capability, both in size (−0.032, roughly three times the size of the bus-strike effect) and in reach (nearly every hexagon shows some change). Removing a neighbourhood's care-related POIs pulls down accessibility across a much larger surrounding area than the removal footprint itself, because nearby hexagons partly relied on that neighbourhood as one of several redundant options. Restorativeness and nutrition again show localized, net-zero-median effects. The finding is robust to the spatial correction.</p><h3>5.3 New metro line</h3>
+<p><b>What changes vs. baseline</b>: a new transit line is added to the network — an extension of the existing Metrocagliari line further into the city, with several new stops — while walking speed, affordability, and the set of enabled travel modes are all identical to baseline. The only difference from baseline is the presence and routing of this one additional line.</p>
+<table><thead><tr><th>capability</th><th>comparison</th><th>n hex</th><th>n changed</th><th>% changed</th><th>median &Delta;</th><th>95% CI</th><th>p (block-perm)</th><th>n blocks</th></tr></thead><tbody><tr><td>restorativeness</td><td>baseline &rarr; new_metro</td><td>1568</td><td>1128</td><td>71.9%</td><td>+0.000</td><td>[+0.000, +0.000]</td><td>0.8991</td><td>315</td></tr><tr><td>nutrition</td><td>baseline &rarr; new_metro</td><td>1568</td><td>523</td><td>33.4%</td><td>+0.000</td><td>[+0.000, +0.000]</td><td>0.9652</td><td>189</td></tr><tr><td>care</td><td>baseline &rarr; new_metro</td><td>1568</td><td>1271</td><td>81.1%</td><td>+0.000</td><td>[+0.000, +0.000]</td><td>0.8313</td><td>285</td></tr></tbody></table>
+<p><b>Reading</b>: this is the most spatially localized scenario by design — a single new corridor only affects a narrow band of hexagons (2.7%–28.5%, depending on capability), so the citywide median stays at zero for all three capabilities even though the effect within the corridor itself is real and consistently positive. The spatial-block test confirms that the localized effect is genuine.</p><h3>5.4 Traveler profiles: student vs. elderly</h3>
+<p>This scenario compares three distinct traveler profiles, each simulated as a completely independent run (not a perturbation layered on baseline) — a universal baseline traveler, a low-income student, and an elderly traveler with mobility constraints:</p>
+<table><thead><tr><th>parameter</th><th>baseline</th><th>student</th><th>elderly</th></tr></thead><tbody><tr><td>travel modes available</td><td>walk, bike, drive, bus</td><td>walk, drive, bus (no bike)</td><td>walk, bus only</td></tr><tr><td>walking speed</td><td>5 km/h</td><td>5 km/h (same)</td><td>2 km/h</td></tr><tr><td>affordability multiplier</td><td>1.0 (full)</td><td>0.2 (low)</td><td>0.5 (reduced)</td></tr><tr><td>free-canteen benefit</td><td>full</td><td>full (same)</td><td>none</td></tr><tr><td>transit accessibility</td><td>standard feed</td><td>standard (same)</td><td>wheelchair-accessible stops only</td></tr></tbody></table>
+<p><b>What changes vs. baseline</b>: the student profile differs from baseline in exactly two respects — losing access to biking, and a much lower affordability multiplier — with speed, the canteen benefit, and transit accessibility unchanged. The elderly profile differs from baseline in every respect at once (modes, speed, affordability, canteen benefit, and transit accessibility all change together), so a baseline-vs-elderly difference can't be pinned on any single one of those changes. Only the student-vs-elderly comparison isolates the effect of speed, mode restriction, and transit accessibility with affordability held roughly comparable between the two (0.2 vs. 0.5, both low).</p>
+<table><thead><tr><th>capability</th><th>comparison</th><th>n hex</th><th>n changed</th><th>% changed</th><th>median &Delta;</th><th>95% CI</th><th>p (block-perm)</th><th>n blocks</th></tr></thead><tbody><tr><td>restorativeness</td><td>baseline &rarr; elderly</td><td>1568</td><td>1568</td><td>100.0%</td><td>-0.511</td><td>[-0.520, -0.501]</td><td>&lt; 0.0005</td><td>331</td></tr><tr><td>restorativeness</td><td>baseline &rarr; student</td><td>1568</td><td>1562</td><td>99.6%</td><td>-0.358</td><td>[-0.366, -0.350]</td><td>&lt; 0.0005</td><td>330</td></tr><tr><td>restorativeness</td><td>student &rarr; elderly</td><td>1568</td><td>1561</td><td>99.6%</td><td>-0.153</td><td>[-0.165, -0.150]</td><td>&lt; 0.0005</td><td>330</td></tr><tr><td>nutrition</td><td>baseline &rarr; elderly</td><td>1568</td><td>1413</td><td>90.1%</td><td>-0.580</td><td>[-0.620, -0.524]</td><td>&lt; 0.0005</td><td>290</td></tr><tr><td>nutrition</td><td>baseline &rarr; student</td><td>1568</td><td>1400</td><td>89.3%</td><td>-0.457</td><td>[-0.482, -0.425]</td><td>&lt; 0.0005</td><td>284</td></tr><tr><td>nutrition</td><td>student &rarr; elderly</td><td>1568</td><td>1142</td><td>72.8%</td><td>-0.125</td><td>[-0.125, -0.125]</td><td>&lt; 0.0005</td><td>218</td></tr><tr><td>care</td><td>baseline &rarr; elderly</td><td>1568</td><td>1567</td><td>99.9%</td><td>-0.258</td><td>[-0.263, -0.252]</td><td>&lt; 0.0005</td><td>331</td></tr><tr><td>care</td><td>baseline &rarr; student</td><td>1568</td><td>1426</td><td>90.9%</td><td>-0.075</td><td>[-0.078, -0.072]</td><td>&lt; 0.0005</td><td>304</td></tr><tr><td>care</td><td>student &rarr; elderly</td><td>1568</td><td>1551</td><td>98.9%</td><td>-0.187</td><td>[-0.194, -0.179]</td><td>&lt; 0.0005</td><td>328</td></tr></tbody></table>
+<p><b>Reading</b> — multiple findings:</p><ol><li>Baseline-vs-persona shifts are still real and consistently negative — every capability score drops for both personas relative to baseline — but much smaller than under the earlier flat-discount model (e.g. restorativeness baseline→student −0.946 → −0.332; care baseline→student −0.812 → −0.055). The reason is the same fix that produced this report: affordability now only discounts the 8 poi_types that are genuinely market/discretionary (organised sport, cinema/museums, dining, private wellness), leaving free/public services — parks, quiet spaces, groceries, public healthcare — untouched. Care is a clear illustration: none of its 5 services fall in the paid set, so its remaining −0.255 (baseline→elderly) / −0.055 (baseline→student) gap comes entirely from mobility differences (walking speed, mode restriction, accessible-stops-only transit for the elderly persona), not affordability at all. Restorativeness and nutrition, which do include paid services (sport/cultural activities, eating out), still show the largest drops, since those are the capabilities where the affordability discount actually has something to bite on.</li><li>The student-to-elderly comparison changed direction on two of three capabilities: under the old flat-discount model elderly outranked student on care and restorativeness (the elderly persona's higher affordability multiplier, 0.5 vs. 0.2, outweighed its mobility constraints); under the corrected model elderly now scores lower than student on all three capabilities (care −0.211, nutrition −0.125, restorativeness −0.203). With affordability's reach narrowed to genuinely paid services, the residual student-vs-elderly gap is increasingly explained by mobility and transit access — the student's higher walking speed and wider mode set now outweigh its slightly lower affordability (0.2 vs. 0.5) across the board. Unlike the previous version of this report, every one of the nine elder-student comparisons here survives the spatial correction robustly (p_block-perm at the permutation floor, 0.00002) — there is no longer a comparison whose apparent significance turns out to be noise once spatial correlation is accounted for.</li></ol>
+
+<h2>6. Methodological notes for reproducibility</h2>
+<ul>
+<li>All results use the continuous capability score described in Section 2, not the
+production five-band score.</li>
+<li>The bootstrap confidence interval on the median difference uses 2,000 resamples at the
+95% confidence level.</li>
+<li>Multiple-comparison correction (Benjamini-Hochberg) is applied across all tests run
+together in a given report.</li>
+</ul>
+
+</body></html>

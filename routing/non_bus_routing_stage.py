@@ -337,18 +337,18 @@ def _process_node(node_item):
                     f"Non-bus routing failed for node_id={node_id}, poi_type={query.poi_type}, cause={exc!r}"
                 ) from exc
 
-            # poi_coords (origin-snapped bus destinations), source_keys and source_coords
-            # are now produced directly by accessibility_non_bus_from_snap_map from the
-            # compact snap bundle, so the old per-item bus-snap loop here is gone.
+            # poi_coords (origin-snapped bus destinations) is produced directly by
+            # accessibility_non_bus_from_snap_map from the compact snap bundle, so the old
+            # per-item bus-snap loop here is gone. source_keys/source_coords are
+            # origin-invariant -- kept_idx indexes them from the shared per-poi_type
+            # catalog written once into the artifact instead of duplicating them here.
             entries.append({
                 "poi_type": query.poi_type,
                 "imp_walk": nb["imp_walk"],
                 "imp_bike": nb["imp_bike"],
                 "imp_drive": nb["imp_drive"],
                 "poi_coords": nb["poi_coords"],
-                "source_keys": nb["source_keys"],
-                "source_coords": nb["source_coords"],
-                "walk_path_scores": nb.get("walk_path_scores", []),
+                "kept_idx": nb["kept_idx"],
             })
 
             if _NON_BUS_PROGRESS_VALUE is not None and _POI_WORK_UNITS_BY_KEY is not None:
@@ -475,6 +475,21 @@ def run_non_bus_routing_stage(
         f"(numpy arrays, shared across workers).",
         flush=True,
     )
+
+    # Each poi_type maps to exactly one query/poi_key in config/poi_types.csv, so this
+    # is a straight rename -- the artifact writer persists it once, instead of every
+    # node's entry re-embedding the same source_keys/source_coords.
+    poi_catalog: dict[str, dict] = {}
+    for query in serv.unique_query_keys():
+        bundle = snap_compact.get(serv.query_key(query))
+        if bundle is not None:
+            poi_catalog[query.poi_type] = {
+                "src_keys": bundle["src_keys"],
+                "source_coords": bundle["source_coords"],
+            }
+    os.makedirs(os.path.dirname(_PIPELINE_CONFIG.non_bus_poi_catalog_path), exist_ok=True)
+    with open(_PIPELINE_CONFIG.non_bus_poi_catalog_path, "wb") as f:
+        pickle.dump(poi_catalog, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     global_radius_m = serv.get_global_radius_m(_PIPELINE_CONFIG)
     if global_radius_m is not None:
@@ -669,6 +684,7 @@ def run_non_bus_routing_stage(
         cache_paths=cache_paths,
         cached_nodes=cached_nodes,
         computed_nodes=len(nodes_to_compute) - len(pending_non_bus),
+        poi_catalog=poi_catalog,
     )
 
 

@@ -488,14 +488,19 @@ def get_capability_colors(cfg=None) -> dict[str, str]:
 # do have one should call get_capability_colors(cfg) instead.
 CAPABILITY_COLORS = get_capability_colors()
 
-# ELECTRE TRI class boundaries and human labels. Five classes over [0, 1].
-ELECTRE_BOUNDS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+# ELECTRE TRI class boundaries and human labels. Five classes over [0, 1], split
+# at the real configured cut points (core.config.ELECTRE_BOUNDARIES) -- NOT a
+# naive uniform quintile. This used to be a hardcoded [0.0, 0.2, 0.4, 0.6, 0.8,
+# 1.0], disconnected from the boundaries actually used for classification
+# (_BOUNDARIES above); it happened to still color cells correctly under
+# capability_score_mode="discrete" (every stored value already snaps to one of
+# the 5 real class midpoints, which all landed inside the matching uniform
+# bucket by coincidence), but would misclassify under "continuous" mode, and
+# the legend text always showed the wrong numeric ranges regardless.
+ELECTRE_BOUNDS = [0.0] + list(ELECTRE_BOUNDARIES) + [1.0]
 ELECTRE_LABELS = [
-    "Very Low (0.0–0.2)",
-    "Low (0.2–0.4)",
-    "Medium (0.4–0.6)",
-    "High (0.6–0.8)",
-    "Very High (0.8–1.0)",
+    f"{name} ({ELECTRE_BOUNDS[i]:.2f}–{ELECTRE_BOUNDS[i + 1]:.2f})"
+    for i, name in enumerate(["Very Low", "Low", "Medium", "High", "Very High"])
 ]
 # Short names (no range), for compact legend rows / band categories.
 ELECTRE_SHORT_LABELS = ["Very Low", "Low", "Medium", "High", "Very High"]

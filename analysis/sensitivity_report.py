@@ -26,15 +26,29 @@ from pathlib import Path
 import matplotlib
 
 from analysis.sensitivity_analysis import ELECTRE_Q, ELECTRE_P, LAMBDA_BASELINE
+from analysis.sensitivity_upstream import CONTRIBUTION_MIN_TIER, CONTRIBUTION_MAX_TIER
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 from core.config import PipelineConfig
+from utils import services as serv
+from utils.capabilities import _CATEGORIES
 
-SENS_DIR = Path("outputs/debug") / PipelineConfig().artifact_slug
+_cfg = PipelineConfig()
+SENS_DIR = Path("outputs/debug") / _cfg.artifact_slug
 UP_DIR = SENS_DIR / "sensitivity_upstream"
+
+# Redundancy-weighting mode count: walk/bike/drive/bus always count, subway adds a
+# fifth when the study city has it configured (see utils.decay.calculate_rra) --
+# read live so this can't silently assume 4 modes for a city that actually has 5.
+RRA_MODE_COUNT = 5 if _cfg.enable_subway else 4
+
+
+def _rra_lambda_taper_str(m: int) -> str:
+    """'1, 1/2, 1/3, ..., 1/m' -- the baseline rank_desc redundancy taper for m modes."""
+    return ", ".join("1" if i == 1 else f"1/{i}" for i in range(1, m + 1))
 
 # Thresholds (in % of nodes changing class) for the automatic parameter verdicts.
 LOAD_BEARING = 20.0
@@ -364,31 +378,6 @@ def chart_ranked_bar(param_rows: list[dict]) -> str:
     return _fig_html(fig)
 
 
-def chart_tornado_dropout(drop: pd.DataFrame, axis: str) -> str:
-    """Tornado plot for one axis's reachable-node changes: below-config's
-    dropped/added counts extend left, above-config's extend right."""
-    below_cfg, above_cfg, axis_label = AXIS_PAIRS[axis]
-
-    def counts(config: str) -> tuple[float, float]:
-        row = drop[drop["config"] == config]
-        if not len(row):
-            return 0.0, 0.0
-        return float(row["dropped_vs_baseline"].iloc[0]), float(row["added_vs_baseline"].iloc[0])
-
-    below_dropped, below_added = counts(below_cfg)
-    above_dropped, above_added = counts(above_cfg)
-    series = {
-        below_cfg: [-below_dropped, -below_added],
-        above_cfg: [above_dropped, above_added],
-    }
-    colors = {below_cfg: CAT_HUES[0], above_cfg: CAT_HUES[7]}
-    fig, ax = plt.subplots(figsize=(6.5, 2.2))
-    _draw_tornado(ax, ["dropped", "added"], series, colors, "nodes (magnitude; side = below/above baseline)")
-    ax.set_title(f"{axis_label} — reachable-node changes", fontsize=11, color=CHART_INK, loc="left")
-    ax.legend(frameon=False, fontsize=9, ncols=2, loc="upper center", bbox_to_anchor=(0.5, -0.35))
-    return _fig_html(fig)
-
-
 def chart_tornado_service_deltas(svc_pivot: pd.DataFrame, axis: str) -> str:
     """Tornado plot for one axis's per-service impact: below-config's mean |delta|
     extends left, above-config's extends right, one row per service."""
@@ -410,8 +399,9 @@ def chart_tornado_service_deltas(svc_pivot: pd.DataFrame, axis: str) -> str:
     return _fig_html(fig)
 
 
-# The five ELECTRE classes, in their fixed order (utils/capabilities._CATEGORIES).
-LEVELS = ["Very Low", "Low", "Medium", "High", "Very High"]
+# The five ELECTRE classes, in their fixed order (single source of truth,
+# shared with sensitivity_analysis.py and robustness_analysis.py).
+LEVELS = _CATEGORIES
 
 # Every parameter that has a genuine (min, max) perturbation pair -- excludes
 # "weights" (a Dirichlet distribution, not a single min/max).
@@ -591,19 +581,21 @@ UPSTREAM_CONFIG_DESC = {
                    "every POI type's configured decay coefficient multiplied by 1.2 — a uniformly longer travel tolerance",
                    "a&prime;<sub>t</sub> = &gamma;&thinsp;a<sub>t</sub>, &nbsp; &gamma; = 1.2, for every POI type t"),
     "rra_lambda_uniform": ("RRA λ-weighting scheme", "multi-modal redundancy aggregation",
-                           "modes ranked best→worst are weighted λ = (1, ½, ⅓, ¼) at baseline; here every mode gets λ = 1 — no redundancy discount at all",
+                           f"modes ranked best→worst are weighted λ = ({_rra_lambda_taper_str(RRA_MODE_COUNT)}) at baseline; here every mode gets λ = 1 — no redundancy discount at all",
                            "RRA = 1 &minus; &prod;<sub>i=1</sub><sup>m</sup> (1 &minus; &lambda;<sub>i</sub>&thinsp;d<sub>(i)</sub>), "
                            "&nbsp; d<sub>(1)</sub> &ge; &hellip; &ge; d<sub>(m)</sub>; &nbsp; baseline &lambda;<sub>i</sub> = 1/i &nbsp;&rarr;&nbsp; here &lambda;<sub>i</sub> = 1"),
     "rra_lambda_reversed": ("RRA λ-weighting scheme", "multi-modal redundancy aggregation",
-                            "the baseline taper λ = (1, ½, ⅓, ¼) is flipped: the WORST mode gets λ = 1 and the best the smallest weight — the polar opposite assumption",
+                            f"the baseline taper λ = ({_rra_lambda_taper_str(RRA_MODE_COUNT)}) is flipped: the WORST mode gets λ = 1 and the best the smallest weight — the polar opposite assumption",
                             "RRA = 1 &minus; &prod;<sub>i=1</sub><sup>m</sup> (1 &minus; &lambda;<sub>i</sub>&thinsp;d<sub>(i)</sub>), "
                             "&nbsp; baseline &lambda;<sub>i</sub> = 1/i &nbsp;&rarr;&nbsp; here &lambda;<sub>i</sub> = 1/(m&minus;i+1)"),
     "contribution_min": ("contribution coefficient", "POI-count saturation (service aggregation)",
-                         "every POI type pinned to the minimum tier of the configured set {1, 2, 3, 5, 8}: tier 1, i.e. a single POI already saturates the service",
-                         "c&prime;<sub>t</sub> = 1 for every POI type t"),
+                         f"every POI type pinned to the minimum tier configured right now ({CONTRIBUTION_MIN_TIER}): "
+                         f"a single POI already saturates the service",
+                         f"c&prime;<sub>t</sub> = {CONTRIBUTION_MIN_TIER} for every POI type t"),
     "contribution_max": ("contribution coefficient", "POI-count saturation (service aggregation)",
-                         "every POI type pinned to the maximum tier: 8 POIs needed to reach saturation",
-                         "c&prime;<sub>t</sub> = 8 for every POI type t"),
+                         f"every POI type pinned to the maximum tier configured right now: "
+                         f"{CONTRIBUTION_MAX_TIER} POIs needed to reach saturation",
+                         f"c&prime;<sub>t</sub> = {CONTRIBUTION_MAX_TIER} for every POI type t"),
     "capacity_blend50": ("Choquet capacity", "POI-type weights inside each service",
                          "each service's capacity vector w is replaced by 0.5·w + 0.5·u, where u is the uniform vector (1/n per POI type) — halfway between the configured skew and no skew",
                          "w&prime; = (1 &minus; &beta;)&thinsp;w + &beta;&thinsp;u, &nbsp; &beta; = 0.5, &nbsp; u = (1/n, &hellip;, 1/n)"),
@@ -685,7 +677,6 @@ def build_html(R: dict, V: dict, out_path: Path) -> None:
     p_pivot = _pivot(R["oat"][R["oat"].parameter == "p"], "value", "capability", "pct_nodes_changed")
     l_pivot = _pivot(R["oat"][R["oat"].parameter == "lambda"], "value", "capability", "pct_nodes_changed")
     wsum = R["weights"].groupby("capability")["pct_nodes_changed"].describe()[["mean", "std", "50%", "max"]]
-    drop = R["up_dropout"]
     caps = V["caps"]
 
     def _oat_baseline(param: str) -> float:
@@ -697,19 +688,20 @@ def build_html(R: dict, V: dict, out_path: Path) -> None:
     axes_present = [a for a in AXIS_PAIRS if {AXIS_PAIRS[a][0], AXIS_PAIRS[a][1]} <= _configs_seen]
     chart_up = "".join(chart_tornado_upstream(up, axis, caps) for axis in axes_present)
     chart_svc = "".join(chart_tornado_service_deltas(svc_pivot, axis) for axis in axes_present)
-    chart_drop = "".join(chart_tornado_dropout(drop, axis) for axis in axes_present)
 
     # Axis-by-axis prose bullets, verdict pulled from the same computed ranking as
     # section 8 (not asserted by hand) so it can't go stale when the perturbation
     # design changes.
     axis_notes = {
-        "decay": "travel-tolerance assumptions drive all three capabilities; it is also the only axis that "
-                 "changes <em>which</em> nodes exist (see dropout below).",
+        "decay": "travel-tolerance assumptions drive all three capabilities; the node universe is frozen "
+                 "identically across the whole sweep, so this axis reweights already-reachable POIs rather "
+                 "than changing which nodes exist.",
         "rra": "brackets the two structural extremes of the redundancy-weighting scheme itself (no continuous "
                "baseline +/- step applies to a weighting rule) — uniform removes the redundancy discount "
                "entirely, reversed rewards the worst mode instead of the best.",
-        "contribution": "every POI type is pinned to the minimum (1) or maximum (8) tier in the configured "
-                         "Fibonacci-like class set — the full range the modeler could plausibly have chosen.",
+        "contribution": f"every POI type is pinned to the minimum ({CONTRIBUTION_MIN_TIER}) or maximum "
+                         f"({CONTRIBUTION_MAX_TIER}) tier currently configured — the full range the modeler "
+                         f"could plausibly have chosen.",
         "capacity": "one direction flattens the hand-chosen skew toward uniform, the other exaggerates it 50% "
                     "further — a genuine two-sided test of whether the exact weights matter.",
         "interactions": "the baseline values are tiny (±0.03–0.07); this brackets a full order-of-magnitude "
@@ -809,7 +801,7 @@ that a human chose:</p>
     <td>{chain_values['rra']}</td></tr>
 <tr><td>③ type aggregation</td><td>per-POI access</td><td>per-POI-type value</td><td><code>contribution_coefficient</code></td>
     <td>{chain_values['contribution']}</td></tr>
-<tr><td>④ Choquet</td><td>POI-type values</td><td>11 service scores</td><td><code>choquet_capacity</code></td>
+<tr><td>④ Choquet</td><td>POI-type values</td><td>{len(serv.SERVICE_KEYS)} service scores</td><td><code>choquet_capacity</code></td>
     <td>{chain_values['capacity']}</td></tr>
 <tr><td></td><td></td><td></td><td><code>choquet_interactions</code></td>
     <td>{chain_values['interactions']}</td></tr>
@@ -847,7 +839,7 @@ backed up and hash-verified on restore, so a run can never leave your config mut
 <tr><th>Metric</th><th>Meaning</th></tr>
 <tr><td>% nodes changed</td><td>Fraction of nodes whose final capability <em>class</em> differs from baseline. A node counts only if it crosses a class boundary — so this measures decision changes, which is what matters for a map.</td></tr>
 <tr><td>mean |score &Delta;|</td><td>Average absolute change in the continuous score. Compared with "% changed" it shows <em>why</em>: many nodes flipped with a small &Delta; = they sat on a knife-edge.</td></tr>
-<tr><td>mean |service &Delta;|</td><td>Same, per individual service — traces which of the 11 services a perturbation actually moves.</td></tr>
+<tr><td>mean |service &Delta;|</td><td>Same, per individual service — traces which of the {len(serv.SERVICE_KEYS)} services a perturbation actually moves.</td></tr>
 <tr><td>node dropout</td><td>Nodes that vanish because a parameter change leaves them with zero reachable POIs — itself a sensitivity signal.</td></tr>
 </table>
 
@@ -874,9 +866,6 @@ This localizes the sensitivity: contribution changes concentrate in the diagnost
 while decay spreads across every service because it touches every POI type.</p>
 {_df_html(svc_pivot)}
 {chart_svc}
-<p>Reachable-node changes (a node dropping out because it loses all POIs is itself a sensitivity signal):</p>
-{drop.to_html(index=False, border=0)}
-{chart_drop}
 
 <h2>4. Downstream ELECTRE parameter sweeps (OAT)</h2>
 <p>One parameter at a time, all others at baseline, tested at exactly one value below and one value above

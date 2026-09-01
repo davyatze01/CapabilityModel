@@ -19,13 +19,13 @@ study_city = "cagliari"
 SAFE_MODE = False
 # WORKER_COUNT: force the number of pool workers. None = automatic (memory/CPU derived, then
 #   the safe-mode cap if SAFE_MODE). Set to 1 for a single-process "survival" run.
-WORKER_COUNT = None
+WORKER_COUNT = 8
 # LIGHT_OUTPUT: skip the per-hexagon POI/interface exports — they exist only to feed the
 #   web interface and are by far the heaviest post-routing step. The run still produces the
 #   capability CSVs, the GeoPackage, and the QGIS project. Meant for colleagues starting
 #   from a shipped impedances.npz who only need to inspect results in QGIS.
 #   Also settable without editing this file: CAP_LIGHT_OUTPUT=1 python main.py
-LIGHT_OUTPUT = False
+LIGHT_OUTPUT = True
 # NOTIFY_CRASH: send a Telegram message when the run stops for ANY reason — unhandled
 #   exception, Ctrl+C, OOM/cgroup SIGKILL, hard crash, terminal dying — plus one on a clean
 #   finish. Uses a detached watchdog process (outside the run_safe.sh cgroup) so even a
@@ -38,7 +38,7 @@ NOTIFY_CRASH = True
 #   Non-bus impedance is aggregated at routing time using this radius (see
 #   utils.delta_g.accessibility_non_bus_from_snap_map) so it cannot be reused across a radius
 #   change; setting this bucket-isolates the non-bus cache and impedance bundle under
-#   artifacts/<slug>/non_bus_r<radius> / impedances_r<radius>.npz so a rerun at the SAME
+#   artifacts/<slug>/non_bus_r<radius> / impedances_r<radius>.npz so a rerun at thes SAME
 #   radius still hits cache, while ARTIFACT_SLUG_SUFFIX below keeps this run's final outputs
 #   (gpkg/QGIS project) from overwriting the normal run's.
 POI_RADIUS_KM = None
@@ -51,10 +51,22 @@ POI_RADIUS_KM = None
 ARTIFACT_SLUG_SUFFIX = None
 # If true, main will generate an interactive dashboard for inspecting the results
 DEBUG_REPORT = True
+# If true, skip the pipeline entirely and just (re)generate the debug report from the
+# last run's artifacts already on disk (non_bus/bus/accessibility/service caches,
+# grid_params.json, the spatial gpkg). Useful after a debug_pipeline.py-only change.
+DEBUG_REPORT_ONLY = False
 # If true, main will generate a robustness analysis dashboard
 ROBUSTNESS_REPORT = True
 # If true, main will generate a dashboard that evaluates the model's sensitivity when changing the parameters
 SENSITIVITY_REPORT = True
+# PAID_POI_AFFORDABILITY: general affordability multiplier u(y) applied to paid poi_types
+#   (core.profiles.PAID_POI_TYPES) — e.g. 0.7 discounts every paid POI's contribution to
+#   accessibility by 30%, same mechanism scenarios.py's personas use. None = baseline (1.0,
+#   no discount). Free/public POIs are always u=1 regardless of this knob. Does NOT bucket
+#   the artifact namespace like POI_RADIUS_KM does, and the accessibility-matrix cache's
+#   signature doesn't account for this value (see core.profiles.Profile.affordability) —
+#   delete artifacts/<slug>/ before a run where you change this, per project convention.
+PAID_POI_AFFORDABILITY: float | None = None
 
 def _reexec_under_run_safe_if_needed() -> None:
     """Re-run this entrypoint through run_safe.sh when not already in a cgroup scope.
@@ -158,7 +170,21 @@ def main():
     if cfg.poi_from_shp:
         for p in cfg.poi_shapefile_paths:
             print(f"[Config]   {p}", flush=True)
+    if DEBUG_REPORT_ONLY:
+        print("[Config] DEBUG_REPORT_ONLY: regenerating debug report from existing artifacts only.", flush=True)
+        run_debug_pipeline(cfg.city_slug)
+        return
+
     ctx = build_context(cfg)
+    if PAID_POI_AFFORDABILITY is not None:
+        from core.profiles import Profile
+        ctx.profile = Profile(
+            key="paid_poi_affordability_override",
+            enabled_modes=frozenset({"walk", "bike", "drive", "bus"}),
+            walk_speed_kmh=cfg.speed_walk_kmh,
+            affordability=PAID_POI_AFFORDABILITY,
+            canteen_utility=1.0,
+        )
     snap = None
 
     loaded = load_impedance_bundle(ctx)

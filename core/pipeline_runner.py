@@ -284,14 +284,27 @@ def _build_qgis_project(cfg: PipelineConfig, gpkg_path: Path, qgis_exe: str) -> 
     _STOP_FRACTIONS = [0.2, 0.4, 0.6, 0.8, 1.0]
 
     def _stop_color_expr(field_name: str, stops: list[str], fractions: list[float]) -> str:
+        def _rgb(hexcolor: str) -> tuple[int, int, int]:
+            h = hexcolor.lstrip("#")
+            return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
         value_expr = f'clamp(0, "{field_name}", 1)'
         clauses = [f"WHEN {value_expr} <= {fractions[0]} THEN '{stops[0]}'"]
         for i in range(1, len(fractions)):
             lo, hi = fractions[i - 1], fractions[i]
-            ratio_expr = f"(({value_expr} - {lo}) / {hi - lo} * 100)"
-            clauses.append(
-                f"WHEN {value_expr} <= {hi} THEN color_mix('{stops[i - 1]}', '{stops[i]}', {ratio_expr})"
+            (r1, g1, b1), (r2, g2, b2) = _rgb(stops[i - 1]), _rgb(stops[i])
+            t_expr = f"(({value_expr} - {lo}) / {hi - lo})"
+            # color_rgb() with hand-rolled linear interpolation instead of color_mix():
+            # color_mix() is only available from QGIS 3.24 onward, and this expression
+            # is embedded in the GeoPackage's layer_styles table -- it must evaluate on
+            # whatever QGIS version opens the file later, not just the one that built it.
+            color_expr = (
+                f"color_rgb("
+                f"round({r1} + ({r2 - r1}) * {t_expr}), "
+                f"round({g1} + ({g2 - g1}) * {t_expr}), "
+                f"round({b1} + ({b2 - b1}) * {t_expr}))"
             )
+            clauses.append(f"WHEN {value_expr} <= {hi} THEN {color_expr}")
         return "CASE " + " ".join(clauses) + f" ELSE '{stops[-1]}' END"
 
     service_grid_specs: list[dict[str, object]] = []

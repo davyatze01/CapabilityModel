@@ -12,6 +12,12 @@ from typing import Any
 CONFIG_CSV_PATH = Path(__file__).resolve().parents[1] / "config" / "poi_types.csv"
 SERVICES_CSV_PATH = Path(__file__).resolve().parents[1] / "config" / "services.csv"
 
+# Remaps the discrete contribution_coefficient tiers read from services.csv without
+# editing the file -- e.g. {5:15,10:30,30:90,50:150,80:240} for a run with a rescaled
+# saturation tier set. None = use the CSV values as-is (default, matches today's runs).
+CONTRIBUTION_TIER_REMAP: dict[int, int] | None = None
+# CONTRIBUTION_TIER_REMAP: dict[int, int] | None = {5: 15, 10: 30, 30: 90, 50: 150, 80: 240}
+
 
 @dataclass(frozen=True)
 class PoiQuery:
@@ -307,7 +313,9 @@ def _load_service_weights(
             contribution_coefficients[service] = {}
             for poi, cap_v, contrib_v in zip(poi_types_clean, choquet_values, contribution_values):
                 service_singleton_m[service][poi] = float(cap_v)
-                contribution_coefficients[service][poi] = float(contrib_v)
+                remapped = CONTRIBUTION_TIER_REMAP.get(int(contrib_v)) if CONTRIBUTION_TIER_REMAP else None
+                contrib_final = remapped if remapped is not None else contrib_v
+                contribution_coefficients[service][poi] = float(contrib_final)
 
     return dict(service_singleton_m), dict(contribution_coefficients), dict(service_poi_order)
 

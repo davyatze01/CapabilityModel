@@ -59,6 +59,10 @@ _SUBWAY_DEST_COORD_TO_COL: dict[tuple[float, float], int] | None = None
 _ACCESS_DEDUPLICATE_ENTRIES: bool = True
 # Per-service POI dedup: source_keys each poi_type must drop (owned by another type).
 _POI_DROP_BY_TYPE: dict[str, set[str]] = {}
+# Shared per-poi_type {src_keys, source_coords} catalog (see exports/artifact_bundle.py):
+# origin-invariant POI identity, loaded once per worker. Each node entry's "kept_idx"
+# indexes into this instead of carrying its own copy of the keys/coords.
+_POI_CATALOG: dict[str, dict[str, Any]] = {}
 
 _POI_RADIUS_ENABLED: bool = False
 _POI_RADIUS_M: float | None = None
@@ -93,14 +97,19 @@ def _haversine_m_np(lat1: float, lon1: float, lat2: NDArray[np.float64], lon2: N
     return 2.0 * r * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
 
 
-def _utility_for_source_key(source_key) -> float:
-    """Per-POI utility u(y): canteen override for canteen instances, else the affordability."""
+def _utility_for_source_key(source_key, poi_type: str) -> float:
+    """Per-POI utility u(y): canteen override for canteen instances, else affordability for
+    paid poi_types, else 1.0 (free/public)."""
     if _CANTEEN_OSMIDS:
         from core.profiles import osmid_from_source_key
         osmid = osmid_from_source_key(source_key)
         if osmid is not None and osmid in _CANTEEN_OSMIDS:
             return _POI_UTIL_CANTEEN
-    return _POI_UTIL_DEFAULT
+    if _POI_UTIL_DEFAULT != 1.0:
+        from core.profiles import PAID_POI_TYPES
+        if poi_type in PAID_POI_TYPES:
+            return _POI_UTIL_DEFAULT
+    return 1.0
 
 # --- incremental accessibility matrix cache helpers ---
 
@@ -506,6 +515,7 @@ def _init_accessibility_worker(
     canteen_osmids=(),
     poi_by_node_dir=None,
     poi_export_geopackage_path=None,
+    poi_catalog_path=None,
 ):
     """Initialize worker-local state for accessibility multiprocessing.
 
@@ -530,7 +540,7 @@ def _init_accessibility_worker(
     global _NON_BUS_CACHE_SCHEMA_VERSION, _NON_BUS_POI_CONFIG_SIGNATURE, _ACCESS_PROGRESS_VALUE
     global _BUS_SOURCE_ID_TO_ROW, _BUS_DEST_COORD_TO_COL, _BUS_IMPEDANCE_MATRIX
     global _SUBWAY_SOURCE_ID_TO_ROW, _SUBWAY_DEST_COORD_TO_COL, _SUBWAY_IMPEDANCE_MATRIX
-    global _ACCESS_DEDUPLICATE_ENTRIES, _POI_DROP_BY_TYPE
+    global _ACCESS_DEDUPLICATE_ENTRIES, _POI_DROP_BY_TYPE, _POI_CATALOG
     global _POI_RADIUS_ENABLED, _POI_RADIUS_M, _POI_RADIUS_DECAY_THRESHOLD, _POI_RADIUS_MAX_SPEED_KMH, _global_radius_m
     global _ENABLED_NON_BUS_MODES, _POI_UTIL_DEFAULT, _POI_UTIL_CANTEEN, _CANTEEN_OSMIDS
     global _POI_BY_NODE_DIR, _SOURCE_KEY_TO_ID
@@ -559,6 +569,11 @@ def _init_accessibility_worker(
     _ACCESS_DEDUPLICATE_ENTRIES = bool(deduplicate_entries)
     from utils import poi_dedup
     _POI_DROP_BY_TYPE = poi_dedup.load_drop_map(poi_drop_map_path) if poi_drop_map_path else {}
+    if poi_catalog_path and os.path.exists(poi_catalog_path):
+        with open(poi_catalog_path, "rb") as f:
+            _POI_CATALOG = pickle.load(f)
+    else:
+        _POI_CATALOG = {}
     _ACCESS_PROGRESS_VALUE = access_progress_value
     with open(source_id_to_row_path, encoding="utf-8") as f:
         source_id_to_row_raw = json.load(f)
@@ -723,27 +738,34 @@ def _compute_node_accessibility(item):
             neg_beta = -beta
 
             poi_coords = entry["poi_coords"]
-            n = len(poi_coords)
+            n = int(poi_coords.shape[0])
             if n == 0:
                 return []
 
-            imp_walk_list = entry.get("imp_walk", [])
-            imp_bike_list = entry.get("imp_bike", [])
-            imp_drive_list = entry.get("imp_drive", [])
+            imp_walk_arr = entry.get("imp_walk")
+            imp_bike_arr = entry.get("imp_bike")
+            imp_drive_arr = entry.get("imp_drive")
+
+            # source_keys is origin-invariant, so it lives once in the shared _POI_CATALOG
+            # (see exports/artifact_bundle.py) instead of this per-node entry -- kept_idx
+            # resolves this entry's POIs into it, positionally aligned with poi_coords.
+            kept_idx = entry.get("kept_idx", np.empty(0, dtype=np.int32))
+            catalog_keys = _POI_CATALOG.get(poi_type, {}).get("src_keys")
+            source_keys = catalog_keys[kept_idx].astype(str).tolist() if catalog_keys is not None else [None] * n
+
             # Per-service dedup: this poi_type does not own these physical POIs, so they
             # are counted under another poi_type of the same service. Zeroing keeps index
             # alignment with source_keys and is equivalent to removal in the Delta-g sum.
-            source_keys = entry.get("source_keys", [])
             drop_keys = _POI_DROP_BY_TYPE.get(poi_type)
 
             valid = np.ones(n, dtype=bool)
             if drop_keys:
-                for i in range(min(n, len(source_keys))):
-                    if str(source_keys[i]) in drop_keys:
+                for i in range(n):
+                    if source_keys[i] in drop_keys:
                         valid[i] = False
 
-            lat_arr = np.fromiter((c[0] for c in poi_coords), dtype=np.float64, count=n)
-            lon_arr = np.fromiter((c[1] for c in poi_coords), dtype=np.float64, count=n)
+            lat_arr = poi_coords[:, 0]
+            lon_arr = poi_coords[:, 1]
 
             if _POI_RADIUS_ENABLED and origin_coord is not None and _global_radius_m is not None:
                 dists = _haversine_m_np(origin_coord[0], origin_coord[1], lat_arr, lon_arr)
@@ -779,18 +801,15 @@ def _compute_node_accessibility(item):
                         out[rows] = np.exp(neg_beta * vals[pos])
                 return out
 
-            def _list_decay(values_list):
+            def _list_decay(values_arr):
                 out = np.zeros(n, dtype=np.float64)
-                limit = min(n, len(values_list))
-                if limit == 0:
+                if values_arr is None or len(values_arr) == 0:
                     return out
-                sub = values_list[:limit]
-                present = np.array([v is not None for v in sub], dtype=bool)
+                limit = min(n, len(values_arr))
+                sub = np.asarray(values_arr[:limit], dtype=np.float64)
+                present = np.isfinite(sub)
                 if present.any():
-                    vals = np.array(
-                        [float(v) if v is not None else 0.0 for v in sub], dtype=np.float64
-                    )
-                    out[:limit] = np.where(present, np.exp(neg_beta * vals), 0.0)
+                    out[:limit] = np.where(present, np.exp(neg_beta * sub), 0.0)
                 return out
 
             d_bus = _matrix_decay(dest_cols, impedance_matrix, source_row)
@@ -805,9 +824,9 @@ def _compute_node_accessibility(item):
             # the 1 - prod(1 - w) formula, leaving the enabled modes with the correct top
             # redundancy weights (exactly as if m were smaller). Bus is a public-transport
             # mode and always kept.
-            d_walk = _list_decay(imp_walk_list) if "walk" in _ENABLED_NON_BUS_MODES else np.zeros(n)
-            d_bike = _list_decay(imp_bike_list) if "bike" in _ENABLED_NON_BUS_MODES else np.zeros(n)
-            d_drive = _list_decay(imp_drive_list) if "drive" in _ENABLED_NON_BUS_MODES else np.zeros(n)
+            d_walk = _list_decay(imp_walk_arr) if "walk" in _ENABLED_NON_BUS_MODES else np.zeros(n)
+            d_bike = _list_decay(imp_bike_arr) if "bike" in _ENABLED_NON_BUS_MODES else np.zeros(n)
+            d_drive = _list_decay(imp_drive_arr) if "drive" in _ENABLED_NON_BUS_MODES else np.zeros(n)
 
             # Per-POI accessibility A^i_k(x, y) is exactly the RRA over modes (formula 2):
             # rank each POI's modal decays descending, apply the fixed redundancy weights
@@ -829,7 +848,7 @@ def _compute_node_accessibility(item):
             if _POI_UTIL_DEFAULT != 1.0 or _POI_UTIL_CANTEEN != 1.0:
                 util = np.fromiter(
                     (
-                        _utility_for_source_key(source_keys[i] if i < len(source_keys) else None)
+                        _utility_for_source_key(source_keys[i] if i < len(source_keys) else None, poi_type)
                         for i in range(n)
                     ),
                     dtype=np.float64,
@@ -883,7 +902,9 @@ def _compute_node_accessibility(item):
         # --- Step 4: build flat source_key → accessibility map ---------------
         accessibility_by_poi: dict[str, float] = {}
         for key, entry in entry_by_poi_type.items():
-            source_keys = entry.get("source_keys", [])
+            kept_idx = entry.get("kept_idx", np.empty(0, dtype=np.int32))
+            catalog_keys = _POI_CATALOG.get(key, {}).get("src_keys")
+            source_keys = catalog_keys[kept_idx].astype(str).tolist() if catalog_keys is not None else []
             accs = per_poi_accs.get(key, [])
             for sk, acc_val in zip(source_keys, accs):
                 if sk and acc_val > 0.0:
@@ -1090,6 +1111,7 @@ def run_accessibility_stage(
                         _profile_canteen_osmids,
                         poi_by_node_dir,
                         ctx.config.poi_export_geopackage_path,
+                        ctx.config.non_bus_poi_catalog_path,
                     ),
                 )
                 _ACTIVE_ACCESSIBILITY_POOL = pool

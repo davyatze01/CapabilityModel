@@ -20,6 +20,7 @@ class PresetDict(TypedDict):
     bus_departure_dt : NotRequired[dt.datetime]
     subway_departure_dt : NotRequired[dt.datetime]
     subway_transit_mode : NotRequired[str]
+    export_hex_radius_m : NotRequired[float]
 
 def normalize_study_city(study_city: str) -> str:
     """Normalize a study city identifier to a stable lookup key."""
@@ -37,10 +38,21 @@ ELECTRE_P: float = 0.06   # preference threshold
 ELECTRE_Q_FACTOR: float = 0.2   # indifference threshold  q = std(x) * Q_FACTOR
 ELECTRE_P_FACTOR: float = 0.8   # preference threshold    p = std(x) * P_FACTOR
 # ELECTRE TRI's 5-class boundaries (Very Low/Low/Medium/High/Very High cut points),
-# frozen from a Jenks natural-breaks calibration against the Cagliari baseline run's
-# capability score distribution -- see analysis/calibrate_electre_boundaries.py.
-# Recalibrating means rerunning that script and pasting its output here.
-ELECTRE_BOUNDARIES: list[float] = [0.31, 0.44, 0.56, 0.71]
+# frozen from a Jenks natural-breaks calibration against a baseline run's capability
+# score distribution -- see analysis/calibrate_electre_boundaries.py. Recalibrating
+# means rerunning that script (set its CITY_SLUG) and pasting its output below.
+# One set per calibration city; auto-follows study_city (mirrors PipelineConfig.study_city's
+# own default) rather than a separate manual knob, so the boundaries always match whichever
+# city CAP_STUDY_CITY/main.py's study_city selects. Falls back to "cagliari" for any city
+# without its own calibrated set.
+ELECTRE_BOUNDARIES_BY_PROFILE: dict[str, list[float]] = {
+    "cagliari": [0.35, 0.51, 0.66, 0.80],
+    "paris": [0.35, 0.51, 0.66, 0.80],
+}
+ELECTRE_BOUNDARIES_PROFILE: str = normalize_study_city(os.getenv("CAP_STUDY_CITY", "cagliari"))
+ELECTRE_BOUNDARIES: list[float] = ELECTRE_BOUNDARIES_BY_PROFILE.get(
+    ELECTRE_BOUNDARIES_PROFILE, ELECTRE_BOUNDARIES_BY_PROFILE["cagliari"]
+)
 # Cutting level λ: minimum outranking credibility for a node to be assigned above a
 # boundary. The single source of truth — the assignment code, the debug details, and
 # the sensitivity baseline all read this value. The sensitivity report flags λ as the
@@ -93,6 +105,11 @@ CITY_PRESETS: dict[str, PresetDict] = {
         "bus_departure_dt": dt.datetime(2025, 12, 17, 12, 0, 0),
         "subway_departure_dt": dt.datetime(2025, 12, 17, 12, 0, 0),
         "osm_extract_url": "https://download.geofabrik.de/europe/france/ile-de-france-latest.osm.pbf",
+        # Paris' dense POI universe at the full poi_radius_m (~15km) makes the hex-POI
+        # provenance export (exports/poi_exports.py, analysis/score_report.py) hit the
+        # process memory cap. Real accessibility/capability computation is unaffected --
+        # see export_hex_radius_m's definition in PipelineConfig.
+        "export_hex_radius_m": 5000.0,
     },
 }
 
@@ -126,6 +143,8 @@ def apply_study_city(cfg: "PipelineConfig", study_city: str) -> None:
         cfg.subway_transit_mode = str(preset["subway_transit_mode"])
     if "subway_departure_dt" in preset:
         cfg.subway_departure_dt = preset["subway_departure_dt"]
+    if "export_hex_radius_m" in preset:
+        cfg.export_hex_radius_m = float(preset["export_hex_radius_m"])
 
 
 
@@ -287,7 +306,11 @@ class PipelineConfig:
     enable_progress: bool = True
 
     non_bus_cache_dir: str = ""
-    non_bus_cache_schema_version: int = 9
+    non_bus_cache_schema_version: int = 10
+    # Shared per-poi_type {src_keys, source_coords} catalog -- written once by the live
+    # pipeline and restored to this same path when an impedance bundle is loaded, so
+    # both paths give the accessibility stage one place to resolve a node's kept_idx.
+    non_bus_poi_catalog_path: str = ""
     poi_snap_cache_dir: str = ""
 
     # POI radius filtering — applies to bus and non-bus routing
@@ -302,6 +325,13 @@ class PipelineConfig:
     poi_radius_m: float | None = field(
         default_factory=lambda: float(os.environ["CAP_POI_RADIUS_M"]) if os.environ.get("CAP_POI_RADIUS_M") else None
     )
+
+    # Post-hoc distance cutoff applied ONLY when building the hex-POI provenance/interface
+    # exports (exports/poi_exports.py, analysis/score_report.py) -- trims the membership
+    # list and score computation to POIs within this radius of each origin. Independent of
+    # poi_radius_m: the real accessibility/capability computation still uses the full
+    # poi_radius_m-derived cache. None = no extra filtering (export radius == poi_radius_m).
+    export_hex_radius_m: float | None = None
 
     # Network-distance cutoff for non-bus Dijkstra = poi_radius * factor. A factor > typical urban
     # street-network detour ratio guarantees no in-radius POI is dropped (bit-exact vs full Dijkstra)
@@ -423,6 +453,7 @@ class PipelineConfig:
 
     def __post_init__(self) -> None:
         self.safe_mode = str(os.environ.get("CAP_SAFE_MODE", "")).strip().lower() in ("1", "true", "yes", "on")
+        self.study_city = normalize_study_city(self.study_city)
         apply_study_city(self, self.study_city)
         self.city_slug = derive_city_slug(self.city_name)
         self.artifact_slug = derive_artifact_slug(
@@ -463,6 +494,7 @@ class PipelineConfig:
         radius_bucket = f"_r{int(self.poi_radius_m)}" if self.poi_radius_m is not None else ""
         self.impedance_artifact_path = os.path.join(city_artifacts, f"impedances{radius_bucket}.npz")
         self.non_bus_cache_dir = os.path.join(city_artifacts, f"non_bus{radius_bucket}")
+        self.non_bus_poi_catalog_path = os.path.join(city_artifacts, f"non_bus_poi_catalog{radius_bucket}.pkl")
         self.walkability_cache_dir = os.path.join(city_artifacts, "walkability")
 
         self.bus_routing_matrix_path = os.path.join(city_artifacts, "bus", "r5r_expanded_travel_time_matrix.csv")

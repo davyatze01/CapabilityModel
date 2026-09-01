@@ -137,6 +137,9 @@ def run_robustness_pipeline(
     node_stab, _mc_summary = run_input_noise(caps_X, node_ids, sigmas, n_mc, rng)
     node_stab.to_csv(out_dir / "robustness_node_stability.csv", index=False)
 
+    wide = node_stab.pivot_table(index=["node_id", "sigma"], columns="capability", values="stability").reset_index()
+    wide.to_csv(out_dir / "robustness_node_stability_wide.csv", index=False)
+
     print(f"\n[done] Table: {out_dir}/robustness_node_stability.csv")
     generate_robustness_report(sigma, coords_csv or csv_path, build_qgis, out_dir)
 

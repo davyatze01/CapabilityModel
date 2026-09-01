@@ -2,6 +2,7 @@ import csv
 import gc
 import json
 import os
+import pickle
 import shutil
 import struct
 import threading
@@ -25,7 +26,7 @@ from core.pipeline_types import BusRoutingStageResult, NonBusRoutingStageResult,
 # within radius per origin) that's hundreds of GB to low TB, far past any
 # reasonable memory budget. v1 bundles are treated as a cache miss below (cheap
 # and safe to recompute) rather than supporting both formats going forward.
-ARTIFACT_SCHEMA_VERSION = 2
+ARTIFACT_SCHEMA_VERSION = 3
 
 
 def _restore_matrix_fast(zip_path: str, arcname: str, dest_path: str):
@@ -152,6 +153,24 @@ def load_impedance_bundle(
         routing_departure_iso = str(np.array(z["routing_departure_iso"]).item())
         origins_sig = str(np.array(z["origins_sig"]).item())
         destinations_sig = str(np.array(z["destinations_sig"]).item())
+        catalog_types = np.array(z["poi_catalog_types"]).astype(str).tolist()
+        catalog_ptr = np.asarray(z["poi_catalog_ptr"], dtype=np.int64)
+        catalog_src_keys = np.asarray(z["poi_catalog_src_keys"])
+        catalog_source_coords = np.asarray(z["poi_catalog_source_coords"], dtype=np.float64)
+
+    # Reconstitute the shared per-poi_type catalog to the same path the live pipeline
+    # writes it to, so the accessibility stage has one place to read it from either way.
+    poi_catalog = {
+        poi_type: {
+            "src_keys": catalog_src_keys[catalog_ptr[i]:catalog_ptr[i + 1]],
+            "source_coords": catalog_source_coords[catalog_ptr[i]:catalog_ptr[i + 1]],
+        }
+        for i, poi_type in enumerate(catalog_types)
+    }
+    Path(cfg.non_bus_poi_catalog_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(cfg.non_bus_poi_catalog_path, "wb") as f:
+        pickle.dump(poi_catalog, f, protocol=pickle.HIGHEST_PROTOCOL)
+    del catalog_src_keys, catalog_source_coords, poi_catalog
 
     source_id_to_row = {str(node_id): idx for idx, node_id in enumerate(node_ids.tolist())}
     with open(cfg.bus_source_id_to_row_path, "w", encoding="utf-8") as f:
@@ -368,6 +387,21 @@ def write_impedance_bundle(
             raise RuntimeError(f"Missing non-bus cache for node_id={node_id}")
         node_cache_paths.append(cache_path)
 
+    # Flatten the per-poi_type catalog (origin-invariant POI identity) into one CSR-style
+    # block, same pattern as build_snap_compact's cand_ptr/cand_coords -- written once
+    # here instead of duplicated into every node's blob.
+    catalog_types = sorted(non_bus.poi_catalog.keys())
+    catalog_ptr = [0]
+    catalog_src_keys_parts = []
+    catalog_source_coords_parts = []
+    for poi_type in catalog_types:
+        bundle = non_bus.poi_catalog[poi_type]
+        catalog_src_keys_parts.append(np.asarray(bundle["src_keys"]))
+        catalog_source_coords_parts.append(
+            np.asarray(bundle["source_coords"], dtype=np.float64).reshape(-1, 2)
+        )
+        catalog_ptr.append(catalog_ptr[-1] + len(bundle["src_keys"]))
+
     save_kwargs = dict(
         schema_version=np.array(ARTIFACT_SCHEMA_VERSION, dtype=np.int32),
         node_ids=node_ids,
@@ -376,6 +410,16 @@ def write_impedance_bundle(
         routing_departure_iso=np.array(bus.routing_departure_iso, dtype=object),
         origins_sig=np.array(bus.origins_sig, dtype=object),
         destinations_sig=np.array(bus.destinations_sig, dtype=object),
+        poi_catalog_types=np.array(catalog_types, dtype=object),
+        poi_catalog_ptr=np.array(catalog_ptr, dtype=np.int64),
+        poi_catalog_src_keys=(
+            np.concatenate(catalog_src_keys_parts) if catalog_src_keys_parts else np.asarray([], dtype="S1")
+        ),
+        poi_catalog_source_coords=(
+            np.concatenate(catalog_source_coords_parts, axis=0)
+            if catalog_source_coords_parts
+            else np.empty((0, 2), dtype=np.float64)
+        ),
     )
 
     # Optional subway modality: stored additively (no schema bump) so existing bundles

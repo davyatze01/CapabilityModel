@@ -245,7 +245,7 @@ def default_experiment_csv(city_slug : str = "Cagliari") -> Path | None:
     # Pick the most recently written CSV (the current run). A lexical sort here
     # is wrong: "Cagliari_capability_9.csv" sorts after "..._80.csv", so string
     # ordering silently grabs a stale file.
-    candidates = glob.glob(f"experiments/{city_slug}_capability_*.csv")
+    candidates = glob.glob(f"experiments/{city_slug}_capability*.csv")
     if not candidates:
         return None
     return Path(max(candidates, key=lambda p: os.path.getmtime(p)))

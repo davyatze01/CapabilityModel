@@ -264,6 +264,18 @@ def _fetch_capability_points(gpkg_path: Path) -> list[dict[str, Any]]:
     ]
 
 
+def _list_hex_ids_from_grid_gpkg(gpkg_path: Path) -> list[str]:
+    """Fallback hex-id source when hex_pois/ wasn't written (e.g. LIGHT_OUTPUT runs):
+    read them straight from the capability grid layer, which generate_spatial_outputs
+    always writes regardless of POI export."""
+    from exports.generate_experiment_shapefiles import GRID_TABLE_NAME
+    if gpkg_path is None or not gpkg_path.exists():
+        return []
+    with sqlite3.connect(gpkg_path) as conn:
+        rows = conn.execute(f'SELECT hex_id FROM "{GRID_TABLE_NAME}"').fetchall()
+    return sorted({str(row[0]) for row in rows if row[0] is not None})
+
+
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     radius_m = 6371000.0
     phi1 = math.radians(lat1)

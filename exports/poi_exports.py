@@ -132,8 +132,8 @@ def _collect_poi_records() -> list[dict[str, Any]]:
             poi = poi.copy()
             poi["geometry"] = gpd.array.GeometryArray(
                 shapely.points(
-                    [c[0] for c in coords],
-                    [c[1] for c in coords],
+                    [c[1] for c in coords],  # lon = x
+                    [c[0] for c in coords],  # lat = y
                 )
             )
             poi = gpd.GeoDataFrame(poi, geometry="geometry", crs="EPSG:4326")
@@ -357,13 +357,29 @@ def _resolve_stream_tasks(
 # Populated in each worker process by _init_stream_worker (via Pool initargs, pickled
 # once per worker at pool startup, not per task).
 _WORKER_POI_INDEX: dict[str, int] = {}
+# None everywhere except Paris (see PipelineConfig.export_hex_radius_m) -- an export-only
+# distance cutoff, independent of the real poi_radius_m used for accessibility/capability.
+_WORKER_EXPORT_HEX_RADIUS_M: float | None = None
+# Shared per-poi_type {src_keys, source_coords} catalog (see exports/artifact_bundle.py):
+# origin-invariant, loaded once per worker. Each node entry's kept_idx indexes into it.
+_WORKER_POI_CATALOG: dict[str, dict] = {}
 _STREAM_TRIM_EVERY_N_NODES = 20  # mirrors non_bus_routing_stage._TRIM_EVERY_N_ORIGINS
 _stream_trim_counter = 0  # per worker process
 
 
-def _init_stream_worker(poi_index: dict[str, int]) -> None:
-    global _WORKER_POI_INDEX
+def _init_stream_worker(
+    poi_index: dict[str, int],
+    export_hex_radius_m: float | None = None,
+    poi_catalog_path: str | None = None,
+) -> None:
+    global _WORKER_POI_INDEX, _WORKER_EXPORT_HEX_RADIUS_M, _WORKER_POI_CATALOG
     _WORKER_POI_INDEX = poi_index
+    _WORKER_EXPORT_HEX_RADIUS_M = export_hex_radius_m
+    if poi_catalog_path and os.path.exists(poi_catalog_path):
+        with open(poi_catalog_path, "rb") as f:
+            _WORKER_POI_CATALOG = pickle.load(f)
+    else:
+        _WORKER_POI_CATALOG = {}
 
 
 def _stream_node_worker(args: tuple[str, str | None]) -> tuple[str, list[int]] | None:
@@ -385,13 +401,28 @@ def _stream_node_worker(args: tuple[str, str | None]) -> tuple[str, list[int]] |
         try:
             with open(path, "rb") as f:
                 payload = pickle.load(f)
+            origin = payload.get("origin") if isinstance(payload, dict) else None
             service_payload = payload.get("services", {}) if isinstance(payload, dict) else {}
             for service in serv.SERVICE_KEYS:
                 for entry in service_payload.get(service, []):
                     if not isinstance(entry, dict):
                         continue
-                    for source_key_raw in entry.get("source_keys", []):
-                        poi_id = _WORKER_POI_INDEX.get(str(source_key_raw))
+                    # source_keys/source_coords are origin-invariant, so they live once in
+                    # the shared _WORKER_POI_CATALOG instead of this entry -- kept_idx
+                    # resolves this entry's POIs into it.
+                    catalog = _WORKER_POI_CATALOG.get(str(entry.get("poi_type")), {})
+                    catalog_keys = catalog.get("src_keys")
+                    catalog_coords = catalog.get("source_coords")
+                    kept_idx = entry.get("kept_idx", [])
+                    if catalog_keys is None:
+                        continue
+                    for i in kept_idx:
+                        source_key_raw = catalog_keys[i].decode("ascii")
+                        if _WORKER_EXPORT_HEX_RADIUS_M is not None and origin is not None and catalog_coords is not None:
+                            c = catalog_coords[i]
+                            if delta_g._haversine_m(origin[0], origin[1], float(c[0]), float(c[1])) > _WORKER_EXPORT_HEX_RADIUS_M:
+                                continue
+                        poi_id = _WORKER_POI_INDEX.get(source_key_raw)
                         if poi_id is not None:
                             poi_seen.add(poi_id)
         except Exception:
@@ -459,7 +490,7 @@ def _stream_hexagon_export(
         processes=pool_workers,
         maxtasksperchild=200,
         initializer=_init_stream_worker,
-        initargs=(poi_index,),
+        initargs=(poi_index, ctx.config.export_hex_radius_m, ctx.config.non_bus_poi_catalog_path),
     ) as pool:
         for idx, result in enumerate(pool.imap_unordered(_stream_node_worker, tasks, chunksize=chunksize), start=1):
             if result is not None:
@@ -567,9 +598,18 @@ def generate_poi_exports(
     # regenerated post-routing once non_bus exists.
     hexagons_written = 0
     if non_bus is not None:
-        writer = HexShardWriter(ctx.config.hex_pois_dir, ctx.config.artifact_slug, scale_powers=True)
-        with _ElapsedTimer(f"POI Export hexagon stream ({len(poi_rows)} POIs)"):
-            hexagons_written = _stream_hexagon_export(poi_rows, ctx, non_bus, writer)
+        writer = HexShardWriter(ctx.config.hex_pois_dir, ctx.config.artifact_slug, scale_powers=True, resume=True)
+        if writer.resumed:
+            print(
+                f"[POI Export] Resuming from a completed hexagon stream "
+                f"({writer.hex_count} hexagons already streamed) -- skipping straight to finalize.",
+                flush=True,
+            )
+            hexagons_written = writer.hex_count
+        else:
+            with _ElapsedTimer(f"POI Export hexagon stream ({len(poi_rows)} POIs)"):
+                hexagons_written = _stream_hexagon_export(poi_rows, ctx, non_bus, writer)
+            writer.mark_scoring_complete()
         if hexagons_written:
             with _ElapsedTimer("POI Export shard finalize + zip"):
                 hex_files_info = writer.finalize(zip_path=ctx.config.hex_pois_zip_path)

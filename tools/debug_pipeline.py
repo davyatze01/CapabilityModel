@@ -5,9 +5,10 @@ completed a full run for the current study_city, since grid_params.json and the 
 exports and non-bus/bus/accessibility/service caches must already be on disk.
 Otherwise, a runtime error will be thrown.
 
-Reads all intermediate pipeline artifacts for a sample of hexagons (4 near the
-grid centre + 1 near each bounding-box corner) and writes a single self-contained
-HTML report that walks through the full computation chain:
+Reads all intermediate pipeline artifacts for a sample of hexagons (one per named
+quartiere/neighborhood, see _select_hexagons; optionally subsampled by LIGHT_MODE
+below) and writes a single self-contained HTML report that walks through the full
+computation chain:
 
   raw impedances → accessibility decay → Choquet service aggregation → ELECTRE TRI
 """
@@ -34,6 +35,19 @@ MAX_VERIFY_ROWS = 150
 # running `total` is still summed over every POI regardless of this cap.
 MAX_AGGREGATION_STEPS = 10
 
+# _select_hexagons picks one hexagon per named quartiere/neighborhood (see its docstring),
+# not a fixed handful -- a big, dense city (Paris) has far more quartieri than Cagliari, so
+# the per-hexagon payload above (already capped) still multiplies out to hundreds of MB.
+# LIGHT_MODE subsamples the selected hexagons down to LIGHT_MODE_MAX_HEXAGONS, evenly
+# strided (not just the first N) so geographic spread across the city is preserved.
+LIGHT_MODE = True
+LIGHT_MODE_MAX_HEXAGONS = 150
+
+# For cities where _select_hexagons splits quartiere (city proper) from comune (wider
+# metropolitan area) selection -- see its docstring -- this bounds how many comune hexes
+# get added on top of the (unbounded) one-per-quartiere set.
+METRO_COMMUNE_SAMPLE = 40
+
 import csv
 import json
 import math
@@ -49,7 +63,7 @@ from utils import services as serv
 from utils.capabilities import electre_tri_details, CAPABILITY_SERVICES
 from utils.services import choquet_integral_details, get_decay_coefficient
 from utils.decay import calculate_rra
-from utils.delta_g import accessibility_from_rra
+from utils.delta_g import accessibility_from_rra, DEFAULT_WALK_SCORE
 
 # Re-use geometry helpers already implemented in inspect_hex_pois.
 from tools.inspect_hex_pois import (
@@ -63,6 +77,7 @@ from tools.inspect_hex_pois import (
     _fetch_capability_points,
     _load_hex_items,
     _fetch_poi_rows,
+    _list_hex_ids_from_grid_gpkg,
 )
 
 
@@ -117,6 +132,7 @@ def _select_hexagons(
     grid_params: dict,
     hex_source: Path,
     capability_points: list[dict],
+    gpkg_path: Path | None = None,
 ) -> list[dict]:
     """Select one representative hexagon per named quartiere (neighbourhood), so the
     debug report covers real neighbourhoods across the city instead of an arbitrary
@@ -139,9 +155,28 @@ def _select_hexagons(
     if quartieri.empty:
         raise RuntimeError(f"No quartiere entries found in {place_labels_path}.")
 
-    hex_ids = _list_hex_ids(hex_source)
+    # Some cities' "quartiere" pool mixes true city neighbourhoods with suburb ones tagged
+    # the same way in OSM (e.g. Paris/mgp_boundary: 806 quartiere entries span the whole
+    # metropolitan area, not just the city). Where arrondissement-named entries exist (Paris
+    # proper), use their convex hull as a city-boundary proxy: keep only quartiere points
+    # inside it, and add a bounded sample of "comune" points from outside as a second group
+    # covering the wider metropolitan area. Cities without arrondissement entries (Cagliari)
+    # fall through unchanged -- every quartiere is selected exactly as before.
+    city_hull = None
+    arrondissements = quartieri[quartieri["name"].str.contains("Arrondissement", case=False, na=False)]
+    if len(arrondissements) >= 3:
+        from shapely.ops import unary_union
+        city_hull = unary_union(arrondissements.geometry.tolist()).convex_hull.buffer(0.01)
+        quartieri = quartieri[quartieri.geometry.within(city_hull)]
+
+    try:
+        hex_ids = _list_hex_ids(hex_source)
+    except FileNotFoundError:
+        hex_ids = _list_hex_ids_from_grid_gpkg(gpkg_path) if gpkg_path else []
+        if hex_ids:
+            print(f"[Debug] hex_pois not found at {hex_source}; using grid layer from {gpkg_path} instead ({len(hex_ids)} hexes).")
     if not hex_ids:
-        raise RuntimeError(f"No hex files found in {hex_source}")
+        raise RuntimeError(f"No hex files found in {hex_source} and no fallback grid at {gpkg_path}")
 
     # Compute centroid for every hex (fast — pure arithmetic).
     centroids: dict[str, tuple[float, float]] = {}
@@ -154,9 +189,8 @@ def _select_hexagons(
     selected: list[dict] = []
     seen_nodes: set[str] = set()
     seen_hexes: set[str] = set()
-    for _, row in quartieri.iterrows():
-        name = str(row["name"])
-        qlat, qlon = row.geometry.y, row.geometry.x
+
+    def _pick_hex_for(name: str, qlat: float, qlon: float, group_type: str) -> None:
         for candidate_hid, (clat, clon) in sorted(
             centroids.items(), key=lambda kv: _haversine_m(kv[1][0], kv[1][1], qlat, qlon)
         ):
@@ -170,7 +204,7 @@ def _select_hexagons(
                 selected.append({
                     "hex_id": candidate_hid,
                     "group": name,
-                    "group_type": "neighborhood",
+                    "group_type": group_type,
                     "hex_centroid": (clat, clon),
                     "node_id": nid,
                     "node_lat": float(node["lat"]),
@@ -178,6 +212,17 @@ def _select_hexagons(
                     "hex_vertices": _hex_geometry(candidate_hid, grid_params),
                 })
                 break
+
+    for _, row in quartieri.iterrows():
+        _pick_hex_for(str(row["name"]), row.geometry.y, row.geometry.x, "neighborhood")
+
+    if city_hull is not None:
+        comuni = places[(places["place_kind"] == "comune") & (~places.geometry.within(city_hull))]
+        if not comuni.empty:
+            stride = max(1, len(comuni) // METRO_COMMUNE_SAMPLE)
+            for _, row in comuni.iloc[::stride][:METRO_COMMUNE_SAMPLE].iterrows():
+                _pick_hex_for(str(row["name"]), row.geometry.y, row.geometry.x, "commune")
+
     return selected
 
 
@@ -208,6 +253,26 @@ def _load_pt_context(cfg: PipelineConfig, mode: str = "bus") -> dict | None:
         return {"mat": mat, "source_to_row": source_to_row, "coord_to_col": coord_to_col}
     except Exception as exc:
         print(f"[Debug] {mode} context load failed: {exc}")
+        return None
+
+
+def _load_housing_context(cfg: PipelineConfig) -> dict | None:
+    """Load per-node OMI buy/rent price from housing/cagliari_nodes_omi.csv.
+    Housing capability is currently Cagliari-only, so this is None elsewhere."""
+    if cfg.study_city != "cagliari":
+        return None
+    housing_csv = Path(__file__).resolve().parent.parent / "housing" / "cagliari_nodes_omi.csv"
+    if not housing_csv.exists():
+        return None
+    try:
+        import pandas as pd
+        df = pd.read_csv(housing_csv)
+        return {
+            str(row.node_id): {"buy": float(row.buy_price_eur_sqm_month), "rent": float(row.rent_price_eur_sqm_month)}
+            for row in df.itertuples(index=False)
+        }
+    except Exception as exc:
+        print(f"[Debug] Housing context load failed: {exc}")
         return None
 
 
@@ -266,8 +331,27 @@ def _bus_time(poi_coord: tuple, source_row: int | None, bus_ctx: dict | None) ->
     return v if v > 0 else None
 
 
-def _build_step1(non_bus: dict, source_row: int | None, bus_ctx: dict | None, subway_source_row: int | None, subway_ctx: dict | None, poi_names: dict[str, str] | None = None) -> dict:
+_POI_CATALOG_CACHE: dict[str, dict] = {}
+
+
+def _load_poi_catalog(cfg: PipelineConfig) -> dict:
+    """Load the shared per-poi_type {src_keys, source_coords} catalog once per path
+    (see exports/artifact_bundle.py) -- node entries only carry kept_idx into it."""
+    path = cfg.non_bus_poi_catalog_path
+    if not path:
+        return {}
+    if path not in _POI_CATALOG_CACHE:
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                _POI_CATALOG_CACHE[path] = pickle.load(f)
+        else:
+            _POI_CATALOG_CACHE[path] = {}
+    return _POI_CATALOG_CACHE[path]
+
+
+def _build_step1(non_bus: dict, source_row: int | None, bus_ctx: dict | None, subway_source_row: int | None, subway_ctx: dict | None, cfg: PipelineConfig, poi_names: dict[str, str] | None = None) -> dict:
     """Step 1 — raw impedances from the non-bus pickle."""
+    poi_catalog = _load_poi_catalog(cfg)
     services_out = []
     for svc in serv.SERVICE_KEYS:
         entries_out = []
@@ -278,31 +362,41 @@ def _build_step1(non_bus: dict, source_row: int | None, bus_ctx: dict | None, su
             except Exception:
                 decay_coeff = None
 
-            imp_walk_list = entry.get("imp_walk", []) or []
-            imp_bike_list = entry.get("imp_bike", []) or []
-            imp_drive_list = entry.get("imp_drive", []) or []
-            poi_coords = entry.get("poi_coords", []) or []
-            source_coords = entry.get("source_coords", []) or []
-            walk_scores = entry.get("walk_path_scores", []) or []
-            source_keys = entry.get("source_keys", []) or []
-            n = len(poi_coords)
+            imp_walk_arr = entry.get("imp_walk")
+            imp_bike_arr = entry.get("imp_bike")
+            imp_drive_arr = entry.get("imp_drive")
+            poi_coords = entry.get("poi_coords")
+            n = int(poi_coords.shape[0]) if poi_coords is not None else 0
+
+            # source_keys/source_coords are origin-invariant, so they live once in the
+            # shared poi_catalog (see exports/artifact_bundle.py) -- kept_idx resolves
+            # this entry's POIs into it, positionally aligned with poi_coords.
+            kept_idx = entry.get("kept_idx", np.empty(0, dtype=np.int32))
+            catalog = poi_catalog.get(poi_type, {})
+            catalog_keys = catalog.get("src_keys")
+            catalog_coords = catalog.get("source_coords")
+            source_keys = catalog_keys[kept_idx].astype(str).tolist() if catalog_keys is not None else [None] * n
+            source_coords = catalog_coords[kept_idx].tolist() if catalog_coords is not None else [(None, None)] * n
+
+            def _reachable(arr, i):
+                return arr is not None and i < len(arr) and not np.isnan(arr[i])
 
             pois_out = []
             for i in range(n):
                 src_coord = source_coords[i] if i < len(source_coords) else (None, None)
-                poi_coord = poi_coords[i] if i < len(poi_coords) else (None, None)
-                src_key = str(source_keys[i]) if i < len(source_keys) else ""
+                poi_coord = poi_coords[i]
+                src_key = str(source_keys[i]) if i < len(source_keys) and source_keys[i] is not None else ""
                 pois_out.append({
                     "source_key": src_key,
                     "name": (poi_names or {}).get(src_key),
                     "src_lat": float(src_coord[0]) if src_coord[0] is not None else None,
                     "src_lon": float(src_coord[1]) if src_coord[1] is not None else None,
-                    "walk_min": float(imp_walk_list[i]) if i < len(imp_walk_list) and imp_walk_list[i] is not None else None,
-                    "bike_min": float(imp_bike_list[i]) if i < len(imp_bike_list) and imp_bike_list[i] is not None else None,
-                    "drive_min": float(imp_drive_list[i]) if i < len(imp_drive_list) and imp_drive_list[i] is not None else None,
-                    "bus_min": _bus_time(poi_coord, source_row, bus_ctx) if poi_coord[0] is not None else None,
-                    "subway_min": _bus_time(poi_coord, subway_source_row, subway_ctx) if poi_coord[0] is not None else None,
-                    "walk_score": float(walk_scores[i]) if i < len(walk_scores) and walk_scores[i] is not None else None,
+                    "walk_min": float(imp_walk_arr[i]) if _reachable(imp_walk_arr, i) else None,
+                    "bike_min": float(imp_bike_arr[i]) if _reachable(imp_bike_arr, i) else None,
+                    "drive_min": float(imp_drive_arr[i]) if _reachable(imp_drive_arr, i) else None,
+                    "bus_min": _bus_time(poi_coord, source_row, bus_ctx),
+                    "subway_min": _bus_time(poi_coord, subway_source_row, subway_ctx),
+                    "walk_score": DEFAULT_WALK_SCORE if _reachable(imp_walk_arr, i) else None,
                 })
             pois_out.sort(key=lambda p: p["walk_min"] if p["walk_min"] is not None else float("inf"))
             n_total = len(pois_out)
@@ -379,6 +473,7 @@ def _build_step2(
     poi_names: dict[str, str] | None = None,
 ) -> tuple[dict, dict[str, float]]:
     """Step 2 — accessibility decay applied per mode and merged into poi_type scores."""
+    poi_catalog = _load_poi_catalog(cfg)
     # Deduplicate POI entries by poi_type across services.
     entry_by_poi_type: dict[str, dict] = {}
     for svc in serv.SERVICE_KEYS:
@@ -402,25 +497,38 @@ def _build_step2(
             decay_coeff = 16.0
         beta = math.log(2) / decay_coeff
 
-        imp_walk_list = entry.get("imp_walk", []) or []
-        imp_bike_list = entry.get("imp_bike", []) or []
-        imp_drive_list = entry.get("imp_drive", []) or []
-        poi_coords = entry.get("poi_coords", []) or []
-        source_coords = entry.get("source_coords", []) or []
-        source_keys = entry.get("source_keys", []) or []
-        n = len(poi_coords)
+        imp_walk_arr = entry.get("imp_walk")
+        imp_bike_arr = entry.get("imp_bike")
+        imp_drive_arr = entry.get("imp_drive")
+        poi_coords = entry.get("poi_coords")
+        n = int(poi_coords.shape[0]) if poi_coords is not None else 0
+
+        # source_keys/source_coords are origin-invariant, so they live once in the
+        # shared poi_catalog instead of this per-node entry -- kept_idx resolves this
+        # entry's POIs into it, positionally aligned with poi_coords.
+        kept_idx = entry.get("kept_idx", np.empty(0, dtype=np.int32))
+        catalog = poi_catalog.get(pt, {})
+        catalog_keys = catalog.get("src_keys")
+        catalog_coords = catalog.get("source_coords")
+        source_keys = catalog_keys[kept_idx].astype(str).tolist() if catalog_keys is not None else [None] * n
+        source_coords = catalog_coords[kept_idx].tolist() if catalog_coords is not None else [(None, None)] * n
+
+        def _val(arr, i):
+            if arr is None or i >= len(arr) or np.isnan(arr[i]):
+                return None
+            return float(arr[i])
 
         pois_out = []
         poi_accs: list[float] = []  # per-POI accessibility (single-element RRA transform)
         for i in range(n):
-            wm = float(imp_walk_list[i]) if i < len(imp_walk_list) and imp_walk_list[i] is not None else None
-            bm = float(imp_bike_list[i]) if i < len(imp_bike_list) and imp_bike_list[i] is not None else None
-            dm = float(imp_drive_list[i]) if i < len(imp_drive_list) and imp_drive_list[i] is not None else None
-            poi_coord = poi_coords[i] if i < len(poi_coords) else (None, None)
-            bus_m = _bus_time(poi_coord, source_row, bus_ctx) if poi_coord[0] is not None else None
-            subway_m = _bus_time(poi_coord, subway_source_row, subway_ctx) if poi_coord[0] is not None else None
+            wm = _val(imp_walk_arr, i)
+            bm = _val(imp_bike_arr, i)
+            dm = _val(imp_drive_arr, i)
+            poi_coord = poi_coords[i]
+            bus_m = _bus_time(poi_coord, source_row, bus_ctx)
+            subway_m = _bus_time(poi_coord, subway_source_row, subway_ctx)
             src_coord = source_coords[i] if i < len(source_coords) else (None, None)
-            src_key = str(source_keys[i]) if i < len(source_keys) else ""
+            src_key = str(source_keys[i]) if i < len(source_keys) and source_keys[i] is not None else ""
 
             dw = math.exp(-beta * wm) if wm is not None else 0.0
             db = math.exp(-beta * bm) if bm is not None else 0.0
@@ -472,7 +580,7 @@ def _build_step2(
         # Apply the same per-service ownership drop so a non-owning poi_type does not
         # overwrite the owning value (mirrors accessibility_stage zeroing dropped pairs).
         drop_for_pt = (drop_map or {}).get(pt, ())
-        src_keys = entry.get("source_keys", []) or []
+        src_keys = source_keys
         for i, a in enumerate(poi_accs):
             if i < len(src_keys) and src_keys[i] and a > 0.0:
                 if str(src_keys[i]) in drop_for_pt:
@@ -731,6 +839,30 @@ def _build_step4(svc_ctx: dict | None, svc_node_row: int | None) -> dict:
     return {"capabilities": capabilities_out}
 
 
+def _build_step5_housing(node_id: str | None, housing_ctx: dict | None) -> dict | None:
+    """Step 5 — housing capability ELECTRE TRI classification, mirroring
+    Step 4's shape. None if housing data isn't available for this city/node
+    (e.g. an origin in an OMI zone with no published prices, like E5)."""
+    if housing_ctx is None or node_id is None:
+        return None
+    prices = housing_ctx.get(str(node_id))
+    if prices is None:
+        return {"available": False}
+
+    from housing.housing_capability import classify_housing_opportunities, electre_tri_housing_details, housing_category_colors
+
+    surface_by_curve, _ = classify_housing_opportunities({"buying": prices["buy"], "renting": prices["rent"]})
+    details = _sanitise(electre_tri_housing_details(surface_by_curve))
+    category_color = housing_category_colors()[details["assigned_category"]]
+    return {
+        "available": True,
+        "buy_price_eur_sqm_month": prices["buy"],
+        "rent_price_eur_sqm_month": prices["rent"],
+        "electre": details,
+        "category_color": category_color,
+    }
+
+
 def _build_chain(
     hex_entry: dict,
     cfg: PipelineConfig,
@@ -742,6 +874,7 @@ def _build_chain(
     gpkg_path: Path | None,
     drop_map: dict[str, set[str]] | None = None,
     poi_names: dict[str, str] | None = None,
+    housing_ctx: dict | None = None,
 ) -> dict:
     node_id = hex_entry.get("node_id")
     vertices_latlng = [[lat, lon] for lon, lat in hex_entry["hex_vertices"]]
@@ -762,6 +895,7 @@ def _build_chain(
         "step2": None,
         "step3": None,
         "step4": None,
+        "housing": _build_step5_housing(node_id, housing_ctx),
         "verify": None,
     }
 
@@ -797,7 +931,7 @@ def _build_chain(
         svc_node_row = svc_ctx["node_to_row"].get(str(node_id))
 
     chain["has_data"] = True
-    chain["step1"] = _build_step1(non_bus, bus_source_row, bus_ctx, subway_source_row, subway_ctx, poi_names)
+    chain["step1"] = _build_step1(non_bus, bus_source_row, bus_ctx, subway_source_row, subway_ctx, cfg, poi_names)
     chain["step2"], acc_by_source_key = _build_step2(non_bus, bus_source_row, subway_source_row, bus_ctx, subway_ctx, acc_ctx, acc_node_row, cfg, drop_map, poi_names)
     chain["step3"] = _build_step3(acc_ctx, acc_node_row, svc_ctx, svc_node_row)
     chain["step4"] = _build_step4(svc_ctx, svc_node_row)
@@ -900,6 +1034,7 @@ _HTML_TEMPLATE = """\
 </head>
 <body>
 <div class="layout">
+  __HEX_SCRIPTS__
   <div class="left">
     <div id="map"></div>
     <div class="hex-list" id="hex-list"></div>
@@ -912,8 +1047,17 @@ _HTML_TEMPLATE = """\
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
   integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 <script>
-const CHAIN_DATA = __CHAIN_DATA__;
+const MAP_DATA = __CHAIN_DATA__;
 const SUBWAY_ENABLED = __SUBWAY_ENABLED__;
+
+const heavyCache = {};
+function getHeavyData(hexId){
+  if(!(hexId in heavyCache)){
+    const el = document.getElementById("hex-data-" + hexId);
+    heavyCache[hexId] = el ? JSON.parse(el.textContent) : {};
+  }
+  return heavyCache[hexId];
+}
 
 // ---- Map ----
 const map = L.map("map");
@@ -926,7 +1070,7 @@ let poiLayer = null;
 const hexLayers = {};
 const allBounds = [];
 
-for(const [hexId, chain] of Object.entries(CHAIN_DATA)){
+for(const [hexId, chain] of Object.entries(MAP_DATA)){
   const color = "#1d4ed8";
   const fillColor = "#60a5fa";
   const poly = L.polygon(chain.hex_vertices, {
@@ -943,7 +1087,7 @@ if(allBounds.length) map.fitBounds(allBounds, {padding:[20,20]});
 
 // ---- Hex list buttons ----
 const hexList = document.getElementById("hex-list");
-for(const [hexId, chain] of Object.entries(CHAIN_DATA)){
+for(const [hexId, chain] of Object.entries(MAP_DATA)){
   const btn = document.createElement("span");
   btn.className = "hex-btn " + chain.group_type;
   btn.textContent = chain.group + " (" + hexId + ")";
@@ -963,19 +1107,16 @@ function selectHex(hexId){
   if(poly) poly.setStyle({weight:3, fillOpacity:0.35});
   document.querySelector(`.hex-btn[data-hex-id="${hexId}"]`)?.classList.add("active");
 
-  const chain = CHAIN_DATA[hexId];
+  const light = MAP_DATA[hexId];
+  const chain = light.has_data ? Object.assign({}, light, getHeavyData(hexId)) : light;
 
   // Draw POI markers for step 1 pois
   if(poiLayer){ poiLayer.remove(); poiLayer = null; }
-  if(chain.step1){
-    const markers = [];
-    chain.step1.services.forEach(s => s.entries.forEach(e => e.pois.forEach(p => {
-      if(p.src_lat != null)
-        markers.push(L.circleMarker([p.src_lat, p.src_lon],{radius:4,color:"#0f766e",weight:1,fillColor:"#14b8a6",fillOpacity:0.9})
-          .bindTooltip(`${e.poi_type}<br>${poiLabel(p)}`));
-    })));
-    if(markers.length){ poiLayer = L.layerGroup(markers).addTo(map); }
-  }
+  const markers = (light.poi_markers || []).map(p =>
+    L.circleMarker([p.src_lat, p.src_lon],{radius:4,color:"#0f766e",weight:1,fillColor:"#14b8a6",fillOpacity:0.9})
+      .bindTooltip(`${p.poi_type}<br>${poiLabel(p)}`)
+  );
+  if(markers.length){ poiLayer = L.layerGroup(markers).addTo(map); }
   map.fitBounds(chain.hex_vertices, {padding:[30,30]});
 
   renderChain(chain);
@@ -1355,6 +1496,74 @@ function renderChain(chain){
         `<div class="muted" style="margin-top:4px">Showing ${vr.rows.length} of ${vr.n_pois} POIs.</div>`);
   }
   el.appendChild(p5.panel);
+
+  // Step 6 — Housing affordability
+  const p6 = makePanel("6","Housing Capability","ELECTRE TRI — combines renting and buying access into one Q1..Q5 category. No veto: renting and buying are two routes to the same household situation.");
+  const h = chain.housing;
+  if(!h){
+    p6.body.insertAdjacentHTML("beforeend", `<div class="muted">Housing data not available for this city.</div>`);
+  } else if(!h.available){
+    p6.body.insertAdjacentHTML("beforeend", `<div class="muted">No OMI price data for this node's zone (e.g. a zone like E5 with no published quotations) — origin is dropped from the housing layer.</div>`);
+  } else {
+    const e = h.electre;
+    p6.body.insertAdjacentHTML("beforeend",`
+      <div class="section-label">Housing
+        <span style="margin-left:8px"><span class="score-chip" style="background:${h.category_color};color:#1a1a1a">${e.assigned_category}</span></span>
+      </div>
+      <div class="muted" style="margin:4px 0 10px">
+        buy = <b>${h.buy_price_eur_sqm_month.toFixed(2)} €/sqm/mo</b>
+        &nbsp;|&nbsp; rent = <b>${h.rent_price_eur_sqm_month.toFixed(2)} €/sqm/mo</b>
+      </div>`);
+    (e.boundaries||[]).slice().reverse().forEach(b => {
+      const bv = b.boundary_value;
+      const terms = b.concordance_terms || [];
+      const cred = b.credibility;
+      const outranks = b.outranks_boundary;
+
+      const concRows = terms.map(t => {
+        const d = t.difference_vs_boundary ?? 0;
+        const dStr = (d>=0?"+":"")+d.toFixed(2);
+        const ruleCls = t.rule==="full"?"rule-full":t.rule==="none"?"rule-none":"rule-partial";
+        return `<tr>
+          <td>${t.criterion}</td>
+          <td>${(t.surface??0).toFixed(2)}</td>
+          <td>${bv.toFixed(2)}</td>
+          <td class="${d>=0?"d-pos":"d-neg"}">${dStr}</td>
+          <td><b>${(t.partial_concordance??0).toFixed(3)}</b></td>
+          <td class="${ruleCls}">${t.rule}</td>
+        </tr>`;
+      }).join("");
+
+      const cTerms = terms.map(t=>`${t.weight.toFixed(2)}×${(t.partial_concordance??0).toFixed(3)}`).join(" + ");
+      const decisionCls = outranks ? "outranks-yes" : "outranks-no";
+      const decisionTxt = outranks
+        ? `σ = ${cred?.toFixed(3)} ≥ ${e.lambda_cut} → <span class="outranks-yes">✓ OUTRANKS b = ${bv}</span>`
+        : `σ = ${cred?.toFixed(3)} < ${e.lambda_cut} → <span class="outranks-no">✗ does not outrank b = ${bv}</span>`;
+
+      p6.body.insertAdjacentHTML("beforeend",`
+        <div class="boundary-block">
+          <div class="boundary-header">Boundary b = ${bv} sqm</div>
+          <div class="b-step"><span class="b-num">①</span><span class="b-calc">Partial concordance c_j per criterion</span></div>
+          <div class="b-table">
+            <table><thead><tr><th>Criterion</th><th>ς (sqm)</th><th>b</th><th>d = ς−b</th><th>c_j</th><th>Rule</th></tr></thead>
+            <tbody>${concRows}</tbody></table>
+          </div>
+          <div class="b-step"><span class="b-num">②</span><span class="b-calc">σ = ${cTerms} = <b>${cred?.toFixed(3)}</b> (no veto)</span></div>
+          <div class="b-decision ${decisionCls}">③ ${decisionTxt}</div>
+        </div>`);
+    });
+
+    const ob = (e.boundaries||[]).filter(b=>b.outranks_boundary).map(b=>b.boundary_value);
+    const summaryTxt = ob.length
+      ? `Outranks up to b = ${Math.max(...ob)} sqm → category just above it`
+      : `Does not outrank any boundary → lowest category`;
+    p6.body.insertAdjacentHTML("beforeend",`
+      <div class="elec-summary">
+        <b>Assignment:</b> ${summaryTxt}
+        &nbsp;→&nbsp; category = <span class="score-chip" style="background:${h.category_color};color:#1a1a1a">${e.assigned_category}</span>
+      </div>`);
+  }
+  el.appendChild(p6.panel);
 }
 
 let _tgSeq = 0;
@@ -1413,8 +1622,35 @@ function timeClass(v){
 
 
 def _build_html(chain_data: dict, slug: str, subway_enabled: bool) -> str:
-    payload = json.dumps(chain_data, ensure_ascii=False, separators=(",", ":"))
-    return _HTML_TEMPLATE.replace("__SUBWAY_ENABLED__", json.dumps(subway_enabled)).replace("__CHAIN_DATA__", payload)
+    map_data = {}
+    hex_scripts = []
+    for hex_id, chain in chain_data.items():
+        markers_by_key: dict[str, dict] = {}
+        if chain.get("step1"):
+            for s in chain["step1"]["services"]:
+                for e in s["entries"]:
+                    for p in e["pois"]:
+                        if p["src_lat"] is not None and p["source_key"] not in markers_by_key:
+                            markers_by_key[p["source_key"]] = {
+                                "poi_type": e["poi_type"], "source_key": p["source_key"],
+                                "name": p["name"], "src_lat": p["src_lat"], "src_lon": p["src_lon"],
+                            }
+        map_data[hex_id] = {
+            "hex_id": chain["hex_id"], "group": chain["group"], "group_type": chain["group_type"],
+            "node_id": chain["node_id"], "node_lat": chain["node_lat"], "node_lon": chain["node_lon"],
+            "hex_vertices": chain["hex_vertices"], "has_data": chain["has_data"],
+            "poi_markers": list(markers_by_key.values()),
+        }
+        heavy = {k: chain[k] for k in ("step1", "step2", "step3", "step4", "housing", "verify")}
+        hex_scripts.append(
+            f'<script type="application/json" id="hex-data-{hex_id}">'
+            f'{json.dumps(heavy, ensure_ascii=False, separators=(",", ":"))}</script>'
+        )
+    payload = json.dumps(map_data, ensure_ascii=False, separators=(",", ":"))
+    return (_HTML_TEMPLATE
+            .replace("__SUBWAY_ENABLED__", json.dumps(subway_enabled))
+            .replace("__CHAIN_DATA__", payload)
+            .replace("__HEX_SCRIPTS__", "\n".join(hex_scripts)))
 
 # ---------------------------------------------------------------------------
 # This function is called by main.py to generate the debug pipeline 
@@ -1464,14 +1700,19 @@ def run_debug_pipeline(study_city = STUDY_CITY, output = None) -> None:
         capability_points = [p for p in capability_points if str(p["node_id"]) in cached_nodes]
     print(f"[Debug] Capability points with non-bus cache: {len(capability_points)}")
 
-    selected = _select_hexagons(cfg, grid_params, hex_source, capability_points)
+    selected = _select_hexagons(cfg, grid_params, hex_source, capability_points, gpkg_path=spatial_gpkg)
+    if LIGHT_MODE and len(selected) > LIGHT_MODE_MAX_HEXAGONS:
+        stride = max(1, len(selected) // LIGHT_MODE_MAX_HEXAGONS)
+        selected = selected[::stride][:LIGHT_MODE_MAX_HEXAGONS]
+        print(f"[Debug] LIGHT_MODE: subsampled to {len(selected)} hexagons (stride={stride})", flush=True)
     print(f"[Debug] Selected {len(selected)} hexagons: {[h['hex_id'] for h in selected]}")
 
     bus_ctx = _load_pt_context(cfg, "bus")
     subway_ctx = _load_pt_context(cfg, "metro") if cfg.enable_subway else None
     acc_ctx = _load_accessibility_context(cfg)
     svc_ctx = _load_service_context(cfg)
-    print(f"[Debug] bus={'ok' if bus_ctx else 'missing'} acc={'ok' if acc_ctx else 'missing'} subway={'ok' if subway_ctx else 'missing'} svc={'ok' if svc_ctx else 'missing'}")
+    housing_ctx = _load_housing_context(cfg)
+    print(f"[Debug] bus={'ok' if bus_ctx else 'missing'} acc={'ok' if acc_ctx else 'missing'} subway={'ok' if subway_ctx else 'missing'} svc={'ok' if svc_ctx else 'missing'} housing={'ok' if housing_ctx else 'missing'}")
     if cfg.enable_subway and subway_ctx is None:
         raise RuntimeError(f"Subway is none even if enabled, please check the subway artifacts in artifacts/{cfg.artifact_slug}/subway and the paths in" \
         f" {cfg.public_transport_paths("metro")}")
@@ -1490,7 +1731,7 @@ def run_debug_pipeline(study_city = STUDY_CITY, output = None) -> None:
     for hex_entry in selected:
         hid = hex_entry["hex_id"]
         print(f"[Debug] Building chain for {hid} ({hex_entry['group']}) node={hex_entry['node_id']}")
-        chain_data[hid] = _build_chain(hex_entry, cfg, bus_ctx, acc_ctx, svc_ctx, subway_ctx, hex_source, gpkg_path, poi_drop_map, poi_names)
+        chain_data[hid] = _build_chain(hex_entry, cfg, bus_ctx, acc_ctx, svc_ctx, subway_ctx, hex_source, gpkg_path, poi_drop_map, poi_names, housing_ctx)
 
     html = _build_html(chain_data, slug, cfg.enable_subway)
 

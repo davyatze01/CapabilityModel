@@ -75,6 +75,21 @@ def osmid_from_source_key(source_key: object) -> str | None:
     return None
 
 
+# poi_types where affordability plausibly gates access -- market/discretionary spending, not
+# free public space or subsidized public healthcare/social services. Everything NOT listed
+# here gets u=1.0 regardless of a profile's affordability value (see Profile.utility_for).
+PAID_POI_TYPES: frozenset[str] = frozenset({
+    "organised_sport_indoor",      # gym, climbing wall, ice rink, bowling
+    "organized_sport_outdoor",     # private pitch, golf course, stadium, horse riding
+    "informal_sport_indoor",       # fitness_centre, indoor pool, dance studio
+    "passive_consumption",         # cinema, theatre, events venue
+    "mediated_experience",         # museum, gallery, tourist attraction
+    "on_site_dining",              # restaurant, cafe, pub, bar
+    "takeaway_consumption",        # bakery, fast food, ice cream
+    "therapeutic_wellness",        # spa, sauna, massage (private wellness, not medical care)
+})
+
+
 @dataclass(frozen=True)
 class Profile:
     """One individual profile / persona.
@@ -127,12 +142,13 @@ class Profile:
         overrides.update(self.extra_config_overrides)
         return overrides
 
-    def utility_for(self, source_key: object) -> float:
-        """Per-POI utility multiplier u(y): canteen override when applicable, else affordability."""
+    def utility_for(self, source_key: object, poi_type: str) -> float:
+        """Per-POI utility multiplier u(y): canteen override when applicable, else affordability
+        for market/paid poi_types (PAID_POI_TYPES), else 1.0 for free/public ones."""
         osmid = osmid_from_source_key(source_key)
         if osmid is not None and osmid in self.canteen_source_keys:
             return self.canteen_utility
-        return self.affordability
+        return self.affordability if poi_type in PAID_POI_TYPES else 1.0
 
 
 # --- Named personas -------------------------------------------------------------------

@@ -30,6 +30,8 @@ scikit-learn>=1.4,<1.6
 matplotlib>=3.8,<4.0
 seaborn>=0.13,<1.0
 pyDecision>=5.1,<6.0
+# analysis/generate_scenario_report.py: renders docs/SCENARIO_VALIDATION_REPORT.html to PDF
+weasyprint>=69.0,<70.0
 
 # ops/non_bus_routing_bench.py only: in-process C++ graph library, one of the routing
 # backends benchmarked against the production scipy path. MIT-licensed, actively

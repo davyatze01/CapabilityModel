@@ -292,5 +292,9 @@ gtfs/_extracts/
 outputs/sensitivity/upstream/
 interfaccia/resources/hexagon_service_pois.json
 
+# Ad-hoc zip archives duplicating already-ignored or already-tracked content
+/scenarios.zip
+housing/plots.zip
+
 # Telegram notification credentials (see notify.py)
 notify_config.json

@@ -84,6 +84,35 @@ def shard_name_for_hex(hex_id: str, block: int = SHARD_BLOCK) -> str:
     return f"sx{h:04d}"
 
 
+_SHARD_CALL_RE = re.compile(r'^__onHexShardZ\("([^"]*)","([^"]*)"\);$')
+
+
+def read_shard_poi_ids(out_dir: str, shard_name: str) -> dict[str, list[int]]:
+    """Decode one already-finalized shard file back to {hex_id: [poi_id, ...]}.
+
+    Counterpart to hex_shard_loader.js's client-side decode, for a Python
+    consumer (score_report.py) that wants to reuse a prior HexShardWriter
+    pass's per-hexagon POI membership instead of recomputing it. Records may
+    be bare poi_id ints (id-only export) or [poi_id, sp_flat, cp_flat]
+    (scored export) -- either way only the id is extracted.
+    """
+    path = os.path.join(out_dir, f"{shard_name}.js")
+    if not os.path.isfile(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        content = f.read().strip()
+    m = _SHARD_CALL_RE.match(content)
+    if not m:
+        raise ValueError(f"Unrecognized shard file format: {path}")
+    packed = m.group(2)
+    payload = zlib.decompress(base64.b64decode(packed)).decode("utf-8")
+    hexmap: dict[str, list[Any]] = json.loads(payload)
+    return {
+        hex_id: [rec if isinstance(rec, int) else rec[0] for rec in records]
+        for hex_id, records in hexmap.items()
+    }
+
+
 def service_keys() -> list[str]:
     return list(serv.SERVICE_KEYS)
 
