@@ -1,6 +1,7 @@
 from utils import graphml, decay, get_impedance, services as serv
 import math
 import os
+import csv
 import json
 import hashlib
 from collections import OrderedDict
@@ -189,6 +190,19 @@ def _haversine_m(lat1, lon1, lat2, lon2):
     dlambda = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
     return 2.0 * r * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+
+
+def _haversine_m_np(lat1, lon1, lat2, lon2):
+    """Array version of _haversine_m: one fixed origin vs many destinations."""
+    import numpy as np
+
+    r = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+    a = np.sin(dphi / 2.0) ** 2 + math.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0) ** 2
+    return 2.0 * r * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
 
 
 def _select_best_snap_for_origin(origin, source_coord, candidates):
@@ -679,6 +693,49 @@ def accessibility_from_rra(RRA, poi_type=None, contribution_coefficient=None):
     return out
 
 
+_DEST_COL_MAP: dict[tuple[float, float], int] | None = None
+
+
+def _dest_col_map(config: PipelineConfig):
+    """Lazily build {rounded (lat, lon) -> impedance-matrix column}, shared by bus and subway.
+
+    Bus and subway route against the same snapped destination set, so a single column
+    addresses both matrices -- only the values behind it differ. The check below turns that
+    shared assumption into a loud failure if a city ever routes metro against a different
+    destination set.
+
+    Cached per worker process: the map is ~140k entries and every origin needs it. Rounding
+    matches accessibility_stage's old _BUS_DEST_COORD_TO_COL exactly -- a POI must land on
+    the same column on the write side as the read side, or its transit impedance silently
+    comes from the wrong stop.
+    """
+    global _DEST_COL_MAP
+    if _DEST_COL_MAP is not None:
+        return _DEST_COL_MAP
+
+    def _load(dest_id_to_col_path, dest_csv_path):
+        with open(dest_id_to_col_path, encoding="utf-8") as f:
+            id_to_col = {str(k): int(v) for k, v in json.load(f).items()}
+        out: dict[tuple[float, float], int] = {}
+        with open(dest_csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                col = id_to_col.get(row["id"])
+                if col is not None:
+                    out[(round(float(row["lat"]), 6), round(float(row["lon"]), 6))] = int(col)
+        return out
+
+    bus = _load(config.bus_dest_id_to_col_path, config.bus_routing_destinations_input_path)
+    if config.enable_subway:
+        subway = _load(config.subway_dest_id_to_col_path, config.subway_routing_destinations_input_path)
+        if subway != bus:
+            raise RuntimeError(
+                "Subway routes against a different destination set than bus, so one dest_col "
+                "can no longer address both impedance matrices."
+            )
+    _DEST_COL_MAP = bus
+    return _DEST_COL_MAP
+
+
 def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origine, snap_compact, feature=None, radius_m=None, tags=None, origin_nodes_by_mode=None):
     """Compute non-bus impedance ingredients for one origin/POI type.
 
@@ -692,8 +749,10 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
     - tags: optional tags filter used for query identity.
 
     Outputs:
-    - dict with per-POI impedance arrays plus the origin-snapped destination coords
-      (`poi_coords`), source keys and source coords, positionally aligned.
+    - dict with per-POI impedance arrays plus the resolved addressing they are read
+      through -- `dest_col` (the origin-snapped column addressing BOTH the bus and subway
+      matrices, -1 when the POI reaches no stop) and `in_radius` -- all positionally
+      aligned with `kept_idx`, which indexes the shared per-poi_type catalog.
     """
     import numpy as np
 
@@ -707,7 +766,8 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
 
     empty = {
         "kept_idx": np.empty(0, dtype=np.int32),
-        "poi_coords": np.empty((0, 2), dtype=np.float64),
+        "dest_col": np.empty(0, dtype=np.int32),
+        "in_radius": np.empty(0, dtype=bool),
         "imp_walk": np.empty(0, dtype=np.float32),
         "imp_bike": np.empty(0, dtype=np.float32),
         "imp_drive": np.empty(0, dtype=np.float32),
@@ -831,9 +891,29 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
         else:
             poi_coords[pos] = sc
 
+    # Resolve here what the accessibility stage used to re-derive from these coords on every
+    # read: which bus/subway matrix column this POI reads, and whether its SNAPPED position
+    # passes the radius test (kept_idx above filtered on the SOURCE position, so the two
+    # differ for POIs that snap across the boundary). Storing the resolved integers instead
+    # of the coords is what keeps the impedance artifact from shipping duplicated geometry.
+    dest_map = _dest_col_map(config)
+
+    if radius_m is not None:
+        in_radius = _haversine_m_np(origine[0], origine[1], poi_coords[:, 0], poi_coords[:, 1]) <= radius_m
+    else:
+        in_radius = np.ones(n, dtype=bool)
+
+    dest_col = np.full(n, -1, dtype=np.int32)
+    for pos in range(n):
+        coord_key = (round(float(poi_coords[pos, 0]), 6), round(float(poi_coords[pos, 1]), 6))
+        dc = dest_map.get(coord_key)
+        if dc is not None:
+            dest_col[pos] = dc
+
     return {
         "kept_idx": kept_idx.astype(np.int32),
-        "poi_coords": poi_coords,
+        "dest_col": dest_col,
+        "in_radius": in_radius,
         "imp_walk": imp_walk,
         "imp_bike": imp_bike,
         "imp_drive": imp_drive,

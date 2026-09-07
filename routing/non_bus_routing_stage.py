@@ -337,17 +337,19 @@ def _process_node(node_item):
                     f"Non-bus routing failed for node_id={node_id}, poi_type={query.poi_type}, cause={exc!r}"
                 ) from exc
 
-            # poi_coords (origin-snapped bus destinations) is produced directly by
-            # accessibility_non_bus_from_snap_map from the compact snap bundle, so the old
-            # per-item bus-snap loop here is gone. source_keys/source_coords are
-            # origin-invariant -- kept_idx indexes them from the shared per-poi_type
-            # catalog written once into the artifact instead of duplicating them here.
+            # dest_col (the origin-snapped column addressing both the bus and subway
+            # matrices) and in_radius are resolved by accessibility_non_bus_from_snap_map, so
+            # neither the old per-item bus-snap loop nor the snapped coords themselves are
+            # kept here. source_keys/source_coords are origin-invariant -- kept_idx indexes
+            # them from the shared per-poi_type catalog written once into the artifact
+            # instead of duplicating them here.
             entries.append({
                 "poi_type": query.poi_type,
                 "imp_walk": nb["imp_walk"],
                 "imp_bike": nb["imp_bike"],
                 "imp_drive": nb["imp_drive"],
-                "poi_coords": nb["poi_coords"],
+                "dest_col": nb["dest_col"],
+                "in_radius": nb["in_radius"],
                 "kept_idx": nb["kept_idx"],
             })
 

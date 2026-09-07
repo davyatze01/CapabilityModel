@@ -1,9 +1,9 @@
 import csv
 import gc
 import json
+import lzma
 import os
 import pickle
-import shutil
 import struct
 import threading
 import time
@@ -16,6 +16,7 @@ from numpy.lib import format as npy_format
 from tqdm import tqdm
 
 from core.pipeline_types import BusRoutingStageResult, NonBusRoutingStageResult, PipelineContext
+from utils import services as serv
 
 # v2: non_bus_blobs moved from one big in-memory object array (a single npz key
 # holding every node's cache bytes at once) to individual per-node entries
@@ -26,60 +27,303 @@ from core.pipeline_types import BusRoutingStageResult, NonBusRoutingStageResult,
 # within radius per origin) that's hundreds of GB to low TB, far past any
 # reasonable memory budget. v1 bundles are treated as a cache miss below (cheap
 # and safe to recompute) rather than supporting both formats going forward.
-ARTIFACT_SCHEMA_VERSION = 3
+ARTIFACT_SCHEMA_VERSION = 4
 
 
-def _restore_matrix_fast(zip_path: str, arcname: str, dest_path: str):
-    """Copy a ZIP_STORED (uncompressed) float32 .npy member's raw bytes straight to
-    `dest_path` as a flat binary file, without ever materializing the array in RAM.
+def _shuffle_bytes(arr: np.ndarray) -> bytes:
+    """Group a fixed-width array's byte planes together (all byte 0s, then all byte 1s, ...).
 
-    np.load()/NpzFile.__getitem__ always decompresses a member fully into a new
-    numpy array before you can even read its .shape -- for a 24.7 GB Paris matrix
-    that's a full-size heap allocation just to then copy it again into the memmap
-    file. np.savez writes members uncompressed (ZIP_STORED) and C-contiguous, so
-    the raw bytes on disk already ARE the memmap's target layout; we only need to
-    locate where they start (past the zip local-file-header and the .npy header)
-    and stream them straight across in fixed-size chunks.
-
-    Returns the array's shape on success, or None if the fast path doesn't apply
-    (compressed member, non-C-contiguous, unexpected dtype, or any parsing
-    surprise), so the caller can fall back to the safe np.load path.
+    Impedances are float32 minutes spanning a narrow range, so their exponent bytes are
+    nearly constant while their mantissa bytes are noise. Interleaved, every 4th byte is
+    compressible and the compressor gets nothing; planed, the exponent bytes form long runs.
+    Measured on real blobs: 1.94x with lzma vs 1.48x on the raw interleaved bytes. Exactly
+    reversible -- this is a permutation, not a quantization.
     """
-    try:
-        with zipfile.ZipFile(zip_path) as zf:
-            zinfo = zf.getinfo(arcname)
-            if zinfo.compress_type != zipfile.ZIP_STORED:
-                return None
-            with open(zip_path, "rb") as f:
-                f.seek(zinfo.header_offset)
-                local_header = f.read(30)
-                if local_header[:4] != b"PK\x03\x04":
-                    return None
-                fname_len, extra_len = struct.unpack("<HH", local_header[26:30])
-                f.seek(zinfo.header_offset + 30 + fname_len + extra_len)
-                major, _minor = npy_format.read_magic(f)
-                if major == 1:
-                    shape, fortran_order, dtype = npy_format.read_array_header_1_0(f)
-                else:
-                    shape, fortran_order, dtype = npy_format.read_array_header_2_0(f)
-                if fortran_order or dtype != np.dtype(np.float32):
-                    return None
-                data_offset = f.tell()
-                nbytes = int(np.prod(shape)) * dtype.itemsize
-                f.seek(data_offset)
-                with open(dest_path, "wb") as fdst:
-                    remaining = nbytes
-                    chunk_size = 1 << 26  # 64 MB
-                    while remaining > 0:
-                        buf = f.read(min(chunk_size, remaining))
-                        if not buf:
-                            raise IOError("unexpected EOF while copying matrix bytes")
-                        fdst.write(buf)
-                        remaining -= len(buf)
-        return shape
-    except Exception as exc:
-        print(f"[Artifact] Fast matrix restore for {arcname} failed ({exc}); falling back.", flush=True)
-        return None
+    v = arr.view(np.uint8).reshape(-1, arr.itemsize)
+    return v.T.copy().tobytes()
+
+
+def _unshuffle_bytes(buf: bytes, dtype, n: int) -> np.ndarray:
+    itemsize = np.dtype(dtype).itemsize
+    v = np.frombuffer(buf, dtype=np.uint8).reshape(itemsize, n)
+    return np.ascontiguousarray(v.T).view(dtype).reshape(n)
+
+
+def _pack_kept_idx(kept_idx: np.ndarray, catalog_size: int) -> bytes:
+    """kept_idx (sorted int32 positions) -> one bit per catalog entry.
+
+    Coverage runs ~47% of the catalog and the indices are monotonic, so a presence bitmask
+    is ~15x smaller than the int32 list it replaces.
+    """
+    mask = np.zeros(catalog_size, dtype=bool)
+    mask[kept_idx] = True
+    return np.packbits(mask).tobytes()
+
+
+def _unpack_kept_idx(buf: bytes, catalog_size: int) -> np.ndarray:
+    mask = np.unpackbits(np.frombuffer(buf, dtype=np.uint8), count=catalog_size).astype(bool)
+    return np.nonzero(mask)[0].astype(np.int32)
+
+
+_SHUFFLE_CHUNK_ELEMS = 1 << 24    # 16M elements = 64 MB per chunk
+
+
+def _write_shuffled_lzma(
+    zf: zipfile.ZipFile, arcname: str, arr: np.ndarray, desc: str | None = None
+) -> None:
+    """Byte-shuffle `arr` in fixed-size chunks into a single lzma stream in the archive.
+
+    Chunked so peak memory is one chunk, not the whole array -- a dense city's CSR indices
+    run ~1.7 GB, and the old dense path already had to be written to stay off the anon heap
+    (see _memmap_zip_member). The reader reverses with the same chunk size.
+
+    Pass `desc` for a progress bar: lzma at preset=1 moves tens of MB/s, so a 1.7 GB array
+    is minutes of otherwise-silent work. The bar is driven by bytes already consumed, which
+    costs nothing to know.
+    """
+    comp = lzma.LZMACompressor(preset=1)
+    bar = tqdm(
+        total=arr.nbytes, desc=desc, unit="B", unit_scale=True, unit_divisor=1024,
+        leave=False, disable=desc is None,
+    )
+    with zf.open(arcname, "w") as dst:
+        for start in range(0, arr.size, _SHUFFLE_CHUNK_ELEMS):
+            chunk = arr[start:start + _SHUFFLE_CHUNK_ELEMS]
+            out = comp.compress(_shuffle_bytes(chunk))
+            if out:
+                dst.write(out)
+            bar.update(chunk.nbytes)
+        dst.write(comp.flush())
+    bar.close()
+
+
+def _read_shuffled_lzma(
+    zf: zipfile.ZipFile, arcname: str, dtype, n: int, desc: str | None = None
+) -> np.ndarray:
+    """Inverse of _write_shuffled_lzma, filling the output array chunk by chunk."""
+    itemsize = np.dtype(dtype).itemsize
+    out = np.empty(n, dtype=dtype)
+    dec = lzma.LZMADecompressor()
+    buf = bytearray()
+    pos = 0
+    bar = tqdm(
+        total=out.nbytes, desc=desc, unit="B", unit_scale=True, unit_divisor=1024,
+        leave=False, disable=desc is None,
+    )
+    with zf.open(arcname) as src:
+        while pos < n:
+            raw = src.read(1 << 22)
+            if not raw:
+                break
+            buf += dec.decompress(raw)
+            while pos < n:
+                take = min(_SHUFFLE_CHUNK_ELEMS, n - pos)
+                need = take * itemsize
+                if len(buf) < need:
+                    break
+                out[pos:pos + take] = _unshuffle_bytes(bytes(buf[:need]), dtype, take)
+                del buf[:need]
+                pos += take
+                bar.update(need)
+    bar.close()
+    return out
+
+
+def _memmap_zip_member(zip_path: str, arcname: str):
+    """Memory-map an uncompressed .npy member of a zip in place, without copying it out.
+
+    A ZIP_STORED member's bytes already sit
+    contiguously in the archive in C order, so a 12.6 GB matrix can be read straight from
+    the .npz at an offset instead of being extracted to a temp file first.
+    """
+    with zipfile.ZipFile(zip_path) as zf:
+        zinfo = zf.getinfo(arcname)
+        if zinfo.compress_type != zipfile.ZIP_STORED:
+            raise ValueError(f"{arcname} is compressed; cannot memmap in place")
+    with open(zip_path, "rb") as f:
+        f.seek(zinfo.header_offset)
+        local_header = f.read(30)
+        fname_len, extra_len = struct.unpack("<HH", local_header[26:30])
+        f.seek(zinfo.header_offset + 30 + fname_len + extra_len)
+        version = npy_format.read_magic(f)
+        shape, fortran, dtype = npy_format._read_array_header(f, version)
+        offset = f.tell()
+    if fortran:
+        raise ValueError(f"{arcname} is Fortran-ordered; cannot memmap as C-order")
+    return np.memmap(zip_path, dtype=dtype, mode="r", shape=shape, offset=offset)
+
+
+_MATRIX_ROW_CHUNK = 512
+
+
+def encode_matrix_csr(zf: zipfile.ZipFile, name: str, matrix) -> dict:
+    """Write a dense impedance matrix into the archive as CSR; return its header entry.
+
+    These matrices are 86-88% exact zeros (subway's median row has none at all), so the
+    dense form spends ~22 GB storing the number 0. A zero here means "no service", which
+    the accessibility stage already reads as zero decay (_matrix_decay's `vals > 0`), and
+    CSR reconstructs it as exactly 0.0 -- lossless, not a threshold.
+
+    Streams the source in row chunks so the dense matrix is never pulled into RAM: it
+    arrives as a memmap whose pages must stay clean and reclaimable (see the note on
+    write_impedance_bundle's `matrix`, and the 2026-07-31 cgroup incident).
+    """
+    n_rows, n_cols = matrix.shape
+    # Two passes over the memmap (count, then fill), so the bar spans 2 * n_rows -- a dense
+    # city reads ~25 GB here and would otherwise sit silent for minutes.
+    bar = tqdm(total=n_rows * 2, desc=f"[Artifact] {name} -> CSR", unit="row",
+               unit_scale=True, leave=False)
+    counts = np.empty(n_rows, dtype=np.int64)
+    for start in range(0, n_rows, _MATRIX_ROW_CHUNK):
+        block = np.asarray(matrix[start:start + _MATRIX_ROW_CHUNK])
+        counts[start:start + block.shape[0]] = np.count_nonzero(block, axis=1)
+        bar.update(block.shape[0])
+    indptr = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
+    nnz = int(indptr[-1])
+
+    indices = np.empty(nnz, dtype=np.int32)
+    data = np.empty(nnz, dtype=np.float32)
+    for start in range(0, n_rows, _MATRIX_ROW_CHUNK):
+        block = np.asarray(matrix[start:start + _MATRIX_ROW_CHUNK])
+        rows, cols = np.nonzero(block)          # row-major == CSR order
+        lo, hi = int(indptr[start]), int(indptr[start + block.shape[0]])
+        indices[lo:hi] = cols.astype(np.int32)
+        data[lo:hi] = block[rows, cols]
+        bar.update(block.shape[0])
+    bar.close()
+
+    _write_shuffled_lzma(zf, f"{name}_indices.bin", indices, desc=f"[Artifact] {name} indices")
+    _write_shuffled_lzma(zf, f"{name}_data.bin", data, desc=f"[Artifact] {name} data")
+    zf.writestr(f"{name}_indptr.bin", indptr.tobytes())
+    return {"shape": [int(n_rows), int(n_cols)], "nnz": nnz}
+
+
+def decode_matrix_csr(zf: zipfile.ZipFile, name: str, header: dict, dest_path: str):
+    """Expand a CSR matrix back into the dense .dat memmap the pipeline reads."""
+    n_rows, n_cols = header["shape"]
+    nnz = int(header["nnz"])
+    indptr = np.frombuffer(zf.read(f"{name}_indptr.bin"), dtype=np.int64)
+    indices = _read_shuffled_lzma(zf, f"{name}_indices.bin", np.int32, nnz,
+                                  desc=f"[Artifact] {name} indices")
+    data = _read_shuffled_lzma(zf, f"{name}_data.bin", np.float32, nnz,
+                               desc=f"[Artifact] {name} data")
+
+    mat = np.memmap(dest_path, dtype=np.float32, mode="w+", shape=(n_rows, n_cols))
+    bar = tqdm(total=n_rows, desc=f"[Artifact] {name} <- CSR", unit="row",
+               unit_scale=True, leave=False)
+    for start in range(0, n_rows, _MATRIX_ROW_CHUNK):
+        end = min(start + _MATRIX_ROW_CHUNK, n_rows)
+        block = np.zeros((end - start, n_cols), dtype=np.float32)
+        for r in range(start, end):
+            lo, hi = int(indptr[r]), int(indptr[r + 1])
+            block[r - start, indices[lo:hi]] = data[lo:hi]
+        mat[start:end] = block
+        bar.update(end - start)
+    bar.close()
+    mat.flush()
+    return (n_rows, n_cols)
+
+
+_BLOB_MAGIC = b"NB4\x00"
+
+
+def encode_blob(payload: dict, catalog_sizes: dict[str, int]) -> bytes:
+    """Serialize one node's non-bus payload into the v4 compact form.
+
+    Layout: magic, a 4-byte header length, a JSON header (node identity + a per-entry
+    index of service/poi_type/n), then ONE lzma stream holding every entry's arrays back
+    to back. One compression call per node rather than per array: the arrays are small and
+    lzma needs a wide window to exploit the redundancy across them (measured 1.73x joined
+    vs 1.40x per-array on a real blob).
+    """
+    index, parts = [], []
+    for service, entries in payload["services"].items():
+        for e in entries:
+            poi_type = str(e["poi_type"])
+            n = int(len(e["kept_idx"]))
+            index.append({"service": service, "poi_type": poi_type, "n": n})
+            parts.append(_pack_kept_idx(e["kept_idx"], catalog_sizes[poi_type]))
+            parts.append(_shuffle_bytes(np.ascontiguousarray(e["dest_col"], dtype=np.int32)))
+            parts.append(np.packbits(e["in_radius"]).tobytes())
+            for k in ("imp_walk", "imp_bike", "imp_drive"):
+                parts.append(_shuffle_bytes(np.ascontiguousarray(e[k], dtype=np.float32)))
+
+    header = json.dumps({
+        "node_id": payload["node_id"],
+        "origin": [float(payload["origin"][0]), float(payload["origin"][1])],
+        "poi_config_signature": payload["poi_config_signature"],
+        "entries": index,
+    }).encode("utf-8")
+    body = lzma.compress(b"".join(parts), preset=1)
+    return _BLOB_MAGIC + struct.pack("<I", len(header)) + header + body
+
+
+def decode_blob(buf: bytes, catalog_sizes: dict[str, int], schema_version: int) -> dict:
+    """Inverse of encode_blob: rebuild the exact dict the non-bus cache holds."""
+    if buf[:4] != _BLOB_MAGIC:
+        raise ValueError("not a v4 non-bus blob")
+    (hlen,) = struct.unpack("<I", buf[4:8])
+    header = json.loads(buf[8:8 + hlen])
+    raw = lzma.decompress(buf[8 + hlen:])
+
+    pos = 0
+    services: dict[str, list] = {}
+    for item in header["entries"]:
+        poi_type, n = item["poi_type"], int(item["n"])
+        csize = catalog_sizes[poi_type]
+        nb = (csize + 7) // 8
+        kept_idx = _unpack_kept_idx(raw[pos:pos + nb], csize); pos += nb
+        dest_col = _unshuffle_bytes(raw[pos:pos + 4 * n], np.int32, n); pos += 4 * n
+        rb = (n + 7) // 8
+        in_radius = np.unpackbits(
+            np.frombuffer(raw[pos:pos + rb], dtype=np.uint8), count=n
+        ).astype(bool); pos += rb
+        entry = {"poi_type": poi_type, "kept_idx": kept_idx,
+                 "dest_col": dest_col, "in_radius": in_radius}
+        for k in ("imp_walk", "imp_bike", "imp_drive"):
+            entry[k] = _unshuffle_bytes(raw[pos:pos + 4 * n], np.float32, n); pos += 4 * n
+        services.setdefault(item["service"], []).append(entry)
+
+    return {
+        "schema_version": schema_version,
+        "poi_config_signature": header["poi_config_signature"],
+        "node_id": header["node_id"],
+        "origin": tuple(header["origin"]),
+        "services": services,
+    }
+
+
+def _mode_matrix_path(cfg, mode: str) -> str:
+    return cfg.bus_impedance_matrix_path if mode == "bus" else cfg.subway_impedance_matrix_path
+
+
+def _write_mode_sidecars(cfg, mode: str, source_id_to_row: dict, dest_coords) -> None:
+    """Write the row/column index files and destinations CSV a restored mode needs.
+
+    These are the same files the live routing stages produce, so downstream code reads one
+    layout regardless of whether the run routed or restored from a bundle.
+    """
+    if mode == "bus":
+        src_path = cfg.bus_source_id_to_row_path
+        col_path = cfg.bus_dest_id_to_col_path
+        csv_path = cfg.bus_routing_destinations_input_path
+    else:
+        src_path = cfg.subway_source_id_to_row_path
+        col_path = cfg.subway_dest_id_to_col_path
+        csv_path = cfg.subway_routing_destinations_input_path
+
+    Path(_mode_matrix_path(cfg, mode)).parent.mkdir(parents=True, exist_ok=True)
+    Path(src_path).parent.mkdir(parents=True, exist_ok=True)
+
+    with open(src_path, "w", encoding="utf-8") as f:
+        json.dump(source_id_to_row, f)
+    with open(col_path, "w", encoding="utf-8") as f:
+        json.dump({f"d{idx}": idx for idx in range(dest_coords.shape[0])}, f)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "lon", "lat"])
+        for idx, (lat, lon) in enumerate(dest_coords.tolist()):
+            writer.writerow([f"d{idx}", float(lon), float(lat)])
 
 
 def load_impedance_bundle(
@@ -88,234 +332,130 @@ def load_impedance_bundle(
     path = ctx.config.impedance_artifact_path
     if not os.path.isfile(path):
         return None
-
     cfg = ctx.config
 
-    with np.load(path, allow_pickle=True) as z_probe:
-        bundle_schema_version = int(np.array(z_probe["schema_version"])) if "schema_version" in z_probe.files else 1
-        if bundle_schema_version != ARTIFACT_SCHEMA_VERSION:
-            print(
-                f"[Artifact] Bundle schema_version={bundle_schema_version} != {ARTIFACT_SCHEMA_VERSION}; "
-                "recomputing.",
-                flush=True,
-            )
+    with zipfile.ZipFile(path) as zf:
+        if "manifest.json" not in set(zf.namelist()):
+            print("[Artifact] Bundle predates schema 4; recomputing.", flush=True)
             return None
-        # If subway is enabled for this city but the cached bundle predates subway support, treat
-        # it as a miss so the pipeline re-routes both modes and rewrites a subway-aware bundle.
-        if cfg.enable_subway and "subway_impedance_matrix" not in z_probe.files:
-            print(
-                "[Artifact] Bundle has no subway data but subway is enabled; recomputing.",
-                flush=True,
-            )
-            return None
-        # The bundle's routing data is keyed to the exact origin node set it was built
-        # against (baked in as origins_sig, the same signature run_public_transport_routing_stage
-        # uses to detect a stale routing cache). Unlike that stage's own cache check, this
-        # load path used to skip straight past it with no validation at all: it would restore
-        # whatever bundle existed on disk regardless of whether the CURRENT ctx.nodes_with_coords
-        # (e.g. after a boundary/study-area fix that changes which nodes are in scope) still
-        # matches it, silently mixing a stale, narrower routing matrix with a freshly-rebuilt,
-        # wider node set -- nodes outside the old bundle's coverage then get no transit
-        # accessibility at all, with no error or warning. Reject the bundle here so a mismatch
-        # falls through to a real (now partial-reuse-capable, see public_transport_routing_stage)
-        # routing run instead of silently corrupting downstream accessibility.
-        bundle_origins_sig = str(np.array(z_probe["origins_sig"]).item()) if "origins_sig" in z_probe.files else None
-        if bundle_origins_sig is not None:
-            from routing.public_transport_routing_stage import _coords_signature
-            current_origins_sig = _coords_signature(
-                [(data["y"], data["x"]) for _, data in ctx.nodes_with_coords]
-            )
-            if bundle_origins_sig != current_origins_sig:
-                print(
-                    "[Artifact] Bundle origins_sig doesn't match the current node set "
-                    f"(bundle={bundle_origins_sig[:12]}... current={current_origins_sig[:12]}...); "
-                    "recomputing.",
-                    flush=True,
-                )
-                return None
+        man = json.loads(zf.read("manifest.json"))
 
-    Path(cfg.non_bus_cache_dir).mkdir(parents=True, exist_ok=True)
-    Path(cfg.bus_impedance_matrix_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(cfg.bus_source_id_to_row_path).parent.mkdir(parents=True, exist_ok=True)
-    if cfg.enable_subway:
-        Path(cfg.subway_impedance_matrix_path).parent.mkdir(parents=True, exist_ok=True)
-
-    # ── Pass 1: load everything except blobs, write bus matrix, then free RAM ──
-    # Loading all npz keys at once (bus matrix + blobs) can exhaust RAM for large
-    # cities. We instead load scalars and the bus matrix first, flush them to disk,
-    # and only then load the blob array so peak RSS = max(bus_matrix, blobs) rather
-    # than bus_matrix + blobs.
-    print(f"[Artifact] Restoring bus matrix from {path} ...", flush=True)
-    _t_pass1 = time.monotonic()
-    with np.load(path, allow_pickle=True) as z:
-        node_ids = np.array(z["node_ids"]).astype(str)
-        bus_dest_coords = np.asarray(z["bus_dest_coords"], dtype=np.float64)
-        routing_departure_iso = str(np.array(z["routing_departure_iso"]).item())
-        origins_sig = str(np.array(z["origins_sig"]).item())
-        destinations_sig = str(np.array(z["destinations_sig"]).item())
-        catalog_types = np.array(z["poi_catalog_types"]).astype(str).tolist()
-        catalog_ptr = np.asarray(z["poi_catalog_ptr"], dtype=np.int64)
-        catalog_src_keys = np.asarray(z["poi_catalog_src_keys"])
-        catalog_source_coords = np.asarray(z["poi_catalog_source_coords"], dtype=np.float64)
-
-    # Reconstitute the shared per-poi_type catalog to the same path the live pipeline
-    # writes it to, so the accessibility stage has one place to read it from either way.
-    poi_catalog = {
-        poi_type: {
-            "src_keys": catalog_src_keys[catalog_ptr[i]:catalog_ptr[i + 1]],
-            "source_coords": catalog_source_coords[catalog_ptr[i]:catalog_ptr[i + 1]],
-        }
-        for i, poi_type in enumerate(catalog_types)
-    }
-    Path(cfg.non_bus_poi_catalog_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(cfg.non_bus_poi_catalog_path, "wb") as f:
-        pickle.dump(poi_catalog, f, protocol=pickle.HIGHEST_PROTOCOL)
-    del catalog_src_keys, catalog_source_coords, poi_catalog
-
-    source_id_to_row = {str(node_id): idx for idx, node_id in enumerate(node_ids.tolist())}
-    with open(cfg.bus_source_id_to_row_path, "w", encoding="utf-8") as f:
-        json.dump(source_id_to_row, f)
-
-    dest_id_to_col = {f"d{idx}": idx for idx in range(bus_dest_coords.shape[0])}
-    with open(cfg.bus_dest_id_to_col_path, "w", encoding="utf-8") as f:
-        json.dump(dest_id_to_col, f)
-
-    with open(cfg.bus_routing_destinations_input_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["id", "lon", "lat"])
-        for idx, (lat, lon) in enumerate(bus_dest_coords.tolist()):
-            writer.writerow([f"d{idx}", float(lon), float(lat)])
-    del bus_dest_coords
-
-    bus_shape = _restore_matrix_fast(path, "bus_impedance_matrix.npy", cfg.bus_impedance_matrix_path)
-    if bus_shape is None:
-        # Fallback: compressed or non-C-contiguous member -- safe but RAM-heavier.
-        # asarray (not array): the stored dtype already matches, so this avoids a second
-        # full-size copy of a matrix that can be tens of GB (Paris: ~24.7 GB) -- np.array()
-        # always copies even when the dtype is already correct, which was doubling peak RSS
-        # at exactly this line and pushing it past the run's memory cgroup cap (2026-08-03).
-        with np.load(path, allow_pickle=True) as z:
-            bus_matrix = np.asarray(z["bus_impedance_matrix"], dtype=np.float32)
-        mat = np.memmap(
-            cfg.bus_impedance_matrix_path,
-            dtype=np.float32,
-            mode="w+",
-            shape=bus_matrix.shape,
-        )
-        mat[:] = bus_matrix
-        mat.flush()
-        bus_shape = bus_matrix.shape
-        del mat, bus_matrix
-        gc.collect()
-
-    mat_ro = np.memmap(cfg.bus_impedance_matrix_path, dtype=np.float32, mode="r", shape=bus_shape)
-    nonzero_count = int(np.count_nonzero(mat_ro))
-    total_count = int(mat_ro.size)
-    print(
-        f"[Artifact] Loaded impedance bundle: bus_impedance_nonzero={nonzero_count}/{total_count} "
-        f"bus_impedance_zero={total_count - nonzero_count} "
-        f"({time.monotonic() - _t_pass1:.1f}s)",
-        flush=True,
-    )
-    del mat_ro
-    gc.collect()
-
-    # ── Pass 1b: restore the optional subway matrix (kept separate to bound peak RSS) ──
-    if cfg.enable_subway:
-        with np.load(path, allow_pickle=True) as z:
-            subway_dest_coords = np.asarray(z["subway_dest_coords"], dtype=np.float64)
-
-        # Origins are the same graph nodes as bus, so the source index mirrors node_ids.
-        with open(cfg.subway_source_id_to_row_path, "w", encoding="utf-8") as f:
-            json.dump(source_id_to_row, f)
-
-        subway_dest_id_to_col = {f"d{idx}": idx for idx in range(subway_dest_coords.shape[0])}
-        with open(cfg.subway_dest_id_to_col_path, "w", encoding="utf-8") as f:
-            json.dump(subway_dest_id_to_col, f)
-
-        with open(cfg.subway_routing_destinations_input_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["id", "lon", "lat"])
-            for idx, (lat, lon) in enumerate(subway_dest_coords.tolist()):
-                writer.writerow([f"d{idx}", float(lon), float(lat)])
-        del subway_dest_coords
-
-        subway_shape = _restore_matrix_fast(
-            path, "subway_impedance_matrix.npy", cfg.subway_impedance_matrix_path
-        )
-        if subway_shape is None:
-            # Fallback: same reasoning as the bus matrix above -- asarray avoids a
-            # redundant full copy, but a full decompress-into-RAM is still unavoidable
-            # here since the fast byte-range path didn't apply.
-            with np.load(path, allow_pickle=True) as z:
-                subway_matrix = np.asarray(z["subway_impedance_matrix"], dtype=np.float32)
-            sub_mem = np.memmap(
-                cfg.subway_impedance_matrix_path, dtype=np.float32, mode="w+", shape=subway_matrix.shape,
-            )
-            sub_mem[:] = subway_matrix
-            sub_mem.flush()
-            subway_shape = subway_matrix.shape
-            del sub_mem, subway_matrix
-            gc.collect()
-
-        sub_mem_ro = np.memmap(cfg.subway_impedance_matrix_path, dtype=np.float32, mode="r", shape=subway_shape)
-        sub_nonzero = int(np.count_nonzero(sub_mem_ro))
+    if int(man["schema_version"]) != ARTIFACT_SCHEMA_VERSION:
         print(
-            f"[Artifact] Loaded subway impedance: nonzero={sub_nonzero}/{sub_mem_ro.size} "
-            f"zero={sub_mem_ro.size - sub_nonzero}",
+            f"[Artifact] Bundle schema_version={man['schema_version']} != "
+            f"{ARTIFACT_SCHEMA_VERSION}; recomputing.",
             flush=True,
         )
-        del sub_mem_ro
-        gc.collect()
+        return None
+    if cfg.enable_subway and not man["has_subway"]:
+        print(
+            "[Artifact] Bundle has no subway data but subway is enabled; recomputing.",
+            flush=True,
+        )
+        return None
 
-    # ── Pass 2: stream each node's blob straight from the archive to its cache file ──
-    # Each node lives in its own zip entry (non_bus_blobs/<node_id>.bin) -- these
-    # ~23k entries are fully independent I/O units (this is where 90%+ of a dense
-    # city's bundle bytes live, e.g. Paris: ~704 GB of ~751 GB total), so restoring
-    # them one at a time on a single thread badly under-uses NVMe queue depth. Each
-    # worker thread opens its own ZipFile handle onto `path` rather than sharing one:
-    # zipfile.ZipFile serializes reads through its shared file object's internal
-    # lock, which would otherwise flatten this back down to effectively one reader.
-    # Peak memory stays bounded by (workers x one copy buffer), not by total cache size.
-    cache_paths: dict[str, str] = {}
-    schema_version_str = str(ctx.config.non_bus_cache_schema_version)
-    node_ids_list = node_ids.tolist()
+    # The bundle's routing data is keyed to the exact origin node set it was built against.
+    # Without this check a stale, narrower bundle would silently mix with a wider current
+    # node set, leaving the extra nodes with no transit accessibility and no warning.
+    from routing.public_transport_routing_stage import _coords_signature
+    current_origins_sig = _coords_signature(
+        [(data["y"], data["x"]) for _, data in ctx.nodes_with_coords]
+    )
+    if man["origins_sig"] != current_origins_sig:
+        print(
+            f"[Artifact] Bundle origins_sig doesn't match the current node set "
+            f"(bundle={man['origins_sig'][:12]}... current={current_origins_sig[:12]}...); "
+            "recomputing.",
+            flush=True,
+        )
+        return None
 
-    _thread_local = threading.local()
+    node_ids = [str(n) for n in man["node_ids"]]
+    Path(cfg.non_bus_cache_dir).mkdir(parents=True, exist_ok=True)
+    _t0 = time.monotonic()
 
-    def _restore_one(node_id: str) -> tuple[str, str]:
-        zf = getattr(_thread_local, "zf", None)
-        if zf is None:
-            zf = zipfile.ZipFile(path)
-            _thread_local.zf = zf
-        out_path = os.path.join(cfg.non_bus_cache_dir, f"{node_id}.pkl")
-        arcname = f"non_bus_blobs/{node_id}.bin"
-        with zf.open(arcname) as src, open(out_path, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-        # Write sidecar so _has_valid_non_bus_cache skips full unpickling.
-        try:
-            with open(out_path + ".v", "w") as fv:
-                fv.write(schema_version_str)
-        except OSError:
-            pass
-        return str(node_id), out_path
+    with zipfile.ZipFile(path) as zf:
+        catalog_ptr = np.load(zf.open("poi_catalog_ptr.npy"))
+        catalog_src_keys = np.load(zf.open("poi_catalog_src_keys.npy"))
+        catalog_coords = np.load(zf.open("poi_catalog_source_coords.npy"))
+        catalog_types = man["poi_catalog_types"]
 
-    max_workers = min(32, (os.cpu_count() or 4) * 4)
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_restore_one, node_id): node_id for node_id in node_ids_list}
-        for future in tqdm(
-            as_completed(futures), total=len(futures), desc="[Artifact] Restoring non-bus caches", unit="node"
-        ):
-            node_id, out_path = future.result()
-            cache_paths[node_id] = out_path
+        # Reconstitute the shared catalog where the live pipeline writes it, so the
+        # accessibility stage has one place to read it from either way.
+        poi_catalog = {
+            poi_type: {
+                "src_keys": catalog_src_keys[catalog_ptr[i]:catalog_ptr[i + 1]],
+                "source_coords": catalog_coords[catalog_ptr[i]:catalog_ptr[i + 1]],
+            }
+            for i, poi_type in enumerate(catalog_types)
+        }
+        Path(cfg.non_bus_poi_catalog_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(cfg.non_bus_poi_catalog_path, "wb") as f:
+            pickle.dump(poi_catalog, f, protocol=pickle.HIGHEST_PROTOCOL)
+        catalog_sizes = {
+            t: int(catalog_ptr[i + 1] - catalog_ptr[i]) for i, t in enumerate(catalog_types)
+        }
+        del catalog_src_keys, catalog_coords, poi_catalog
+
+        source_id_to_row = {node_id: idx for idx, node_id in enumerate(node_ids)}
+        for mode in ("bus", "subway"):
+            if mode == "subway" and not cfg.enable_subway:
+                continue
+            dest_coords = np.load(zf.open(f"{mode}_dest_coords.npy"))
+            _write_mode_sidecars(cfg, mode, source_id_to_row, dest_coords)
+            print(f"[Artifact] Expanding {mode} matrix from CSR ...", flush=True)
+            shape = decode_matrix_csr(
+                zf, mode, man["matrices"][mode], _mode_matrix_path(cfg, mode)
+            )
+            print(
+                f"[Artifact]   {mode} {shape} restored, "
+                f"nnz={man['matrices'][mode]['nnz']}",
+                flush=True,
+            )
+
+        schema_version = int(man["non_bus_cache_schema_version"])
+        cache_paths: dict[str, str] = {}
+        _thread_local = threading.local()
+
+        def _restore_one(node_id: str) -> tuple[str, str]:
+            zf_local = getattr(_thread_local, "zf", None)
+            if zf_local is None:
+                zf_local = zipfile.ZipFile(path)
+                _thread_local.zf = zf_local
+            payload = decode_blob(
+                zf_local.read(f"non_bus_blobs/{node_id}.bin"), catalog_sizes, schema_version
+            )
+            out_path = os.path.join(cfg.non_bus_cache_dir, f"{node_id}.pkl")
+            with open(out_path, "wb") as f:
+                pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+            with open(out_path + ".v", "w") as fv:     # lets _has_valid_non_bus_cache
+                fv.write(str(schema_version))          # skip a full unpickle later
+            return str(node_id), out_path
+
+        # CPU-bound now (lzma + unshuffle) rather than pure byte-copying, so this tracks
+        # core count instead of the old 4x oversubscription for I/O.
+        max_workers = min(16, os.cpu_count() or 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_restore_one, n): n for n in node_ids}
+            for fut in tqdm(
+                as_completed(futures), total=len(futures),
+                desc="[Artifact] Restoring non-bus caches", unit="node",
+            ):
+                node_id, out_path = fut.result()
+                cache_paths[node_id] = out_path
+
     gc.collect()
+    print(
+        f"[Artifact] Restored {len(cache_paths)} nodes in {time.monotonic() - _t0:.1f}s.",
+        flush=True,
+    )
 
     bus = BusRoutingStageResult(
         routing_csv=cfg.bus_routing_matrix_path,
         routing_pkl=cfg.bus_routing_cache_path,
-        routing_departure_iso=routing_departure_iso,
-        origins_sig=origins_sig,
-        destinations_sig=destinations_sig,
+        routing_departure_iso=man["routing_departure_iso"],
+        origins_sig=man["origins_sig"],
+        destinations_sig=man["destinations_sig"],
     )
     non_bus = NonBusRoutingStageResult(
         cache_paths=cache_paths,
@@ -325,58 +465,54 @@ def load_impedance_bundle(
     return bus, non_bus
 
 
+def _read_mode_dest_coords(cfg, mode: str) -> np.ndarray:
+    """Read one mode's routed destinations CSV into an (n_dest, 2) lat/lon array,
+    ordered by matrix column."""
+    if mode == "bus":
+        col_path = cfg.bus_dest_id_to_col_path
+        csv_path = cfg.bus_routing_destinations_input_path
+    else:
+        col_path = cfg.subway_dest_id_to_col_path
+        csv_path = cfg.subway_routing_destinations_input_path
+
+    with open(col_path, encoding="utf-8") as f:
+        dest_id_to_col = {str(k): int(v) for k, v in json.load(f).items()}
+    dest_coords = np.zeros((len(dest_id_to_col), 2), dtype=np.float64)
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            idx = dest_id_to_col.get(str(row["id"]))
+            if idx is not None:
+                dest_coords[idx, 0] = float(row["lat"])
+                dest_coords[idx, 1] = float(row["lon"])
+    return dest_coords
+
+
 def write_impedance_bundle(
     ctx: PipelineContext,
     bus: BusRoutingStageResult,
     non_bus: NonBusRoutingStageResult,
 ) -> None:
     cfg = ctx.config
-    node_ids = np.array([str(node_id) for node_id, _ in ctx.nodes_with_coords], dtype=object)
+    node_ids = [str(node_id) for node_id, _ in ctx.nodes_with_coords]
 
-    with open(cfg.bus_dest_id_to_col_path, encoding="utf-8") as f:
-        dest_id_to_col_raw = json.load(f)
-    dest_id_to_col = {str(k): int(v) for k, v in dest_id_to_col_raw.items()}
-    n_dest = len(dest_id_to_col)
-    dest_coords = np.zeros((n_dest, 2), dtype=np.float64)
-    with open(cfg.bus_routing_destinations_input_path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            idx = dest_id_to_col.get(str(row["id"]))
-            if idx is None:
-                continue
-            dest_coords[idx, 0] = float(row["lat"])
-            dest_coords[idx, 1] = float(row["lon"])
+    catalog_types = sorted(non_bus.poi_catalog.keys())
+    catalog_ptr = [0]
+    src_keys_parts, coords_parts = [], []
+    for poi_type in catalog_types:
+        bundle = non_bus.poi_catalog[poi_type]
+        src_keys_parts.append(np.asarray(bundle["src_keys"]))
+        coords_parts.append(np.asarray(bundle["source_coords"], dtype=np.float64).reshape(-1, 2))
+        catalog_ptr.append(catalog_ptr[-1] + len(bundle["src_keys"]))
+    catalog_ptr = np.asarray(catalog_ptr, dtype=np.int64)
+    catalog_sizes = {
+        t: int(catalog_ptr[i + 1] - catalog_ptr[i]) for i, t in enumerate(catalog_types)
+    }
 
-    with open(cfg.bus_source_id_to_row_path, encoding="utf-8") as f:
-        source_id_to_row_raw = json.load(f)
-    source_id_to_row = {str(k): int(v) for k, v in source_id_to_row_raw.items()}
-    n_rows = len(source_id_to_row)
-
-    # Keep the matrix as a read-only memmap rather than np.array()-copying it into RAM.
-    # For a dense city each matrix is ~n_rows*n_dest*4 bytes (Paris bus ~24.7 GB), and the
-    # bundle holds the bus AND subway matrix at once -- two full anon copies (~49 GB) blew
-    # past the 45 GB cgroup cap here (2026-07-31). count_nonzero and np.savez both stream
-    # the memmap in chunks, so its pages stay clean, file-backed and reclaimable (verified:
-    # savez adds no anon copy) instead of un-reclaimable anon.
-    matrix = np.memmap(
-        cfg.bus_impedance_matrix_path,
-        dtype=np.float32,
-        mode="r",
-        shape=(n_rows, n_dest),
-    )
-    nonzero_count = int(np.count_nonzero(matrix))
-    total_count = int(matrix.size)
-    print(
-        f"[Artifact] Restored bus impedance matrix: nonzero={nonzero_count}/{total_count} "
-        f"zero={total_count - nonzero_count}",
-        flush=True,
-    )
-
-    # Only resolve+validate each node's cache path here (cheap: path strings, not
-    # file contents). The actual bytes are streamed straight from these files into
-    # the archive below, one node at a time, so peak memory never holds more than
-    # one node's blob regardless of how many GB the full non-bus cache adds up to.
-    node_cache_paths: list[str] = []
-    for node_id in node_ids.tolist():
+    # Only resolve+validate each node's cache path here (cheap: path strings, not file
+    # contents). The bytes are read one node at a time below, so peak memory never holds
+    # more than one window of blobs regardless of how many GB the full cache adds up to.
+    node_cache_paths = []
+    for node_id in node_ids:
         cache_path = non_bus.cache_paths.get(node_id)
         if cache_path is None:
             try:
@@ -387,111 +523,75 @@ def write_impedance_bundle(
             raise RuntimeError(f"Missing non-bus cache for node_id={node_id}")
         node_cache_paths.append(cache_path)
 
-    # Flatten the per-poi_type catalog (origin-invariant POI identity) into one CSR-style
-    # block, same pattern as build_snap_compact's cand_ptr/cand_coords -- written once
-    # here instead of duplicated into every node's blob.
-    catalog_types = sorted(non_bus.poi_catalog.keys())
-    catalog_ptr = [0]
-    catalog_src_keys_parts = []
-    catalog_source_coords_parts = []
-    for poi_type in catalog_types:
-        bundle = non_bus.poi_catalog[poi_type]
-        catalog_src_keys_parts.append(np.asarray(bundle["src_keys"]))
-        catalog_source_coords_parts.append(
-            np.asarray(bundle["source_coords"], dtype=np.float64).reshape(-1, 2)
-        )
-        catalog_ptr.append(catalog_ptr[-1] + len(bundle["src_keys"]))
-
-    save_kwargs = dict(
-        schema_version=np.array(ARTIFACT_SCHEMA_VERSION, dtype=np.int32),
-        node_ids=node_ids,
-        bus_impedance_matrix=matrix,
-        bus_dest_coords=dest_coords,
-        routing_departure_iso=np.array(bus.routing_departure_iso, dtype=object),
-        origins_sig=np.array(bus.origins_sig, dtype=object),
-        destinations_sig=np.array(bus.destinations_sig, dtype=object),
-        poi_catalog_types=np.array(catalog_types, dtype=object),
-        poi_catalog_ptr=np.array(catalog_ptr, dtype=np.int64),
-        poi_catalog_src_keys=(
-            np.concatenate(catalog_src_keys_parts) if catalog_src_keys_parts else np.asarray([], dtype="S1")
-        ),
-        poi_catalog_source_coords=(
-            np.concatenate(catalog_source_coords_parts, axis=0)
-            if catalog_source_coords_parts
-            else np.empty((0, 2), dtype=np.float64)
-        ),
-    )
-
-    # Optional subway modality: stored additively (no schema bump) so existing bundles
-    # without these keys keep loading unchanged.
-    if cfg.enable_subway:
-        subway_matrix, subway_dest_coords = _read_mode_matrix(
-            cfg.subway_impedance_matrix_path,
-            cfg.subway_source_id_to_row_path,
-            cfg.subway_dest_id_to_col_path,
-            cfg.subway_routing_destinations_input_path,
-        )
-        save_kwargs["subway_impedance_matrix"] = subway_matrix
-        save_kwargs["subway_dest_coords"] = subway_dest_coords
-        sub_nonzero = int(np.count_nonzero(subway_matrix))
-        print(
-            f"[Artifact] Restored subway impedance matrix: nonzero={sub_nonzero}/{subway_matrix.size} "
-            f"zero={subway_matrix.size - sub_nonzero}",
-            flush=True,
-        )
-
     Path(cfg.impedance_artifact_path).parent.mkdir(parents=True, exist_ok=True)
-    # Plain savez, not savez_compressed: compression builds each array's compressed
-    # representation fully in memory before writing it into the zip -- fine for the
-    # small arrays here, but exactly the kind of extra full-size copy that must be
-    # avoided for non_bus_blobs below. Uncompressed writes closer to bytes-in ==
-    # bytes-out, trading disk space for memory headroom.
-    _write_start = time.monotonic()
+    _t0 = time.monotonic()
     print(f"[Artifact] Writing impedance bundle to {cfg.impedance_artifact_path} ...", flush=True)
-    np.savez(cfg.impedance_artifact_path, **save_kwargs)
 
-    # Stream each node's non-bus cache file directly into the archive as its own zip
-    # entry (non_bus_blobs/<node_id>.bin) instead of building one big in-memory
-    # object array first: ZipFile.write() reads+writes the source file in chunks, so
-    # peak memory here is one copy buffer, not the total non-bus cache size (which,
-    # for a dense city, can be hundreds of GB to low TB -- see ARTIFACT_SCHEMA_VERSION
-    # comment above). A single archive file is preserved so the bundle stays a
-    # portable, compute-once artifact you can copy to another machine.
-    with zipfile.ZipFile(cfg.impedance_artifact_path, mode="a", allowZip64=True) as zf:
-        for node_id, cache_path in zip(
-            tqdm(node_ids.tolist(), desc="[Artifact] Writing non-bus caches", unit="node"),
-            node_cache_paths,
+    matrix_headers: dict[str, dict] = {}
+    with zipfile.ZipFile(cfg.impedance_artifact_path, "w", allowZip64=True) as zf:
+        for mode in ("bus", "subway"):
+            if mode == "subway" and not cfg.enable_subway:
+                continue
+            dest_coords = _read_mode_dest_coords(cfg, mode)
+            # Keep this a memmap, not an np.array() copy: each matrix is ~12.6 GB for a
+            # dense city and encode_matrix_csr streams it in row chunks, so its pages stay
+            # clean and reclaimable instead of un-reclaimable anon (2026-07-31 cgroup kill).
+            matrix = np.memmap(
+                _mode_matrix_path(cfg, mode), dtype=np.float32, mode="r",
+                shape=(len(node_ids), dest_coords.shape[0]),
+            )
+            print(f"[Artifact] {mode} matrix {matrix.shape} -> CSR ...", flush=True)
+            matrix_headers[mode] = encode_matrix_csr(zf, mode, matrix)
+            nnz = matrix_headers[mode]["nnz"]
+            print(f"[Artifact]   nnz={nnz} ({nnz / matrix.size:.1%} of dense)", flush=True)
+            del matrix
+            with zf.open(f"{mode}_dest_coords.npy", "w") as f:
+                np.save(f, dest_coords)
+
+        for name, arr in (
+            ("poi_catalog_src_keys",
+             np.concatenate(src_keys_parts) if src_keys_parts else np.asarray([], dtype="S1")),
+            ("poi_catalog_source_coords",
+             np.concatenate(coords_parts, axis=0) if coords_parts else np.empty((0, 2), dtype=np.float64)),
+            ("poi_catalog_ptr", catalog_ptr),
         ):
-            zf.write(cache_path, arcname=f"non_bus_blobs/{node_id}.bin")
+            with zf.open(f"{name}.npy", "w") as f:
+                np.save(f, arr)
 
-    _write_elapsed = time.monotonic() - _write_start
-    _artifact_size_gb = os.path.getsize(cfg.impedance_artifact_path) / (1 << 30)
+        zf.writestr("manifest.json", json.dumps({
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "non_bus_cache_schema_version": int(cfg.non_bus_cache_schema_version),
+            "node_ids": node_ids,
+            "routing_departure_iso": bus.routing_departure_iso,
+            "origins_sig": bus.origins_sig,
+            "destinations_sig": bus.destinations_sig,
+            "poi_catalog_types": catalog_types,
+            "poi_radius_m": serv.get_global_radius_m(cfg),
+            "has_subway": bool(cfg.enable_subway),
+            "matrices": matrix_headers,
+        }))
+
+        # Encode in parallel (lzma releases the GIL) but write serially -- a ZipFile is not
+        # thread-safe. Windowed rather than one big map so peak memory is one window of
+        # encoded blobs, not all of them at once.
+        def _encode_one(cache_path: str) -> bytes:
+            with open(cache_path, "rb") as f:
+                return encode_blob(pickle.load(f), catalog_sizes)
+
+        max_workers = min(16, os.cpu_count() or 4)
+        window = max_workers * 4
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            bar = tqdm(total=len(node_ids), desc="[Artifact] Writing non-bus caches", unit="node")
+            for start in range(0, len(node_ids), window):
+                chunk_ids = node_ids[start:start + window]
+                chunk_paths = node_cache_paths[start:start + window]
+                for node_id, payload in zip(chunk_ids, pool.map(_encode_one, chunk_paths)):
+                    zf.writestr(f"non_bus_blobs/{node_id}.bin", payload)
+                    bar.update(1)
+            bar.close()
+
+    size_gb = os.path.getsize(cfg.impedance_artifact_path) / (1 << 30)
     print(
-        f"[Artifact] Wrote impedance bundle: {_artifact_size_gb:.2f} GB in {_write_elapsed:.1f}s.",
+        f"[Artifact] Wrote impedance bundle: {size_gb:.2f} GB in {time.monotonic() - _t0:.1f}s.",
         flush=True,
     )
-
-
-def _read_mode_matrix(matrix_path, source_id_to_row_path, dest_id_to_col_path, dest_csv_path):
-    """Load a public-transport impedance matrix + its destination coords from disk.
-
-    Returns (matrix: float32 [n_rows, n_dest], dest_coords: float64 [n_dest, 2] (lat, lon)).
-    """
-    with open(dest_id_to_col_path, encoding="utf-8") as f:
-        dest_id_to_col = {str(k): int(v) for k, v in json.load(f).items()}
-    n_dest = len(dest_id_to_col)
-    dest_coords = np.zeros((n_dest, 2), dtype=np.float64)
-    with open(dest_csv_path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            idx = dest_id_to_col.get(str(row["id"]))
-            if idx is None:
-                continue
-            dest_coords[idx, 0] = float(row["lat"])
-            dest_coords[idx, 1] = float(row["lon"])
-
-    with open(source_id_to_row_path, encoding="utf-8") as f:
-        n_rows = len(json.load(f))
-
-    # Same reasoning as the bus matrix above: keep this a memmap, not an anon copy.
-    matrix = np.memmap(matrix_path, dtype=np.float32, mode="r", shape=(n_rows, n_dest))
-    return matrix, dest_coords

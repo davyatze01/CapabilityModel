@@ -48,7 +48,6 @@ LIGHT_MODE_MAX_HEXAGONS = 150
 # get added on top of the (unbounded) one-per-quartiere set.
 METRO_COMMUNE_SAMPLE = 40
 
-import csv
 import json
 import math
 import os
@@ -197,21 +196,24 @@ def _select_hexagons(
             if candidate_hid in seen_hexes:
                 continue
             node = _nearest_capability_point(clat, clon, capability_points)
-            nid = str(node["node_id"]) if node else None
-            if nid and nid not in seen_nodes:
-                seen_hexes.add(candidate_hid)
-                seen_nodes.add(nid)
-                selected.append({
-                    "hex_id": candidate_hid,
-                    "group": name,
-                    "group_type": group_type,
-                    "hex_centroid": (clat, clon),
-                    "node_id": nid,
-                    "node_lat": float(node["lat"]),
-                    "node_lon": float(node["lon"]),
-                    "hex_vertices": _hex_geometry(candidate_hid, grid_params),
-                })
-                break
+            if node is None:
+                continue
+            nid = str(node["node_id"])
+            if not nid or nid in seen_nodes:
+                continue
+            seen_hexes.add(candidate_hid)
+            seen_nodes.add(nid)
+            selected.append({
+                "hex_id": candidate_hid,
+                "group": name,
+                "group_type": group_type,
+                "hex_centroid": (clat, clon),
+                "node_id": nid,
+                "node_lat": float(node["lat"]),
+                "node_lon": float(node["lon"]),
+                "hex_vertices": _hex_geometry(candidate_hid, grid_params),
+            })
+            break
 
     for _, row in quartieri.iterrows():
         _pick_hex_for(str(row["name"]), row.geometry.y, row.geometry.x, "neighborhood")
@@ -233,24 +235,17 @@ def _select_hexagons(
 def _load_pt_context(cfg: PipelineConfig, mode: str = "bus") -> dict | None:
     """Load public transport (bus or subway, depending on mode) impedance matrix and destination mapping."""
     paths = cfg.public_transport_paths(mode)
-    if not all(os.path.exists(paths[k]) for k in ("source_id_to_row", "dest_id_to_col", "routing_destinations_input", "impedance_matrix")):
+    if not all(os.path.exists(paths[k]) for k in ("source_id_to_row", "dest_id_to_col", "impedance_matrix")):
         return None
     try:
         with open(paths["source_id_to_row"], encoding="utf-8") as f:
             source_to_row: dict[str, int] = {str(k): int(v) for k, v in json.load(f).items()}
         with open(paths["dest_id_to_col"], encoding="utf-8") as f:
             dest_id_to_col: dict[str, int] = {str(k): int(v) for k, v in json.load(f).items()}
-        coord_to_col: dict[tuple, int] = {}
-        with open(paths["routing_destinations_input"], newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                coord = (round(float(row["lat"]), 6), round(float(row["lon"]), 6))
-                col = dest_id_to_col.get(row["id"])
-                if col is not None:
-                    coord_to_col[coord] = int(col)
         n_src = len(source_to_row)
         n_dst = len(dest_id_to_col)
         mat = np.memmap(paths["impedance_matrix"], dtype=np.float32, mode="r", shape=(n_src, n_dst))
-        return {"mat": mat, "source_to_row": source_to_row, "coord_to_col": coord_to_col}
+        return {"mat": mat, "source_to_row": source_to_row}
     except Exception as exc:
         print(f"[Debug] {mode} context load failed: {exc}")
         return None
@@ -268,8 +263,11 @@ def _load_housing_context(cfg: PipelineConfig) -> dict | None:
         import pandas as pd
         df = pd.read_csv(housing_csv)
         return {
-            str(row.node_id): {"buy": float(row.buy_price_eur_sqm_month), "rent": float(row.rent_price_eur_sqm_month)}
-            for row in df.itertuples(index=False)
+            str(row["node_id"]): {
+                "buy": float(row["buy_price_eur_sqm_month"]),
+                "rent": float(row["rent_price_eur_sqm_month"]),
+            }
+            for row in df.to_dict("records")
         }
     except Exception as exc:
         print(f"[Debug] Housing context load failed: {exc}")
@@ -320,12 +318,8 @@ def _load_service_context(cfg: PipelineConfig) -> dict | None:
 # Chain computation for one hexagon
 # ---------------------------------------------------------------------------
 
-def _bus_time(poi_coord: tuple, source_row: int | None, bus_ctx: dict | None) -> float | None:
-    if bus_ctx is None or source_row is None:
-        return None
-    coord_key = (round(float(poi_coord[0]), 6), round(float(poi_coord[1]), 6))
-    col = bus_ctx["coord_to_col"].get(coord_key)
-    if col is None:
+def _bus_time(col: int, source_row: int | None, bus_ctx: dict | None) -> float | None:
+    if bus_ctx is None or source_row is None or col < 0:
         return None
     v = float(bus_ctx["mat"][source_row, col])
     return v if v > 0 else None
@@ -362,16 +356,15 @@ def _build_step1(non_bus: dict, source_row: int | None, bus_ctx: dict | None, su
             except Exception:
                 decay_coeff = None
 
-            imp_walk_arr = entry.get("imp_walk")
-            imp_bike_arr = entry.get("imp_bike")
-            imp_drive_arr = entry.get("imp_drive")
-            poi_coords = entry.get("poi_coords")
-            n = int(poi_coords.shape[0]) if poi_coords is not None else 0
-
+            imp_walk_arr = entry["imp_walk"]
+            imp_bike_arr = entry["imp_bike"]
+            imp_drive_arr = entry["imp_drive"]
             # source_keys/source_coords are origin-invariant, so they live once in the
             # shared poi_catalog (see exports/artifact_bundle.py) -- kept_idx resolves
-            # this entry's POIs into it, positionally aligned with poi_coords.
+            # this entry's POIs into it, positionally aligned with the imp arrays.
             kept_idx = entry.get("kept_idx", np.empty(0, dtype=np.int32))
+            n = int(kept_idx.shape[0])
+            dest_col_arr = entry["dest_col"]
             catalog = poi_catalog.get(poi_type, {})
             catalog_keys = catalog.get("src_keys")
             catalog_coords = catalog.get("source_coords")
@@ -384,7 +377,6 @@ def _build_step1(non_bus: dict, source_row: int | None, bus_ctx: dict | None, su
             pois_out = []
             for i in range(n):
                 src_coord = source_coords[i] if i < len(source_coords) else (None, None)
-                poi_coord = poi_coords[i]
                 src_key = str(source_keys[i]) if i < len(source_keys) and source_keys[i] is not None else ""
                 pois_out.append({
                     "source_key": src_key,
@@ -394,8 +386,8 @@ def _build_step1(non_bus: dict, source_row: int | None, bus_ctx: dict | None, su
                     "walk_min": float(imp_walk_arr[i]) if _reachable(imp_walk_arr, i) else None,
                     "bike_min": float(imp_bike_arr[i]) if _reachable(imp_bike_arr, i) else None,
                     "drive_min": float(imp_drive_arr[i]) if _reachable(imp_drive_arr, i) else None,
-                    "bus_min": _bus_time(poi_coord, source_row, bus_ctx),
-                    "subway_min": _bus_time(poi_coord, subway_source_row, subway_ctx),
+                    "bus_min": _bus_time(int(dest_col_arr[i]), source_row, bus_ctx),
+                    "subway_min": _bus_time(int(dest_col_arr[i]), subway_source_row, subway_ctx),
                     "walk_score": DEFAULT_WALK_SCORE if _reachable(imp_walk_arr, i) else None,
                 })
             pois_out.sort(key=lambda p: p["walk_min"] if p["walk_min"] is not None else float("inf"))
@@ -497,16 +489,15 @@ def _build_step2(
             decay_coeff = 16.0
         beta = math.log(2) / decay_coeff
 
-        imp_walk_arr = entry.get("imp_walk")
-        imp_bike_arr = entry.get("imp_bike")
-        imp_drive_arr = entry.get("imp_drive")
-        poi_coords = entry.get("poi_coords")
-        n = int(poi_coords.shape[0]) if poi_coords is not None else 0
-
+        imp_walk_arr = entry["imp_walk"]
+        imp_bike_arr = entry["imp_bike"]
+        imp_drive_arr = entry["imp_drive"]
         # source_keys/source_coords are origin-invariant, so they live once in the
         # shared poi_catalog instead of this per-node entry -- kept_idx resolves this
-        # entry's POIs into it, positionally aligned with poi_coords.
+        # entry's POIs into it, positionally aligned with the imp arrays.
         kept_idx = entry.get("kept_idx", np.empty(0, dtype=np.int32))
+        n = int(kept_idx.shape[0])
+        dest_col_arr = entry["dest_col"]
         catalog = poi_catalog.get(pt, {})
         catalog_keys = catalog.get("src_keys")
         catalog_coords = catalog.get("source_coords")
@@ -524,9 +515,8 @@ def _build_step2(
             wm = _val(imp_walk_arr, i)
             bm = _val(imp_bike_arr, i)
             dm = _val(imp_drive_arr, i)
-            poi_coord = poi_coords[i]
-            bus_m = _bus_time(poi_coord, source_row, bus_ctx)
-            subway_m = _bus_time(poi_coord, subway_source_row, subway_ctx)
+            bus_m = _bus_time(int(dest_col_arr[i]), source_row, bus_ctx)
+            subway_m = _bus_time(int(dest_col_arr[i]), subway_source_row, subway_ctx)
             src_coord = source_coords[i] if i < len(source_coords) else (None, None)
             src_key = str(source_keys[i]) if i < len(source_keys) and source_keys[i] is not None else ""
 
@@ -576,7 +566,7 @@ def _build_step2(
                 from_matrix = None if math.isnan(v) else v
 
         # Map source_key -> per-POI accessibility (same overwrite/>0 rule the pipeline
-        # uses when building accessibility_by_poi). source_keys are aligned to poi_coords.
+        # uses when building accessibility_by_poi). source_keys are aligned to kept_idx.
         # Apply the same per-service ownership drop so a non-owning poi_type does not
         # overwrite the owning value (mirrors accessibility_stage zeroing dropped pairs).
         drop_for_pt = (drop_map or {}).get(pt, ())
@@ -913,6 +903,19 @@ def _build_chain(
     except Exception as exc:
         print(f"[Debug] Failed to load non-bus cache for node {node_id}: {exc}")
         return chain
+
+    # accessibility_stage validates this via _is_valid_non_bus_cache; this reader did not,
+    # so a stale blob used to surface as a KeyError several frames deeper instead of saying
+    # what was actually wrong. Raise rather than skip the node: every blob is stale, and
+    # skipping would emit a debug report full of silently empty chains.
+    cached_version = non_bus.get("schema_version")
+    if cached_version != cfg.non_bus_cache_schema_version:
+        raise RuntimeError(
+            f"Non-bus cache for node {node_id} is schema v{cached_version}, but this build "
+            f"expects v{cfg.non_bus_cache_schema_version}. This cache predates the schema-4 "
+            "artifact change and has no dest_col/in_radius. Run the pipeline once so the "
+            "impedance bundle restores a current cache."
+        )
 
     bus_source_row: int | None = None
     if bus_ctx:

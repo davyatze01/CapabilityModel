@@ -1,23 +1,28 @@
-"""One-time migration for Paris's impedance bundle: schema 2 -> schema 3.
+"""One-time migration for an impedance bundle: schema 3 -> schema 4.
 
-Schema 2 per-node blobs carried their own source_keys/source_coords/walk_path_scores
-(the same origin-invariant POI identity duplicated into every one of ~23k node blobs).
-Schema 3 (see exports/artifact_bundle.py, routing/non_bus_routing_stage.py,
-utils/delta_g.py) keeps that identity once, in a shared per-poi_type catalog, and has
-each node reference it by kept_idx. This script converts the existing 750GB bundle to
-the new layout by streaming it once -- no routing is recomputed -- and drops
-natural=tree POIs (TYPEQU=='GI12') along the way, since config/poi_types.csv no longer
-configures them.
+Schema 3 shipped the working non-bus cache verbatim -- `write_impedance_bundle` zipped each
+scratch `.pkl` in as-is -- so the artifact carried a lot that is not impedance. Measured on
+Paris (114 GB uncompressed): only ~32% of the bytes were impedance values. `poi_coords` alone
+was 44 GB, and it is never user-facing geometry (exported POI coordinates come from the shared
+catalog); it existed only to hash into a bus/subway matrix column and to run the radius test.
+The bus and subway matrices were dense float32 despite being 86-88% exact zeros.
 
-OLD_BUNDLE_PATH is only ever read, never modified or deleted. The result is written to
-a brand-new NEW_BUNDLE_PATH so the original stays available to retry from if anything
-looks off. Do not run this at the same time as a live pipeline run against the same
-city -- it writes to the same artifacts/mgp_boundary/bus (and subway) paths the live
-non-bus/bus stages use.
+Schema 4 stores the impedances plus only the addressing needed to read them:
+  - `poi_coords` -> `dest_col` (one column addressing BOTH matrices, since bus and subway
+    route against the same destination set) + `in_radius`
+  - `kept_idx` int32 list -> a presence bitmask over the shared catalog
+  - dense matrices -> CSR
+  - the whole payload byte-shuffled and lzma'd
+Nothing is recomputed and nothing is quantized: every impedance value is copied across
+bit-for-bit, and the CSR expands back to the identical dense matrix. This is a re-encoding,
+not a re-route.
+
+OLD_BUNDLE_PATH is only ever read, never modified or deleted. The result is written to a
+brand-new NEW_BUNDLE_PATH so the original stays available to retry from if anything looks off.
 
 Run directly from VS Code (Run Python File / F5), or: python scripts/convert_paris_impedance_bundle.py
 """
-import csv
+
 import json
 import os
 import pickle
@@ -33,238 +38,191 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-import geopandas as gpd
 import numpy as np
 from tqdm import tqdm
 
 from core.config import PipelineConfig
-from core.pipeline_types import BusRoutingStageResult, NonBusRoutingStageResult, PipelineContext
-from exports.artifact_bundle import _restore_matrix_fast, write_impedance_bundle
+from exports.artifact_bundle import (
+    ARTIFACT_SCHEMA_VERSION,
+    encode_blob,
+    encode_matrix_csr,
+    _memmap_zip_member,
+)
 from utils import services as serv
-from utils.poi_identity import build_poi_source_key
+from utils.delta_g import _haversine_m_np
 
+STUDY_CITY = "paris"
 OLD_BUNDLE_PATH = str(_REPO_ROOT / "artifacts/mgp_boundary/impedances.npz")
-NEW_BUNDLE_PATH = str(_REPO_ROOT / "artifacts/mgp_boundary/impedances_v3.npz")
-SCRATCH_CACHE_DIR = str(_REPO_ROOT / "artifacts/mgp_boundary/non_bus_convert_scratch")
-TREE_SHAPEFILE = str(_REPO_ROOT / "Paris/POI_point.shp")
-TREE_TYPEQU = "GI12"
+NEW_BUNDLE_PATH = str(_REPO_ROOT / "artifacts/mgp_boundary/impedances_v4.npz")
+
+_T0 = 0.0
 
 
-def _build_tree_exclusion_set() -> set[str]:
-    """Every source_key build_poi_source_key would produce for a TREE_TYPEQU row --
-    the exact identifiers the old bundle's node blobs used, so they can be matched
-    and dropped while streaming."""
-    gdf = gpd.read_file(TREE_SHAPEFILE)
-    trees = gdf[gdf["TYPEQU"] == TREE_TYPEQU]
-    keys = {build_poi_source_key(dict(row), row.geometry) for _, row in trees.iterrows()}
-    print(f"[Convert] {len(keys)} tree POIs ({TREE_TYPEQU}) will be dropped.", flush=True)
-    return keys
+def _log(msg: str) -> None:
+    """Timestamped line so phases of a long run can be told apart in a scrollback."""
+    el = time.monotonic() - _T0
+    print(f"[Convert +{int(el) // 60:03d}:{int(el) % 60:02d}] {msg}", flush=True)
 
 
-def _restore_mode_matrix_to_disk(
-    old_zip_path, z, label, matrix_arcname, dest_coords_key,
-    matrix_path, source_id_to_row_path, dest_id_to_col_path, dest_csv_path,
-    source_id_to_row,
-) -> None:
-    """Materialize one mode's (bus or subway) matrix + dest index/CSV to disk, in the
-    exact shape write_impedance_bundle expects to read them back from -- the same
-    shape load_impedance_bundle's own restore passes produce for a live bundle load."""
-    dest_coords = np.asarray(z[dest_coords_key], dtype=np.float64)
-    os.makedirs(os.path.dirname(matrix_path), exist_ok=True)
+def _coord_col_map(dest_coords: np.ndarray) -> dict[tuple[float, float], int]:
+    """{rounded (lat, lon) -> matrix column} built from a bundle's own dest coords.
 
-    with open(source_id_to_row_path, "w", encoding="utf-8") as f:
-        json.dump(source_id_to_row, f)
+    Rounding matches utils.delta_g._dest_col_map exactly, so a POI resolves to the same
+    column here as it does in a live run.
+    """
+    return {
+        (round(float(lat), 6), round(float(lon), 6)): idx
+        for idx, (lat, lon) in enumerate(dest_coords)
+    }
 
-    dest_id_to_col = {f"d{idx}": idx for idx in range(dest_coords.shape[0])}
-    with open(dest_id_to_col_path, "w", encoding="utf-8") as f:
-        json.dump(dest_id_to_col, f)
 
-    with open(dest_csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["id", "lon", "lat"])
-        for idx, (lat, lon) in enumerate(dest_coords.tolist()):
-            writer.writerow([f"d{idx}", float(lon), float(lat)])
+def _convert_blob(payload: dict, dest_map, radius_m) -> dict:
+    """v10 blob (per-origin snapped poi_coords) -> v11 shape (resolved addressing).
 
-    shape = _restore_matrix_fast(old_zip_path, matrix_arcname, matrix_path)
-    if shape is None:
-        matrix = np.asarray(z[matrix_arcname[:-4]], dtype=np.float32)
-        mat = np.memmap(matrix_path, dtype=np.float32, mode="w+", shape=matrix.shape)
-        mat[:] = matrix
-        mat.flush()
-        del mat, matrix
-    print(f"[Convert] Restored {label} matrix to {matrix_path}", flush=True)
+    poi_coords was only ever used to reach a matrix column and to run the radius test, so
+    both are resolved here and the geometry is dropped. No impedance is recomputed.
+    """
+    origin = payload["origin"]
+    for items in payload["services"].values():
+        for it in items:
+            pc = it.pop("poi_coords")
+            n = len(pc)
+            dest_col = np.full(n, -1, dtype=np.int32)
+            for i in range(n):
+                # Python round(), not np.round(): they disagree on exact .5 ties and 5% of
+                # these coords are ties -- a mismatch silently zeroes a POI's transit access.
+                c = dest_map.get((round(float(pc[i, 0]), 6), round(float(pc[i, 1]), 6)))
+                if c is not None:
+                    dest_col[i] = c
+            it["dest_col"] = dest_col
+            it["in_radius"] = (
+                _haversine_m_np(origin[0], origin[1], pc[:, 0], pc[:, 1]) <= radius_m
+                if radius_m is not None
+                else np.ones(n, dtype=bool)
+            )
+    return payload
 
 
 def convert() -> None:
-    cfg = PipelineConfig(study_city="paris")
-    cfg.impedance_artifact_path = NEW_BUNDLE_PATH
-    cfg.non_bus_cache_dir = SCRATCH_CACHE_DIR
-    os.makedirs(SCRATCH_CACHE_DIR, exist_ok=True)
+    global _T0
+    _T0 = time.monotonic()
 
-    tree_keys = _build_tree_exclusion_set()
+    cfg = PipelineConfig(study_city=STUDY_CITY)
+    radius_m = serv.get_global_radius_m(cfg)
+    target_cache_version = int(cfg.non_bus_cache_schema_version)
 
-    print(f"[Convert] Reading scalars from {OLD_BUNDLE_PATH} ...", flush=True)
+    old_size = os.path.getsize(OLD_BUNDLE_PATH)
+    _log(f"Source {OLD_BUNDLE_PATH} ({old_size / (1 << 30):.1f} GB)")
+    _log(f"Target {NEW_BUNDLE_PATH}")
+    _log("Reading metadata ...")
     with np.load(OLD_BUNDLE_PATH, allow_pickle=True) as z:
         node_ids = np.array(z["node_ids"]).astype(str).tolist()
         routing_departure_iso = str(np.array(z["routing_departure_iso"]).item())
         origins_sig = str(np.array(z["origins_sig"]).item())
         destinations_sig = str(np.array(z["destinations_sig"]).item())
+        catalog_types = np.array(z["poi_catalog_types"]).astype(str).tolist()
+        catalog_ptr = np.asarray(z["poi_catalog_ptr"], dtype=np.int64)
+        catalog_src_keys = np.asarray(z["poi_catalog_src_keys"])
+        catalog_source_coords = np.asarray(z["poi_catalog_source_coords"], dtype=np.float64)
+        bus_dest_coords = np.asarray(z["bus_dest_coords"], dtype=np.float64)
         has_subway = "subway_impedance_matrix" in z.files
-
-        source_id_to_row = {node_id: idx for idx, node_id in enumerate(node_ids)}
-
-        _restore_mode_matrix_to_disk(
-            OLD_BUNDLE_PATH, z, "bus", "bus_impedance_matrix.npy", "bus_dest_coords",
-            cfg.bus_impedance_matrix_path, cfg.bus_source_id_to_row_path,
-            cfg.bus_dest_id_to_col_path, cfg.bus_routing_destinations_input_path,
-            source_id_to_row,
+        subway_dest_coords = (
+            np.asarray(z["subway_dest_coords"], dtype=np.float64) if has_subway else None
         )
-        if has_subway:
-            _restore_mode_matrix_to_disk(
-                OLD_BUNDLE_PATH, z, "subway", "subway_impedance_matrix.npy", "subway_dest_coords",
-                cfg.subway_impedance_matrix_path, cfg.subway_source_id_to_row_path,
-                cfg.subway_dest_id_to_col_path, cfg.subway_routing_destinations_input_path,
-                source_id_to_row,
-            )
 
-    # Incrementally-assigned per-poi_type catalog: key string -> index, plus the
-    # parallel coord list. A key's index never changes once assigned, so one
-    # streaming pass over the nodes (in any order) is enough to build it.
-    catalog_index: dict[str, dict[str, int]] = {}
-    catalog_coords: dict[str, list[tuple[float, float]]] = {}
-    cache_paths: dict[str, str] = {}
-
-    print(f"[Convert] Streaming {len(node_ids)} node blobs from {OLD_BUNDLE_PATH} ...", flush=True)
-    _t0 = time.monotonic()
-    dropped_count = 0
-    kept_count = 0
-    with zipfile.ZipFile(OLD_BUNDLE_PATH) as zf:
-        for node_id in tqdm(node_ids, desc="[Convert] Nodes", unit="node"):
-            with zf.open(f"non_bus_blobs/{node_id}.bin") as f:
-                old_payload = pickle.load(f)
-
-            new_services = {}
-            for service, entries in old_payload.get("services", {}).items():
-                new_entries = []
-                for entry in entries:
-                    poi_type = str(entry["poi_type"])
-                    old_source_keys = entry.get("source_keys", []) or []
-                    old_source_coords = entry.get("source_coords", []) or []
-                    old_poi_coords = entry.get("poi_coords", []) or []
-                    old_imp_walk = entry.get("imp_walk", []) or []
-                    old_imp_bike = entry.get("imp_bike", []) or []
-                    old_imp_drive = entry.get("imp_drive", []) or []
-
-                    idx_map = catalog_index.setdefault(poi_type, {})
-                    coord_list = catalog_coords.setdefault(poi_type, [])
-
-                    kept_idx_list: list[int] = []
-                    kept_poi_coords: list[tuple[float, float]] = []
-                    kept_imp_walk: list[float | None] = []
-                    kept_imp_bike: list[float | None] = []
-                    kept_imp_drive: list[float | None] = []
-                    for i in range(len(old_source_keys)):
-                        key = str(old_source_keys[i])
-                        if key in tree_keys:
-                            dropped_count += 1
-                            continue
-                        kept_count += 1
-                        cat_idx = idx_map.get(key)
-                        if cat_idx is None:
-                            cat_idx = len(coord_list)
-                            idx_map[key] = cat_idx
-                            sc = old_source_coords[i] if i < len(old_source_coords) else (0.0, 0.0)
-                            coord_list.append((float(sc[0]), float(sc[1])))
-                        kept_idx_list.append(cat_idx)
-                        kept_poi_coords.append(old_poi_coords[i] if i < len(old_poi_coords) else (0.0, 0.0))
-                        kept_imp_walk.append(old_imp_walk[i] if i < len(old_imp_walk) else None)
-                        kept_imp_bike.append(old_imp_bike[i] if i < len(old_imp_bike) else None)
-                        kept_imp_drive.append(old_imp_drive[i] if i < len(old_imp_drive) else None)
-
-                    n_kept = len(kept_idx_list)
-                    new_entries.append({
-                        "poi_type": poi_type,
-                        "kept_idx": np.asarray(kept_idx_list, dtype=np.int32),
-                        "poi_coords": np.asarray(kept_poi_coords, dtype=np.float64).reshape(n_kept, 2),
-                        "imp_walk": np.asarray(
-                            [v if v is not None else np.nan for v in kept_imp_walk], dtype=np.float32
-                        ),
-                        "imp_bike": np.asarray(
-                            [v if v is not None else np.nan for v in kept_imp_bike], dtype=np.float32
-                        ),
-                        "imp_drive": np.asarray(
-                            [v if v is not None else np.nan for v in kept_imp_drive], dtype=np.float32
-                        ),
-                    })
-                new_services[service] = new_entries
-
-            new_payload = {
-                "schema_version": cfg.non_bus_cache_schema_version,
-                "poi_config_signature": serv.config_signature(),
-                "node_id": node_id,
-                "origin": old_payload.get("origin"),
-                "services": new_services,
-            }
-            out_path = os.path.join(SCRATCH_CACHE_DIR, f"{node_id}.pkl")
-            with open(out_path, "wb") as f:
-                pickle.dump(new_payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-            cache_paths[node_id] = out_path
-
-    _elapsed = time.monotonic() - _t0
-    print(
-        f"[Convert] Streamed {len(node_ids)} nodes in {_elapsed / 60:.1f} min "
-        f"(kept {kept_count} POI refs, dropped {dropped_count} tree POI refs).",
-        flush=True,
-    )
-
-    poi_catalog = {
-        poi_type: {
-            "src_keys": np.asarray(list(idx_map.keys()), dtype="S"),
-            "source_coords": np.asarray(catalog_coords[poi_type], dtype=np.float64),
-        }
-        for poi_type, idx_map in catalog_index.items()
+    catalog_sizes = {
+        poi_type: int(catalog_ptr[i + 1] - catalog_ptr[i])
+        for i, poi_type in enumerate(catalog_types)
     }
-    total_catalog_pois = sum(len(v["src_keys"]) for v in poi_catalog.values())
-    print(
-        f"[Convert] Shared catalog: {total_catalog_pois} unique POIs across "
-        f"{len(poi_catalog)} poi_types.",
-        flush=True,
+
+    # The column map comes from the bundle's own dest coords, so the conversion needs
+    # nothing but the input file.
+    dest_map = _coord_col_map(bus_dest_coords)
+    if subway_dest_coords is not None and _coord_col_map(subway_dest_coords) != dest_map:
+        raise RuntimeError(
+            "Subway destinations differ from bus destinations, so one dest_col cannot "
+            "address both matrices. Schema 4 assumes a shared destination set."
+        )
+    _log(
+        f"{len(node_ids)} nodes | {len(dest_map)} destinations | "
+        f"{sum(catalog_sizes.values())} catalog POIs | radius {radius_m} m"
     )
 
-    ctx = PipelineContext(
-        config=cfg,
-        graph=None,
-        nodes_with_coords=[(node_id, {}) for node_id in node_ids],
-        workers=1,
-        output_paths={},
-        capability_services={},
-    )
-    bus = BusRoutingStageResult(
-        routing_csv=cfg.bus_routing_matrix_path,
-        routing_pkl=cfg.bus_routing_cache_path,
-        routing_departure_iso=routing_departure_iso,
-        origins_sig=origins_sig,
-        destinations_sig=destinations_sig,
-    )
-    non_bus = NonBusRoutingStageResult(
-        cache_paths=cache_paths,
-        cached_nodes=len(cache_paths),
-        computed_nodes=0,
-        poi_catalog=poi_catalog,
-    )
+    matrix_headers: dict[str, dict] = {}
+    modes = [("bus", "bus_impedance_matrix.npy")]
+    if has_subway:
+        modes.append(("subway", "subway_impedance_matrix.npy"))
 
-    print(f"[Convert] Writing new bundle to {NEW_BUNDLE_PATH} ...", flush=True)
-    write_impedance_bundle(ctx, bus, non_bus)
+    with zipfile.ZipFile(OLD_BUNDLE_PATH) as src, \
+            zipfile.ZipFile(NEW_BUNDLE_PATH, "w", allowZip64=True) as dst:
 
-    old_size_gb = os.path.getsize(OLD_BUNDLE_PATH) / (1 << 30)
-    new_size_gb = os.path.getsize(NEW_BUNDLE_PATH) / (1 << 30)
-    print(
-        f"[Convert] Done. {OLD_BUNDLE_PATH} ({old_size_gb:.1f} GB) -> "
-        f"{NEW_BUNDLE_PATH} ({new_size_gb:.1f} GB). Original left untouched -- "
-        "verify the new bundle, then manually delete the old file and the scratch "
-        f"cache dir ({SCRATCH_CACHE_DIR}) once satisfied.",
-        flush=True,
-    )
+        _log(f"Phase 1/3: {len(modes)} matrices -> CSR")
+        for name, arcname in modes:
+            matrix = _memmap_zip_member(OLD_BUNDLE_PATH, arcname)
+            dense_gb = matrix.size * 4 / (1 << 30)
+            _log(f"  {name}: {matrix.shape} dense ({dense_gb:.1f} GB) ...")
+            matrix_headers[name] = encode_matrix_csr(dst, name, matrix)
+            nnz = matrix_headers[name]["nnz"]
+            _log(f"  {name}: nnz={nnz} ({nnz / matrix.size:.1%} of dense)")
+            del matrix
+
+        _log(f"Phase 2/3: metadata ({len(catalog_types)} poi_types)")
+        for arr_name, arr in (
+            ("poi_catalog_src_keys", catalog_src_keys),
+            ("poi_catalog_source_coords", catalog_source_coords),
+            ("poi_catalog_ptr", catalog_ptr),
+            ("bus_dest_coords", bus_dest_coords),
+        ):
+            with dst.open(f"{arr_name}.npy", "w") as f:
+                np.save(f, arr)
+        if subway_dest_coords is not None:
+            with dst.open("subway_dest_coords.npy", "w") as f:
+                np.save(f, subway_dest_coords)
+
+        dst.writestr("manifest.json", json.dumps({
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "non_bus_cache_schema_version": target_cache_version,
+            "node_ids": node_ids,
+            "routing_departure_iso": routing_departure_iso,
+            "origins_sig": origins_sig,
+            "destinations_sig": destinations_sig,
+            "poi_catalog_types": catalog_types,
+            "poi_radius_m": radius_m,
+            "has_subway": has_subway,
+            "matrices": matrix_headers,
+        }))
+
+        _log(f"Phase 3/3: {len(node_ids)} node blobs")
+        bytes_in = bytes_out = 0
+        # smoothing well below tqdm's 0.3 default: blob sizes vary a lot, and over 23k items
+        # a slow-moving average gives a far more usable ETA than one that tracks the last few.
+        bar = tqdm(node_ids, desc="[Convert] blobs", unit="node", smoothing=0.05)
+        for i, node_id in enumerate(bar):
+            raw = src.read(f"non_bus_blobs/{node_id}.bin")
+            payload = _convert_blob(pickle.loads(raw), dest_map, radius_m)
+            payload["schema_version"] = target_cache_version
+            enc = encode_blob(payload, catalog_sizes)
+            dst.writestr(f"non_bus_blobs/{node_id}.bin", enc)
+            bytes_in += len(raw)
+            bytes_out += len(enc)
+            if i % 200 == 0:       # postfix formatting isn't free; keep it off the hot path
+                bar.set_postfix_str(
+                    f"{bytes_in / (1 << 30):.1f}->{bytes_out / (1 << 30):.1f} GB "
+                    f"({bytes_in / max(bytes_out, 1):.2f}x)"
+                )
+        bar.close()
+
+    old_gb = old_size / (1 << 30)
+    new_gb = os.path.getsize(NEW_BUNDLE_PATH) / (1 << 30)
+    matrix_gb = (new_gb * (1 << 30) - bytes_out) / (1 << 30)
+    _log(f"Done in {(time.monotonic() - _T0) / 60:.1f} min")
+    _log(f"  matrices + metadata: {matrix_gb:6.2f} GB")
+    _log(f"  blobs:               {bytes_out / (1 << 30):6.2f} GB "
+         f"(from {bytes_in / (1 << 30):.1f} GB, {bytes_in / max(bytes_out, 1):.2f}x)")
+    _log(f"  total:               {old_gb:.1f} GB -> {new_gb:.1f} GB "
+         f"({old_gb / new_gb:.2f}x smaller)")
+    _log(f"Original left untouched at {OLD_BUNDLE_PATH}; verify the new bundle loads "
+         "before deleting it.")
 
 
 if __name__ == "__main__":

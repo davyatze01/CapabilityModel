@@ -50,12 +50,10 @@ atexit.register(_terminate_active_accessibility_pool)
 
 _BUS_IMPEDANCE_MATRIX: NDArray[np.float32] | None = None
 _BUS_SOURCE_ID_TO_ROW: dict[str, int] | None = None
-_BUS_DEST_COORD_TO_COL: dict[tuple[float, float], int] | None = None
 # Optional second public-transport modality (subway). Left None when the city has no subway,
 # in which case subway is excluded from the RRA entirely (mode count stays 4).
 _SUBWAY_IMPEDANCE_MATRIX: NDArray[np.float32] | None = None
 _SUBWAY_SOURCE_ID_TO_ROW: dict[str, int] | None = None
-_SUBWAY_DEST_COORD_TO_COL: dict[tuple[float, float], int] | None = None
 _ACCESS_DEDUPLICATE_ENTRIES: bool = True
 # Per-service POI dedup: source_keys each poi_type must drop (owned by another type).
 _POI_DROP_BY_TYPE: dict[str, set[str]] = {}
@@ -65,10 +63,6 @@ _POI_DROP_BY_TYPE: dict[str, set[str]] = {}
 _POI_CATALOG: dict[str, dict[str, Any]] = {}
 
 _POI_RADIUS_ENABLED: bool = False
-_POI_RADIUS_M: float | None = None
-_POI_RADIUS_DECAY_THRESHOLD: float = 0.05
-_POI_RADIUS_MAX_SPEED_KMH: float = 60.0
-_global_radius_m: float | None = None
 
 # Per-node sparse accessibility_by_poi is written to a compressed .npz right here in the
 # worker, as soon as it's computed, instead of being returned through IPC. That dict can
@@ -84,17 +78,6 @@ _ENABLED_NON_BUS_MODES: tuple[str, ...] = ("walk", "bike", "drive")
 _POI_UTIL_DEFAULT: float = 1.0        # general affordability multiplier
 _POI_UTIL_CANTEEN: float = 1.0        # status-benefit override for canteen instances
 _CANTEEN_OSMIDS: frozenset[str] = frozenset()  # OSM ids the canteen override applies to
-
-
-def _haversine_m_np(lat1: float, lon1: float, lat2: NDArray[np.float64], lon2: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Array version of utils.delta_g._haversine_m: one fixed origin vs many destinations."""
-    r = 6371000.0
-    phi1 = math.radians(lat1)
-    phi2 = np.radians(lat2)
-    dphi = np.radians(lat2 - lat1)
-    dlambda = np.radians(lon2 - lon1)
-    a = np.sin(dphi / 2.0) ** 2 + math.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0) ** 2
-    return 2.0 * r * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
 
 
 def _utility_for_source_key(source_key, poi_type: str) -> float:
@@ -538,32 +521,19 @@ def _init_accessibility_worker(
     - None. Populates worker globals used during node computation.
     """
     global _NON_BUS_CACHE_SCHEMA_VERSION, _NON_BUS_POI_CONFIG_SIGNATURE, _ACCESS_PROGRESS_VALUE
-    global _BUS_SOURCE_ID_TO_ROW, _BUS_DEST_COORD_TO_COL, _BUS_IMPEDANCE_MATRIX
-    global _SUBWAY_SOURCE_ID_TO_ROW, _SUBWAY_DEST_COORD_TO_COL, _SUBWAY_IMPEDANCE_MATRIX
+    global _BUS_SOURCE_ID_TO_ROW, _BUS_IMPEDANCE_MATRIX
+    global _SUBWAY_SOURCE_ID_TO_ROW, _SUBWAY_IMPEDANCE_MATRIX
     global _ACCESS_DEDUPLICATE_ENTRIES, _POI_DROP_BY_TYPE, _POI_CATALOG
-    global _POI_RADIUS_ENABLED, _POI_RADIUS_M, _POI_RADIUS_DECAY_THRESHOLD, _POI_RADIUS_MAX_SPEED_KMH, _global_radius_m
+    global _POI_RADIUS_ENABLED
     global _ENABLED_NON_BUS_MODES, _POI_UTIL_DEFAULT, _POI_UTIL_CANTEEN, _CANTEEN_OSMIDS
     global _POI_BY_NODE_DIR, _SOURCE_KEY_TO_ID
     _ENABLED_NON_BUS_MODES = tuple(enabled_non_bus_modes)
     _POI_UTIL_DEFAULT = float(poi_util_default)
     _POI_UTIL_CANTEEN = float(poi_util_canteen)
     _CANTEEN_OSMIDS = frozenset(str(x) for x in canteen_osmids)
+    # The radius test itself now runs at routing time (utils.delta_g writes in_radius per
+    # POI); the worker only needs to know whether to honour it.
     _POI_RADIUS_ENABLED = bool(poi_radius_enabled)
-    _POI_RADIUS_M = poi_radius_m
-    _POI_RADIUS_DECAY_THRESHOLD = float(poi_radius_decay_threshold)
-    _POI_RADIUS_MAX_SPEED_KMH = float(poi_radius_max_speed_kmh)
-
-    # Pre-compute once per worker the single global radius used for bus filtering
-    if _POI_RADIUS_ENABLED:
-        if _POI_RADIUS_M is not None:
-            _global_radius_m = float(_POI_RADIUS_M)
-        else:
-            from utils.decay import threshold_radius_m
-            from utils import services as _serv
-            max_coeff = max(_serv.POI_DECAY_COEFFICIENTS.values())
-            _global_radius_m = threshold_radius_m(max_coeff, _POI_RADIUS_DECAY_THRESHOLD, _POI_RADIUS_MAX_SPEED_KMH)
-    else:
-        _global_radius_m = None
     _NON_BUS_CACHE_SCHEMA_VERSION = non_bus_cache_schema_version
     _NON_BUS_POI_CONFIG_SIGNATURE = str(non_bus_poi_config_signature or "")
     _ACCESS_DEDUPLICATE_ENTRIES = bool(deduplicate_entries)
@@ -583,22 +553,13 @@ def _init_accessibility_worker(
         dest_id_to_col_raw = json.load(f)
     dest_id_to_col = {str(k): int(v) for k, v in dest_id_to_col_raw.items()}
 
-    _BUS_DEST_COORD_TO_COL = {}
-    with open(dest_csv_path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            coord = (round(float(row["lat"]), 6), round(float(row["lon"]), 6))
-            col = dest_id_to_col.get(row["id"])
-            if col is not None:
-                _BUS_DEST_COORD_TO_COL[coord] = int(col)
-
     _BUS_IMPEDANCE_MATRIX = np.memmap(
         matrix_path, dtype=np.float32, mode="r",
         shape=(len(_BUS_SOURCE_ID_TO_ROW), len(dest_id_to_col))
     )
 
-    # Optional subway modality: load a second impedance matrix + coord index when configured.
+    # Optional subway modality: load a second impedance matrix when configured.
     _SUBWAY_SOURCE_ID_TO_ROW = None
-    _SUBWAY_DEST_COORD_TO_COL = None
     _SUBWAY_IMPEDANCE_MATRIX = None
     if subway_matrix_path:
         with open(subway_source_id_to_row_path, encoding="utf-8") as f:
@@ -608,14 +569,6 @@ def _init_accessibility_worker(
         with open(subway_dest_id_to_col_path, encoding="utf-8") as f:
             subway_dest_raw = json.load(f)
         subway_dest_id_to_col = {str(k): int(v) for k, v in subway_dest_raw.items()}
-
-        _SUBWAY_DEST_COORD_TO_COL = {}
-        with open(subway_dest_csv_path, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                coord = (round(float(row["lat"]), 6), round(float(row["lon"]), 6))
-                col = subway_dest_id_to_col.get(row["id"])
-                if col is not None:
-                    _SUBWAY_DEST_COORD_TO_COL[coord] = int(col)
 
         _SUBWAY_IMPEDANCE_MATRIX = np.memmap(
             subway_matrix_path, dtype=np.float32, mode="r",
@@ -684,13 +637,11 @@ def _compute_node_accessibility(item):
             return None
 
         poi_beta_cache: dict[str, float] = {}
-        origin_coord = state.get("origin")  # (lat, lon) stored by non_bus_routing_stage
         services_state = state.get("services", {})
 
         source_id_to_row = _BUS_SOURCE_ID_TO_ROW
-        dest_coord_to_col = _BUS_DEST_COORD_TO_COL
         impedance_matrix = _BUS_IMPEDANCE_MATRIX
-        if source_id_to_row is None or dest_coord_to_col is None or impedance_matrix is None:
+        if source_id_to_row is None or impedance_matrix is None:
             raise RuntimeError("Bus impedance matrix is not initialized in worker.")
         
         
@@ -700,7 +651,6 @@ def _compute_node_accessibility(item):
         subway_enabled = (
             _SUBWAY_IMPEDANCE_MATRIX is not None
             and _SUBWAY_SOURCE_ID_TO_ROW is not None
-            and _SUBWAY_DEST_COORD_TO_COL is not None
         )
         subway_source_row = _SUBWAY_SOURCE_ID_TO_ROW.get(str(node_id)) if subway_enabled else None
 
@@ -714,7 +664,7 @@ def _compute_node_accessibility(item):
         def _compute_per_poi_accessibility(entry) -> list[float]:
             """Compute one accessibility value per individual POI in an entry.
 
-            Each POI in poi_coords[i] / source_keys[i] is evaluated independently
+            Each POI in kept_idx[i] / source_keys[i] is evaluated independently
             before being aggregated at the poi_type level. This preserves per-POI
             scores for downstream export (service_power / capability_power).
 
@@ -728,7 +678,7 @@ def _compute_node_accessibility(item):
             - entry: non-bus cache entry with per-POI parallel lists.
 
             Outputs:
-            - list of per-POI accessibility values aligned to entry["poi_coords"].
+            - list of per-POI accessibility values aligned to entry["kept_idx"].
             """
             poi_type = entry["poi_type"]
             beta = poi_beta_cache.get(poi_type)
@@ -737,8 +687,8 @@ def _compute_node_accessibility(item):
                 poi_beta_cache[poi_type] = beta
             neg_beta = -beta
 
-            poi_coords = entry["poi_coords"]
-            n = int(poi_coords.shape[0])
+            kept_idx = entry["kept_idx"]
+            n = int(kept_idx.shape[0])
             if n == 0:
                 return []
 
@@ -748,8 +698,7 @@ def _compute_node_accessibility(item):
 
             # source_keys is origin-invariant, so it lives once in the shared _POI_CATALOG
             # (see exports/artifact_bundle.py) instead of this per-node entry -- kept_idx
-            # resolves this entry's POIs into it, positionally aligned with poi_coords.
-            kept_idx = entry.get("kept_idx", np.empty(0, dtype=np.int32))
+            # resolves this entry's POIs into it, positionally aligned with the imp arrays.
             catalog_keys = _POI_CATALOG.get(poi_type, {}).get("src_keys")
             source_keys = catalog_keys[kept_idx].astype(str).tolist() if catalog_keys is not None else [None] * n
 
@@ -764,29 +713,14 @@ def _compute_node_accessibility(item):
                     if source_keys[i] in drop_keys:
                         valid[i] = False
 
-            lat_arr = poi_coords[:, 0]
-            lon_arr = poi_coords[:, 1]
+            if _POI_RADIUS_ENABLED:
+                valid &= entry["in_radius"]
 
-            if _POI_RADIUS_ENABLED and origin_coord is not None and _global_radius_m is not None:
-                dists = _haversine_m_np(origin_coord[0], origin_coord[1], lat_arr, lon_arr)
-                valid &= dists <= _global_radius_m
-
-            # Destination-column lookups require hashing rounded (lat, lon) tuples against
-            # the bus/subway coord->column maps -- that part stays a per-POI Python loop
-            # (only for still-valid rows), but it does no math beyond a dict.get, unlike the
-            # exp/sort work below which is now fully vectorized.
-            dest_cols = np.full(n, -1, dtype=np.int64)
-            subway_cols = np.full(n, -1, dtype=np.int64) if subway_enabled else None
-            valid_idx = np.nonzero(valid)[0]
-            for i in valid_idx:
-                coord_key = (round(float(lat_arr[i]), 6), round(float(lon_arr[i]), 6))
-                dc = dest_coord_to_col.get(coord_key)
-                if dc is not None:
-                    dest_cols[i] = dc
-                if subway_enabled:
-                    sc = _SUBWAY_DEST_COORD_TO_COL.get(coord_key)
-                    if sc is not None:
-                        subway_cols[i] = sc
+            # Matrix columns were resolved once at routing time (utils.delta_g._dest_col_map)
+            # instead of re-hashing rounded coords per POI on every read. Columns are filled
+            # for invalid rows too -- harmless, since rra is masked by `valid` below.
+            dest_cols = entry["dest_col"].astype(np.int64)
+            subway_cols = dest_cols if subway_enabled else None
 
             def _matrix_decay(index_arr, matrix, src_row):
                 out = np.zeros(n, dtype=np.float64)
@@ -873,7 +807,7 @@ def _compute_node_accessibility(item):
         for key, entry in entry_by_poi_type.items():
             per_poi_accs[key] = _compute_per_poi_accessibility(entry) if _ACCESS_DEDUPLICATE_ENTRIES else [
                 _compute_per_poi_accessibility(entry)[i]
-                for i in range(len(entry["poi_coords"]))
+                for i in range(len(entry["kept_idx"]))
             ]
 
         # --- Step 2: RRA-aggregate per-POI → per-poi-type (for service stage) -

@@ -382,3 +382,161 @@ this is maintained.
   with the same shared, rounded set `[0.35, 0.51, 0.66, 0.80]` so every city now classifies
   against one universal boundary.
 
+
+## 2026-09-07
+
+- Investigated why `artifacts/mgp_boundary/impedances.npz` had grown to 107 GB (345 GB for the
+  whole artifacts dir). Measured its actual composition: only ~32% of the bytes are impedance
+  values. Of the 114 GB uncompressed, `non_bus_blobs/` is 88.8 GB and the bus + subway matrices
+  are 12.6 GB each; within a blob, `poi_coords` is exactly 50% of the array bytes, the three
+  `imp_*` arrays 12.5% each, `kept_idx` 12.5%. The two matrices are 86.7%/88.4% exact zeros
+  (subway's median row has *zero* nonzeros). The bundle also ships the working non-bus cache
+  verbatim — `exports/artifact_bundle.py` `zf.write(cache_path, ...)` zips the scratch `.pkl`
+  files in as-is, pickle framing included — which is what `poi_coords` was doing there at all.
+- Established that the blob's `poi_coords` is never user-facing geometry: exported POI
+  coordinates come from the shared catalog (`exports/poi_exports.py` reads
+  `catalog["source_coords"]`), and all three consumers of the blob copy used it purely as an
+  addressing key — `accessibility_stage` and `debug_pipeline` both hashed the rounded lat/lon
+  into a bus/subway matrix column, and the only true geometric use was the radius haversine.
+  Replaced the geometry with the addressing it was used to compute.
+- `utils/delta_g.py`: added `_dest_col_map`, a per-worker-cached `{rounded (lat, lon) ->
+  matrix column}` map built with the same 6-decimal rounding `accessibility_stage` used, so a
+  POI resolves to the identical column on the write and read sides. Verified the resulting map
+  is equal to the map the old read path built from the same files. Bus and subway were found to
+  share one destination set (`bus == subway` as dicts; `dest_col == subway_col` on 181380/181380
+  POIs), since both routing runs use the same snap output — so one map addresses both matrices
+  and the function raises if a city ever diverges. Also moved `_haversine_m_np` here from
+  `accessibility_stage` (it was documented as the array mirror of this file's `_haversine_m`)
+  and gave it the file-local `import numpy as np` the other functions use.
+- Same file, `accessibility_non_bus_from_snap_map`: `poi_coords` is now a per-origin transient
+  only. The return dict drops it in favour of `dest_col` (-1 when the POI reaches no stop) and
+  `in_radius` (the same radius test, but against the *snapped* coord — `kept_idx` upstream
+  filters on the *source* coord, so the two differ for POIs that snap across the boundary).
+  This moves the per-POI coord-hash loop off the accessibility hot path and onto routing, where
+  it runs once instead of on every read.
+- `routing/non_bus_routing_stage.py`, `stages/accessibility_stage.py`,
+  `tools/debug_pipeline.py`: propagated the new entry shape. The accessibility stage now reads
+  `entry["dest_col"]` / `entry["in_radius"]` instead of re-deriving them, which deleted the
+  coord-hashing loop, the radius haversine, `_haversine_m_np`, `origin_coord`, the
+  `_BUS_/_SUBWAY_DEST_COORD_TO_COL` globals and the `_global_radius_m` machinery — each worker
+  had been parsing two ~140k-row destination CSVs into dicts it now never reads. `_bus_time` in
+  the debug tool takes a column instead of a coord; its reported `src_lat`/`src_lon` came from
+  the catalog and are unchanged.
+- `core/config.py`: bumped `non_bus_cache_schema_version` 10 -> 11 (existing blobs carry
+  `poi_coords` and no `dest_col`, so without the bump `_is_valid_non_bus_cache` would accept a
+  stale blob and the accessibility stage would die on the missing key).
+  `exports/artifact_bundle.py`: bumped `ARTIFACT_SCHEMA_VERSION` 3 -> 4.
+- First wrote `scripts/convert_non_bus_cache.py` to migrate the on-disk v10 blobs in place
+  (verified on three real Paris blobs: 34.3% smaller, all `imp_*`/`kept_idx` bit-identical,
+  100% of columns resolved), then deleted it: converting the *cache* only helps the artifact
+  indirectly, since `write_impedance_bundle` builds the artifact from the cache. Replaced by a
+  direct bundle-to-bundle conversion (below), after which loading a v4 bundle regenerates the
+  cache anyway, so there is one migration route rather than two.
+- Rejected a vectorised `np.searchsorted` version of that lookup after measuring it: Python's
+  `round()` rounds the decimal value half-to-even while `np.round` does multiply-rint-divide in
+  binary, and the two disagree on exact ties — 5% of these snapped latitudes are ties, giving a
+  9.7% mismatch rate. A mismatched POI would resolve to -1 and silently lose its transit
+  impedance, so both the converter and `delta_g` keep the scalar Python dict lookup (the same
+  reasoning as the existing scalar-haversine comment in the `kept_idx` radius filter).
+- `exports/artifact_bundle.py`: added the schema-4 codec, shared by the writer, the reader and
+  the converter so all three agree by construction. `_shuffle_bytes`/`_unshuffle_bytes` group a
+  float32 array's byte planes before compression (the exponent bytes are nearly constant across
+  travel times, so planing them makes runs a compressor can use; measured 1.94x with lzma vs
+  1.48x on interleaved bytes, and it is a permutation, not a quantization).
+  `_pack_kept_idx`/`_unpack_kept_idx` replace the int32 index list with a presence bitmask over
+  the shared catalog (~14x smaller at the measured ~47% coverage). `encode_blob`/`decode_blob`
+  serialize one node as a JSON header plus ONE lzma stream over all its arrays -- compressing
+  per-array instead measured 1.40x vs 1.73x joined, since lzma needs a wide window to find the
+  cross-array redundancy. `encode_matrix_csr`/`decode_matrix_csr` store the two matrices as CSR
+  (they are 86-88% exact zeros; zero means "no service" and already decodes to zero decay via
+  `_matrix_decay`'s `vals > 0`, and CSR reconstructs it as exactly 0.0). `_write_shuffled_lzma`/
+  `_read_shuffled_lzma` stream that in 64 MB chunks so peak memory is one chunk rather than the
+  ~1.7 GB a dense city's CSR index array reaches. `_memmap_zip_member` maps an uncompressed .npy
+  member in place, so a 12.6 GB matrix is read straight out of the .npz at an offset instead of
+  being extracted to a temp file; `_restore_matrix_fast` became unused and was removed.
+- Same file: rewrote `load_impedance_bundle` and `write_impedance_bundle` for schema 4. The
+  bundle is now described by a `manifest.json` member (schema versions, node ids, signatures,
+  matrix headers, and `poi_radius_m` -- recorded so the artifact is self-describing rather than
+  silently depending on the recipient's config matching the writer's). Restore still produces
+  exactly the on-disk layout the live stages write (catalog pickle, row/column JSON indexes,
+  destinations CSV via the new `_write_mode_sidecars`, dense `.dat` memmaps), so nothing
+  downstream can tell whether a run routed or restored. Both directions keep a thread pool:
+  measured that lzma releases the GIL (5.83x on 8 threads, 11.2 min -> 1.9 min to decode 23k
+  blobs), so the pool now tracks core count rather than the old 4x I/O oversubscription, and
+  the writer encodes in parallel but writes serially in bounded windows since `ZipFile` is not
+  thread-safe.
+- Replaced `scripts/convert_paris_impedance_bundle.py` (was a one-time schema 2 -> 3 migration)
+  with a schema 3 -> 4 one. It streams `.npz` -> `.npz` directly -- no scratch cache, no
+  pipeline run, no re-routing -- and is self-contained: the column map is rebuilt from the
+  bundle's own `bus_dest_coords` (verified equal to the map built from the on-disk CSV), so the
+  conversion needs nothing but the input file. Verified end-to-end on a miniature bundle built
+  from real Paris data (3 real node blobs, the real 136,744-destination catalog, real matrix
+  rows): every `imp_*`/`kept_idx` array bit-identical, both matrices bit-identical after the CSR
+  round-trip, `dest_col` matching a direct hash of the original `poi_coords` on 503,000/503,000
+  POIs, `in_radius` matching the original haversine on 503,000/503,000, and zero unresolved
+  columns. Then round-tripped the whole chain (v3 -> convert -> v4 -> load -> write -> load)
+  with everything still bit-identical.
+- Measured projections for the real Paris artifact: blobs 88.8 GB -> ~24.5 GB (3.6x per blob,
+  measured), matrices 25.2 GB -> ~2.5 GB (10.15x, measured on 2000 real rows), so ~107 GB ->
+  ~27 GB, entirely lossless. The 13 GB target is below the lossless floor: after removing all
+  redundancy the remaining bulk is ~17 GB of genuine float32 travel times across three modes,
+  and reaching 13 GB would require quantizing them (uint16 at 0.01-min resolution) or shipping
+  fewer modes, neither of which is in this change.
+- Added progress reporting to the conversion path, since the long stretches were invisible.
+  In `exports/artifact_bundle.py`, `encode_matrix_csr`/`decode_matrix_csr` now carry a bar
+  across their row passes (a dense city reads ~25 GB there) and `_write_shuffled_lzma`/
+  `_read_shuffled_lzma` take an optional `desc` for a byte-scaled bar (lzma at preset=1 moves
+  tens of MB/s, so a 1.7 GB CSR index array is minutes of silence). All are driven by counters
+  already known -- bytes consumed, rows processed -- rather than a separate counting pass, and
+  the inner bars use `leave=False` so they clear rather than pile up.
+  `scripts/convert_paris_impedance_bundle.py` got a `_log` helper that stamps every line with
+  elapsed mm:ss, numbered phase banners (matrices / metadata / blobs), a blob bar whose postfix
+  reports running GB in->out and the live compression ratio (refreshed every 200 nodes to keep
+  formatting off the hot path) with `smoothing=0.05` so the ETA is stable across 23k
+  variable-sized items instead of tracking the last few, and a closing breakdown that splits
+  matrices from blobs so a disappointing total says which part underperformed. Verified the
+  rewritten loop (now `src.read` rather than `src.open`, so bytes can be measured) emits
+  byte-identical blobs to the pre-logging version.
+- `tools/debug_pipeline.py` `_build_chain`: added the non-bus cache schema-version check that
+  this reader was missing. `accessibility_stage` guards its reads with
+  `_is_valid_non_bus_cache`, but the debug tool unpickled and trusted the shape, so running
+  `main.py` with `DEBUG_REPORT_ONLY` against a pre-schema-4 cache surfaced as
+  `KeyError: 'dest_col'` several frames deep rather than saying the cache was stale. Raises
+  rather than skipping the node: every blob is stale at once, and skipping would emit a report
+  full of silently empty chains.
+- Ran the real migration on Paris: `impedances.npz` 107 GB -> 23.9 GB (4.5x), all 23,046 node
+  blobs and both matrices present (bus nnz 431,383,809 = 13.7% of dense; subway 371,223,606 =
+  11.8%), and loading it rewrote the whole non-bus cache to v11 (83 GB -> 55 GB, all 23,046
+  sidecars at v11). Nothing quantized: the reduction is entirely removed duplication plus
+  lossless compression.
+- Checked dependency portability after the change: it adds no third-party package (the imports
+  are numpy/tqdm, both already pinned) and drops one, since the rewritten converter no longer
+  needs geopandas -- so `pip install -r requirements.txt` on a fresh Windows or Linux clone is
+  still sufficient. `lzma` is new to the repo but is stdlib and ships prebuilt in every Windows
+  CPython; only source-built Linux Pythons need xz-devel present at build time, which this
+  machine's pyenv build has. Benchmarked zstandard as an alternative (zstd-19: 2.18x vs lzma's
+  2.24x on blobs, but 20.7x vs 13.8x on CSR indices and ~23x faster decompression) and did not
+  switch -- roughly +0.5 GB overall, and it would have invalidated the freshly converted
+  bundle for no requirement that actually needed satisfying.
+- Same script: Pylance flagged `enumerate(subway_dest_coords)` as possibly-None, since it
+  cannot correlate the `has_subway` bool with the optional array assigned beside it. Narrowed
+  on the array itself (`if subway_dest_coords is not None`) at both use sites rather than
+  casting, and extracted the coord->column dict comprehension (duplicated verbatim for bus and
+  subway) into `_coord_col_map(dest_coords: np.ndarray)`, whose non-optional parameter fixes
+  the complaint at its source. Verified the refactor emits a byte-identical bundle.
+- Same file, two more Pylance optional-narrowing complaints of the same shape: `node["lat"]`
+  in `_pick_hex_for` (the non-None guarantee lived in a separate `nid` symbol, so the checker
+  could not follow it) and `imp_*_arr[i]` (guarded by `_reachable`, which does the None test
+  inside the function and returns only a bool). Fixed both by making the guarantee visible
+  rather than casting: `_pick_hex_for` now narrows on `node` itself with an early `continue`
+  (which also flattens a nesting level, and keeps the empty-node_id case the old `if nid and
+  ...` covered), and the three `imp_*` reads use `entry[...]` instead of `entry.get(...)`,
+  since delta_g writes all three unconditionally in both its normal and empty returns -- the
+  `.get()` was claiming an optionality that does not exist.
+- `_load_housing_context`: Pylance flagged `float(row.buy_price_eur_sqm_month)` and the rent
+  field (`Argument of type "Scalar" cannot be assigned ... "complex" is not assignable to
+  "ConvertibleToFloat"`) -- a pandas-stubs quirk where `itertuples()` types every field as
+  `Scalar`, a union that includes `complex`, which `float()`'s stub rejects. Switched to
+  `df.to_dict("records")` (dict access types as `Any`, sidestepping the union) instead of
+  casting. Verified against the real 1,462-row `housing/cagliari_nodes_omi.csv`: identical
+  output to the old itertuples version.

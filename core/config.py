@@ -306,7 +306,7 @@ class PipelineConfig:
     enable_progress: bool = True
 
     non_bus_cache_dir: str = ""
-    non_bus_cache_schema_version: int = 10
+    non_bus_cache_schema_version: int = 11
     # Shared per-poi_type {src_keys, source_coords} catalog -- written once by the live
     # pipeline and restored to this same path when an impedance bundle is loaded, so
     # both paths give the accessibility stage one place to resolve a node's kept_idx.
