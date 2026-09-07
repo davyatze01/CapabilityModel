@@ -87,9 +87,9 @@ CITY_PRESETS: dict[str, PresetDict] = {
         "name_shapefile": "mgp_boundary.shp",
         "poi_from_shp": True,
         "poi_shapefile_paths": [
-            "Paris/POI_point.shp",
-            "Paris/POI_line.shp",
-            "Paris/POI_polygon.shp",
+            "Paris/POI_point2.shp",
+            "Paris/POI_line2.shp",
+            "Paris/POI_polygon2.shp",
         ],
         # Paris' MGP layers carry the classification attribute under this column name.
         "poi_label_field": "TYPEQU",

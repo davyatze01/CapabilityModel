@@ -18,7 +18,6 @@
   ],
   "python.analysis.indexing": false,
   "python.analysis.diagnosticMode": "openFilesOnly",
-  "python-envs.defaultEnvManager": "ms-python.python:system",
   "git.ignoredRepositories": ["interfaccia"],
   "terminal.integrated.profiles.linux": {
     "host-bash": {

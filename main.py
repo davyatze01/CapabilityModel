@@ -10,7 +10,7 @@ from core.runtime_setup import run_runtime_setup
 faulthandler.enable(all_threads=True)
 
 # Change this to "paris" to switch the whole pipeline to Paris.
-study_city = "cagliari"
+study_city = "paris"
 
 # ── Execution knobs (edit here instead of setting environment variables) ──────────────
 # SAFE_MODE: gentle execution to avoid pinning the machine at full load — caps native math
@@ -54,11 +54,11 @@ DEBUG_REPORT = True
 # If true, skip the pipeline entirely and just (re)generate the debug report from the
 # last run's artifacts already on disk (non_bus/bus/accessibility/service caches,
 # grid_params.json, the spatial gpkg). Useful after a debug_pipeline.py-only change.
-DEBUG_REPORT_ONLY = False
+DEBUG_REPORT_ONLY = True
 # If true, main will generate a robustness analysis dashboard
 ROBUSTNESS_REPORT = True
 # If true, main will generate a dashboard that evaluates the model's sensitivity when changing the parameters
-SENSITIVITY_REPORT = True
+SENSITIVITY_REPORT = False
 # PAID_POI_AFFORDABILITY: general affordability multiplier u(y) applied to paid poi_types
 #   (core.profiles.PAID_POI_TYPES) — e.g. 0.7 discounts every paid POI's contribution to
 #   accessibility by 30%, same mechanism scenarios.py's personas use. None = baseline (1.0,
@@ -66,7 +66,7 @@ SENSITIVITY_REPORT = True
 #   the artifact namespace like POI_RADIUS_KM does, and the accessibility-matrix cache's
 #   signature doesn't account for this value (see core.profiles.Profile.affordability) —
 #   delete artifacts/<slug>/ before a run where you change this, per project convention.
-PAID_POI_AFFORDABILITY: float | None = None
+PAID_POI_AFFORDABILITY: float | None = 0.7
 
 def _reexec_under_run_safe_if_needed() -> None:
     """Re-run this entrypoint through run_safe.sh when not already in a cgroup scope.
