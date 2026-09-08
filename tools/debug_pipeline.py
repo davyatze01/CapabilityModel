@@ -1717,8 +1717,11 @@ def run_debug_pipeline(study_city = STUDY_CITY, output = None) -> None:
     housing_ctx = _load_housing_context(cfg)
     print(f"[Debug] bus={'ok' if bus_ctx else 'missing'} acc={'ok' if acc_ctx else 'missing'} subway={'ok' if subway_ctx else 'missing'} svc={'ok' if svc_ctx else 'missing'} housing={'ok' if housing_ctx else 'missing'}")
     if cfg.enable_subway and subway_ctx is None:
-        raise RuntimeError(f"Subway is none even if enabled, please check the subway artifacts in artifacts/{cfg.artifact_slug}/subway and the paths in" \
-        f" {cfg.public_transport_paths("metro")}")
+        raise RuntimeError(
+            f"Subway is none even if enabled, please check the subway artifacts in "
+            f"artifacts/{cfg.artifact_slug}/subway and the paths in "
+            f'{cfg.public_transport_paths("metro")}'
+        )
         
     # Same per-service ownership drop map the accessibility + export stages apply, so the
     # debug recomputation/verification matches the pipeline's deduplicated values.
