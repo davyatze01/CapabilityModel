@@ -1,10 +1,9 @@
 """Generate standalone PNG legends for the per-capability colored grids.
 
 Each legend is a vertical stack of 5 swatches (one per ELECTRE TRI class, Very
-Low at the bottom -> Very High at the top). Each swatch is filled with that
-level's shade of the capability's signature color (the exact same 5 discrete
-shades the QGIS capability grid uses, from
-utils.capabilities.capability_shade_hexes) and outlined in black at that level's
+Low at the bottom -> Very High at the top). Each swatch is filled with the
+shared CAPABILITY_COLOR_STOPS palette (the exact same 5 colors the QGIS
+capability grid uses) and outlined in black at that level's
 iso-band stroke width (0.3 -> 1.8 mm, thin at Very Low, thick at Very High) so
 the legend also encodes the iso-band line weight.
 
@@ -25,10 +24,10 @@ from matplotlib.patches import Rectangle, RegularPolygon
 
 from utils.capabilities import (
     CAPABILITY_COLORS,
+    CAPABILITY_COLOR_STOPS,
     ELECTRE_BOUNDS,
     ELECTRE_SHORT_LABELS,
     ISO_BAND_WIDTHS_MM,
-    capability_shade_hexes,
 )
 
 # QGIS symbol widths are in millimetres; matplotlib linewidths are in points.
@@ -46,8 +45,7 @@ def render_legend(capability: str, shape: str, output_path: Path) -> None:
     shape: "square" -> square swatches; "hexagon" -> flat-top hexagon swatches
     (matching the hexagonal map grid cells).
     """
-    color_hex = CAPABILITY_COLORS[capability]
-    shades = capability_shade_hexes(color_hex)
+    shades = CAPABILITY_COLOR_STOPS
     n = len(ELECTRE_SHORT_LABELS)
 
     fig, ax = plt.subplots(figsize=(3.0, 6))

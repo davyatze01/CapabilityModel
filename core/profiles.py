@@ -75,18 +75,30 @@ def osmid_from_source_key(source_key: object) -> str | None:
     return None
 
 
-# poi_types where affordability plausibly gates access -- market/discretionary spending, not
-# free public space or subsidized public healthcare/social services. Everything NOT listed
-# here gets u=1.0 regardless of a profile's affordability value (see Profile.utility_for).
+# poi_types where affordability plausibly gates access -- discretionary/market spending,
+# food retail, private healthcare/pharmacy purchases, and paid or means-tested social-care
+# services, not free public space. Everything NOT listed here gets u=1.0 regardless of a
+# profile's affordability value (see Profile.utility_for).
 PAID_POI_TYPES: frozenset[str] = frozenset({
-    "organised_sport_indoor",      # gym, climbing wall, ice rink, bowling
-    "organized_sport_outdoor",     # private pitch, golf course, stadium, horse riding
-    "informal_sport_indoor",       # fitness_centre, indoor pool, dance studio
-    "passive_consumption",         # cinema, theatre, events venue
-    "mediated_experience",         # museum, gallery, tourist attraction
-    "on_site_dining",              # restaurant, cafe, pub, bar
-    "takeaway_consumption",        # bakery, fast food, ice cream
-    "therapeutic_wellness",        # spa, sauna, massage (private wellness, not medical care)
+    "organised_sport_indoor",           # gym, climbing wall, ice rink, bowling
+    "organized_sport_outdoor",          # private pitch, golf course, stadium, horse riding
+    "informal_sport_indoor",            # fitness_centre, indoor pool, dance studio
+    "passive_consumption",              # cinema, theatre, events venue
+    "mediated_experience",              # museum, gallery, tourist attraction
+    "on_site_dining",                   # restaurant, cafe, pub, bar
+    "takeaway_consumption",             # bakery, fast food, ice cream
+    "therapeutic_wellness",             # spa, sauna, massage (private wellness, not medical care)
+    "general_food_retail",              # supermarket, convenience, grocery
+    "fresh_food_retail",                # butcher, fishmonger, greengrocer
+    "nonfresh_food_retail",             # packaged/shelf-stable food retail
+    "cultural_production",              # arts centre, community centre, music school
+    "specialized_medical_supply",       # medical equipment/supply retail
+    "pharmaceutical_provision",         # pharmacy
+    "outpatient_therapeutic_care",      # outpatient rehab/therapy
+    "specialized_diagnostic_preventive",# diagnostic/screening clinics
+    "outpatient_clinical_services",     # outpatient clinical visits
+    "residential_social_care",          # paid residential social care
+    "home_community_care",              # paid home/community care services
 })
 
 

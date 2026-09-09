@@ -242,16 +242,14 @@ def _build_qgis_project(cfg: PipelineConfig, gpkg_path: Path, qgis_exe: str) -> 
     # services feeding "care" share the care color map, etc. This is computed once per
     # capability and reused for every service under it.
     from utils.capabilities import (
+        CAPABILITY_COLOR_STOPS,
         CAPABILITY_ENABLED,
         CAPABILITY_SERVICES,
         ELECTRE_BOUNDS,
         ELECTRE_LABELS,
         ISO_BAND_WIDTHS_MM,
-        capability_shade_hexes,
-        get_capability_colors,
+        SERVICE_COLOR_STOPS,
     )
-
-    capability_grid_colors = get_capability_colors(cfg)
 
     import json as _json_cfg
     service_labels: dict[str, str] = {}
@@ -274,52 +272,27 @@ def _build_qgis_project(cfg: PipelineConfig, gpkg_path: Path, qgis_exe: str) -> 
     # back to the symbol's default fill color) when the project is later opened by a
     # different QGIS instance.
     #
-    # The color map for a capability is 5 explicit colors, linearly interpolated from
-    # white (t=0) to the capability's own color (t=1.0): four progressively lighter
-    # hues at t=0.2, 0.4, 0.6, 0.8, and the full color at 1.0 (see
-    # utils.capabilities.capability_shade_hexes -- the single source of truth shared
-    # with the standalone legend generator). The per-service grids interpolate
-    # continuously between these 5 stops; the per-capability grids (below) snap each
-    # cell to one of the 5 discrete shades by ELECTRE class.
-    _STOP_FRACTIONS = [0.2, 0.4, 0.6, 0.8, 1.0]
-
-    def _stop_color_expr(field_name: str, stops: list[str], fractions: list[float]) -> str:
-        def _rgb(hexcolor: str) -> tuple[int, int, int]:
-            h = hexcolor.lstrip("#")
-            return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-
+    # The color map for a capability is the shared 10-stop SERVICE_COLOR_STOPS scale
+    # (utils.capabilities.service_step_color is the Python-side twin of this expression):
+    # one flat color per 0.1-wide bucket, no interpolation between them.
+    def _step_color_expr(field_name: str, stops: list[str]) -> str:
         value_expr = f'clamp(0, "{field_name}", 1)'
-        clauses = [f"WHEN {value_expr} <= {fractions[0]} THEN '{stops[0]}'"]
-        for i in range(1, len(fractions)):
-            lo, hi = fractions[i - 1], fractions[i]
-            (r1, g1, b1), (r2, g2, b2) = _rgb(stops[i - 1]), _rgb(stops[i])
-            t_expr = f"(({value_expr} - {lo}) / {hi - lo})"
-            # color_rgb() with hand-rolled linear interpolation instead of color_mix():
-            # color_mix() is only available from QGIS 3.24 onward, and this expression
-            # is embedded in the GeoPackage's layer_styles table -- it must evaluate on
-            # whatever QGIS version opens the file later, not just the one that built it.
-            color_expr = (
-                f"color_rgb("
-                f"round({r1} + ({r2 - r1}) * {t_expr}), "
-                f"round({g1} + ({g2 - g1}) * {t_expr}), "
-                f"round({b1} + ({b2 - b1}) * {t_expr}))"
-            )
-            clauses.append(f"WHEN {value_expr} <= {hi} THEN {color_expr}")
+        n = len(stops)
+        clauses = [
+            f"WHEN {value_expr} < {(i + 1) / n} THEN '{color}'"
+            for i, color in enumerate(stops[:-1])
+        ]
         return "CASE " + " ".join(clauses) + f" ELSE '{stops[-1]}' END"
 
     service_grid_specs: list[dict[str, object]] = []
     # One discrete-shade colored grid layer per capability, mirroring the iso-band
     # and per-service layers: its own gpkg view (capability_<name>) so a plain
-    # import is styled, filled with the 5 ELECTRE-class shades of the capability's
-    # signature color. This replaces the old single diagonal-hatch grid layer.
+    # import is styled, filled with the shared 5-color CAPABILITY_COLOR_STOPS scale.
+    # This replaces the old single diagonal-hatch grid layer.
     capability_grid_specs: list[dict[str, object]] = []
     for _capability, _services in CAPABILITY_SERVICES.items():
         if not CAPABILITY_ENABLED.get(_capability, True):
             continue
-        _color_hex = capability_grid_colors.get(_capability)
-        if not _color_hex:
-            continue
-        _stop_hexes = capability_shade_hexes(_color_hex)
         capability_grid_specs.append(
             {
                 "capability": _capability,
@@ -329,8 +302,7 @@ def _build_qgis_project(cfg: PipelineConfig, gpkg_path: Path, qgis_exe: str) -> 
                 # so plain gpkg imports show the capability grids styled.
                 "layer": f"capability_{_capability}",
                 "label": f"Capability grid: {_capability}",
-                "color_hex": _color_hex,
-                "shades": _stop_hexes,
+                "shades": CAPABILITY_COLOR_STOPS,
             }
         )
         for _service in _services:
@@ -343,13 +315,11 @@ def _build_qgis_project(cfg: PipelineConfig, gpkg_path: Path, qgis_exe: str) -> 
                     # style, so plain gpkg imports show the service grids styled.
                     "layer": f"service_{_service}",
                     "label": service_labels.get(_service, _service),
-                    "fill_expr": _stop_color_expr(_field_name, _stop_hexes, _STOP_FRACTIONS),
-                    # Static base color for the symbol, distinct from the per-feature
-                    # data-defined fill: the layer-tree icon/legend swatch has no feature
-                    # to evaluate the expression against, so it always renders this base
-                    # color instead. Without it every service layer's icon defaults to the
-                    # same color, making them indistinguishable in the Layers panel.
-                    "color_hex": _color_hex,
+                    "fill_expr": _step_color_expr(_field_name, SERVICE_COLOR_STOPS),
+                    # Static legend-icon color: every service now shares one palette (no
+                    # per-capability hue), so this is just a fixed representative swatch,
+                    # not a way to tell services apart in the Layers panel any more.
+                    "color_hex": SERVICE_COLOR_STOPS[-1],
                     # Which capability this service feeds: used by the generated
                     # script to pick the sample service grid shown on first open.
                     "capability": _capability,
@@ -455,9 +425,9 @@ if grid_available_fields:
 
     # ── Per-capability colored grids ─────────────────────────────────────────────
     # One graduated layer per capability (care/nutrition/restorativeness), each cell
-    # filled with the 5 discrete ELECTRE-class shades of the capability's signature
-    # color (white->color, snapped by class -- see utils.capabilities). This replaces
-    # the old single diagonal-hatch grid layer. Each layer prefers its own gpkg view
+    # filled with the shared 5-color CAPABILITY_COLOR_STOPS scale, snapped by ELECTRE
+    # class (see utils.capabilities). This replaces the old single diagonal-hatch grid
+    # layer. Each layer prefers its own gpkg view
     # (capability_<name>, has_data=1 baked in, own default style) and falls back to
     # the shared grid table with a subset filter. Every cell carries the same thin
     # outline as the shared outline layer so borders read at any zoom.
@@ -509,14 +479,13 @@ if grid_available_fields:
         capability_grid_layers[_cap] = _cap_layer
 
     # ── Per-service monochrome heatmap grids ─────────────────────────────────────
-    # One grid layer per service, each a continuous heatmap fixed on [0, 1] using its
-    # capability's color map: 4 progressively lighter hues of the capability color at
-    # 0.2/0.4/0.6/0.8, and the full signature color at 1.0 (nutrition=#FFA200,
-    # care=#EB4CCC, restorativeness=#006BFF). All services under the same capability
-    # share this exact map. Each spec's "fill_expr" (built in Python, see above) is a
-    # self-contained CASE/color_mix expression with the 5 stop colors baked in as
-    # literal hex constants — no named color ramp to register or resolve, so the
-    # coloring works regardless of which QGIS instance/profile opens the project.
+    # One grid layer per service, each a stepped heatmap fixed on [0, 1] using the
+    # shared 10-color SERVICE_COLOR_STOPS scale: one flat color per 0.1-wide bucket,
+    # every service sharing the exact same scale (no per-capability hue any more).
+    # Each spec's "fill_expr" (built in Python, see above) is a self-contained CASE
+    # expression with the 10 stop colors baked in as literal hex constants — no named
+    # color ramp to register or resolve, so the coloring works regardless of which
+    # QGIS instance/profile opens the project.
     service_grid_specs = {service_grid_specs_literal}
     grid_service_fields = set(f for f in grid_available_fields if f.startswith("grid_mean_service_"))
     # Sample visualization on first open: exactly one service grid starts

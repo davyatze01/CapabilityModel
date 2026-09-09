@@ -540,3 +540,56 @@ this is maintained.
   `df.to_dict("records")` (dict access types as `Any`, sidestepping the union) instead of
   casting. Verified against the real 1,462-row `housing/cagliari_nodes_omi.csv`: identical
   output to the old itertuples version.
+
+## 2026-09-08
+
+- `config/poi_types.csv` (`high_nature_immersion` row): `nature_contact` was scoring low
+  around Poetto (Cagliari's beach). Traced the service (`config/services.csv`) down to its
+  three POI types and found `natural=coastline` fed `scenic_views` (via `natural_aesthetic`)
+  but nothing in `nature_contact` -- only `natural=beach` (in `accessible_nature`) connected
+  the service to the sea at all, and that row's decay coefficient (12) is short, so proximity
+  to the coastline itself wasn't credited. Added `{"natural": "coastline"}` to the `tags`
+  column and `"natural_coastline"` to the `labels` column of `high_nature_immersion` (decay
+  30), so coastline proximity now also feeds `nature_contact`.
+
+## 2026-09-08
+
+- Diagnosed a "differences.gpkg shows unexplainable high scores" report: verified numerically
+  that the aggregation math is monotonic under POI removal (accessibility_from_rra's rank-based
+  Choquet weights are a fixed decreasing sequence, so zeroing a POI's value can never increase
+  the sum -- swept coefficients 0.5-10 and set sizes to 200, delta never positive; the
+  service->capability ELECTRE-TRI step uses fixed structural weights, not renormalized by which
+  services are "active", so it's monotonic too) and that the on-disk differences.gpkg files
+  showed no positive deltas at all. Traced the actual issue to staleness instead: the boundary
+  recalibration commit (b9ae0172, 2026-09-01) landed after every scenario output on disk
+  (differences.gpkg/profile_comparison.qgz from 2026-08-31, the merged
+  all_scenarios_differences.gpkg from 2026-08-26). Confirmed capability_score_mode="discrete"
+  (production default) bakes the ELECTRE classification into the stored values at compute time,
+  not just the legend, so this needs a regeneration, not a re-style. Since underservice-is-
+  mirrionis is a bundle-reuse (not persona) scenario, this is fast to fix: RUN_ALL_SCENARIOS ->
+  False, SCENARIO -> "underservice-is-mirrionis" in analysis/scenarios.py, then
+  `python analysis/scenarios.py` -- reuses the already-routed impedance bundle, no re-routing.
+- Replaced the service/capability map color scheme with a user-specified palette. Added
+  `utils/capabilities.py`'s SERVICE_COLOR_STOPS (10 hex stops, one per 0.1-wide service-score
+  bucket: d7191c red -> 1a9641 green) and `service_step_color()`, plus CAPABILITY_COLOR_STOPS
+  (5 stops: the service scale's two endpoints plus fdae61/ffffc0/a6d96a) for the capability
+  grid's ELECTRE classes. Verified both interval boundaries with the user before implementing --
+  '#d791c' was a truncated '#d7191c', and '#ffffc0' (not ColorBrewer's ffffbf) was confirmed as
+  typed. Propagated into all 5 consumers: core/pipeline_runner.py (live gpkg/qgz styling --
+  service grids moved from a continuous 5-stop white->hue gradient to a genuine 10-bucket CASE
+  step expression, capability grids from a per-capability computed shade to the fixed 5-color
+  list), exports/generate_capability_legend.py, exports/generate_heatmap_legends.py (collapsed
+  from 3 per-capability bars to 1 shared service_legend.png, since every service now shares one
+  scale -- reuses service_step_color directly rather than re-deriving the bucketing a third
+  time), and analysis/scenarios.py's comparison-grid styling. Deliberately left
+  generate_power_scaling_dashboard.py on the old per-capability hues (#006BFF/#FFA200/#EB4CCC):
+  it uses CAPABILITY_COLORS to give 3 chart GROUPS distinct categorical identity, not to encode
+  a magnitude scale, so swapping it for the new shared gradient would have made two of three
+  groups look confusingly similar rather than fixed anything -- confirmed with the user before
+  touching it. capability_shade_hexes/CAPABILITY_SHADE_FRACTIONS/CAPABILITY_COLORS/
+  get_capability_colors were kept (not deleted) since the user framed this as "for now" and the
+  dashboard still needs CAPABILITY_COLORS. Verified end to end: all 5 files import clean,
+  the generated QGIS CASE expression buckets identically to service_step_color at every 0.1
+  boundary, and both a rendered service-score bar (10 bands) and a capability legend (5 bands,
+  boundaries correctly reading 0.0-0.3/0.3-0.5/0.5-0.7/0.7-0.8/0.8-1.0 from the same
+  already-fixed ELECTRE_BOUNDARIES) look correct.

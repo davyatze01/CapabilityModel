@@ -21,6 +21,7 @@ Important implementation note:
 import ast
 import bisect
 import csv
+import math
 import os
 from collections import Counter, OrderedDict
 from pathlib import Path
@@ -530,3 +531,33 @@ def capability_shade_hexes(color_hex: str) -> list[str]:
         r, g, b, _ = cmap(frac)
         hexes.append("#{:02x}{:02x}{:02x}".format(round(r * 255), round(g * 255), round(b * 255)))
     return hexes
+
+
+# Shared sequential palette, temporarily replacing each capability's own signature-hue
+# shading for every map/legend consumer except the power-scaling dashboard (which keeps
+# CAPABILITY_COLORS -- it needs 3 visually DISTINCT group colors, not a shared magnitude
+# scale). 10 stops, one per 0.1-wide service-score bucket: [0,0.1), [0.1,0.2), ..., [0.9,1.0].
+SERVICE_COLOR_STOPS: list[str] = [
+    "#d7191c", "#e85b3b", "#f99d59", "#fec981", "#ffedab",
+    "#ebf7ad", "#c4e687", "#96d265", "#58b453", "#1a9641",
+]
+
+
+def service_step_color(value: float) -> str:
+    """Bucket a service score in [0, 1] into one of the 10 SERVICE_COLOR_STOPS.
+
+    Ten equal-width buckets, [0,0.1) through [0.9,1.0]; 1.0 itself (and anything above,
+    or non-finite) falls in the last/first bucket rather than overflowing.
+    """
+    if value is None or not math.isfinite(value):
+        return SERVICE_COLOR_STOPS[0]
+    idx = min(int(max(0.0, min(1.0, value)) * 10), len(SERVICE_COLOR_STOPS) - 1)
+    return SERVICE_COLOR_STOPS[idx]
+
+
+# 5-color palette for the capability grid's ELECTRE classes, replacing each capability's
+# own white->hue shading. Endpoints reuse the service scale's ends so the two legends
+# read as one consistent scheme.
+CAPABILITY_COLOR_STOPS: list[str] = [
+    SERVICE_COLOR_STOPS[0], "#fdae61", "#ffffc0", "#a6d96a", SERVICE_COLOR_STOPS[-1],
+]

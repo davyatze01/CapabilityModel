@@ -42,7 +42,7 @@ from core.pipeline_runner import get_or_compute_impedances
 from core.pipeline_runner import _resolve_qgis_executable, _resolve_qgis_python_launcher
 from utils import graphml
 from utils import poi_dedup
-from utils.capabilities import ELECTRE_BOUNDS, ELECTRE_LABELS, capability_shade_hexes, get_capability_colors
+from utils.capabilities import CAPABILITY_COLOR_STOPS, ELECTRE_BOUNDS, ELECTRE_LABELS
 from core.pipeline_types import BusRoutingStageResult, NonBusRoutingStageResult
 from core.profiles import SCENARIOS, ACCESSIBLE_GTFS_PATH, NEW_METRO_GTFS_PATH
 
@@ -1203,13 +1203,8 @@ def create_profile_comparison_project(
     ]
 
     # Per-capability 5-shade color maps, identical to main.py's own capability-grid styling:
-    # white (t=0) -> the capability's signature color (t=1), snapped to the 5 ELECTRE classes.
-    capability_colors = get_capability_colors(cfg)
-    capability_shades = {
-        cap: capability_shade_hexes(capability_colors[cap])
-        for cap in CAPABILITIES
-        if cap in capability_colors
-    }
+    # the shared CAPABILITY_COLOR_STOPS scale, same 5 colors for every capability.
+    capability_shades = {cap: CAPABILITY_COLOR_STOPS for cap in CAPABILITIES}
 
     payload = {
         "scenario_gpkgs": scenario_gpkgs,
@@ -1252,8 +1247,8 @@ ELECTRE_BOUNDS = P["cap_bounds"]
 
 
 def style_electre(layer, field, shades, labels):
-    # Same white->capability-color 5-shade scheme main.py's own capability grids use (see
-    # utils.capabilities.capability_shade_hexes), instead of a generic named color ramp.
+    # Same shared CAPABILITY_COLOR_STOPS 5-shade scheme main.py's own capability grids
+    # use, instead of a generic named color ramp.
     ranges = []
     for i, lbl in enumerate(labels):
         sym = QgsFillSymbol.createSimple({{"style": "solid", "color": shades[i]}})

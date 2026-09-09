@@ -22,6 +22,12 @@ import json
 
 COORD_ROUND = 6
 
+
+class RscriptNotFoundError(RuntimeError):
+    """Raised when Rscript isn't on PATH -- distinct from RuntimeError so callers can
+    catch specifically this and offer to run scripts/setup_r.py, without swallowing
+    unrelated routing failures."""
+
 # Wall-clock stall watchdog for the R5 subprocess. r5r prints per-chunk progress
 # (build_network, per-chunk routing with progress=TRUE, per-chunk mem reports), so a
 # healthy run emits output regularly. If NOTHING is printed for this long, the JVM/R5 is
@@ -598,8 +604,9 @@ def _run_r5r_script(
     else:
         rscript_exe = shutil.which("Rscript")
         if not rscript_exe:
-            raise RuntimeError(
-                "Rscript executable not found. Add Rscript to your PATH so the pipeline can run the R routing script."
+            raise RscriptNotFoundError(
+                "Rscript executable not found. Run `python scripts/setup_r.py` to check/install "
+                "R, the r5r/data.table packages, and verify a Java 21 JVM is available."
             )
     cfg = ctx.config
     r5_data_path = _prepare_r5r_data_bundle(cfg)

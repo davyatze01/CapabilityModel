@@ -10,7 +10,7 @@ from core.runtime_setup import run_runtime_setup
 faulthandler.enable(all_threads=True)
 
 # Change this to "paris" to switch the whole pipeline to Paris.
-study_city = "cagliari"
+study_city = "paris"
 
 # ── Execution knobs (edit here instead of setting environment variables) ──────────────
 # SAFE_MODE: gentle execution to avoid pinning the machine at full load — caps native math
@@ -50,7 +50,7 @@ POI_RADIUS_KM = None
 #   re-routing from scratch.
 ARTIFACT_SLUG_SUFFIX = None
 # If true, main will generate an interactive dashboard for inspecting the results
-DEBUG_REPORT = True
+DEBUG_REPORT = False
 # If true, skip the pipeline entirely and just (re)generate the debug report from the
 # last run's artifacts already on disk (non_bus/bus/accessibility/service caches,
 # grid_params.json, the spatial gpkg). Useful after a debug_pipeline.py-only change.
@@ -66,7 +66,7 @@ SENSITIVITY_REPORT = False
 #   the artifact namespace like POI_RADIUS_KM does, and the accessibility-matrix cache's
 #   signature doesn't account for this value (see core.profiles.Profile.affordability) —
 #   delete artifacts/<slug>/ before a run where you change this, per project convention.
-PAID_POI_AFFORDABILITY: float | None = 0.7
+PAID_POI_AFFORDABILITY: float | None = 1.0
 
 def _reexec_under_run_safe_if_needed() -> None:
     """Re-run this entrypoint through run_safe.sh when not already in a cgroup scope.
@@ -340,8 +340,17 @@ def main():
         build_sensitivity_report()
 
 if __name__ == "__main__":
+    from routing.public_transport_routing_stage import RscriptNotFoundError
+
     try:
-        main()
+        try:
+            main()
+        except RscriptNotFoundError:
+            print("[Main] Rscript not found; running scripts/setup_r.py ...", flush=True)
+            import scripts.setup_r as setup_r
+            setup_r.main()          # exits the process itself if setup fails or is declined
+            print("[Main] Retrying pipeline run...", flush=True)
+            main()
     except KeyboardInterrupt:
         traceback.print_exc()
         # Intentional Ctrl+C: stand the watchdog down, but don't send a message.
