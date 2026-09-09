@@ -146,7 +146,8 @@ def _embed_gpkg_style(gpkg: Path, table: str, attr: str, category_colors: dict[s
     import sqlite3
 
     qml = _categorized_qml(attr, category_colors)
-    with sqlite3.connect(gpkg) as conn:
+    conn = sqlite3.connect(gpkg)
+    try:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS layer_styles ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, f_table_catalog TEXT, f_table_schema TEXT, "
@@ -160,6 +161,9 @@ def _embed_gpkg_style(gpkg: Path, table: str, attr: str, category_colors: dict[s
             "VALUES ('', '', ?, 'geom', 'default', ?, 1, ?)",
             (table, qml, f"Housing affordability category ({attr}); white=Q1, {HOUSING_COLOR_HIGH}=Q5"),
         )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def generate_housing_capability_grid(

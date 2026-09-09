@@ -586,10 +586,17 @@ def _merge_gpkg_table(src_gpkg: Path, dest_gpkg: Path, table_name: str) -> None:
     process-wide SQLite state (e.g. shared-cache mode) that only manifests when
     that file is the *primary* connection. Rooting the connection on src (the
     one nothing has opened yet) and writing into the ATTACHed dest avoids it.
+
+    Closed explicitly (not via `with conn:`, which only manages the transaction and never
+    calls close()) so the OS-level file handle on src_gpkg is guaranteed released before the
+    caller's staging_grid.unlink() runs -- otherwise a mid-transaction failure here left conn
+    alive (referenced by the propagating exception's traceback) with the file still open,
+    which raised WinError 32 on the unlink and masked the real error underneath it.
     """
     import sqlite3
 
-    with sqlite3.connect(src_gpkg) as conn:
+    conn = sqlite3.connect(src_gpkg)
+    try:
         conn.execute("ATTACH DATABASE ? AS dest", (str(dest_gpkg),))
         try:
             conn.execute(f'DROP TABLE IF EXISTS dest."{table_name}"')
@@ -607,6 +614,8 @@ def _merge_gpkg_table(src_gpkg: Path, dest_gpkg: Path, table_name: str) -> None:
             conn.commit()
         finally:
             conn.execute("DETACH DATABASE dest")
+    finally:
+        conn.close()
 
 
 def _hide_gpkg_layer(gpkg_path: Path, table_name: str) -> None:
@@ -620,10 +629,13 @@ def _hide_gpkg_layer(gpkg_path: Path, table_name: str) -> None:
     """
     import sqlite3
 
-    with sqlite3.connect(gpkg_path) as conn:
+    conn = sqlite3.connect(gpkg_path)
+    try:
         conn.execute("DELETE FROM gpkg_contents WHERE table_name = ?", (table_name,))
         conn.execute("DELETE FROM gpkg_geometry_columns WHERE table_name = ?", (table_name,))
         conn.commit()
+    finally:
+        conn.close()
 
 
 def _create_service_grid_views(gpkg_path: Path) -> list[str]:
@@ -643,7 +655,8 @@ def _create_service_grid_views(gpkg_path: Path) -> list[str]:
     import sqlite3
 
     created: list[str] = []
-    with sqlite3.connect(gpkg_path) as conn:
+    conn = sqlite3.connect(gpkg_path)
+    try:
         geom_row = conn.execute(
             "SELECT column_name, geometry_type_name, srs_id, z, m "
             "FROM gpkg_geometry_columns WHERE table_name = ?",
@@ -725,6 +738,8 @@ def _create_service_grid_views(gpkg_path: Path) -> list[str]:
             conn.execute(f"INSERT INTO gpkg_contents ({', '.join(columns)}) VALUES ({placeholders})", grid_contents_row)
 
         conn.commit()
+    finally:
+        conn.close()
     return created
 
 

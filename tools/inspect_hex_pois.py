@@ -109,8 +109,11 @@ def _fetch_poi_rows(gpkg_path: Path, poi_ids: list[int]) -> dict[int, dict[str, 
         f"FROM pois_used WHERE id IN ({placeholders})"
     )
 
-    with sqlite3.connect(gpkg_path) as conn:
+    conn = sqlite3.connect(gpkg_path)
+    try:
         rows = conn.execute(query, poi_ids).fetchall()
+    finally:
+        conn.close()
 
     by_id: dict[int, dict[str, Any]] = {}
     for row in rows:
@@ -253,11 +256,14 @@ def _hex_centroid(hex_id: str, grid_params: dict[str, Any]) -> tuple[float, floa
 def _fetch_capability_points(gpkg_path: Path) -> list[dict[str, Any]]:
     if gpkg_path is None or not gpkg_path.exists():
         return []
-    with sqlite3.connect(gpkg_path) as conn:
+    conn = sqlite3.connect(gpkg_path)
+    try:
         rows = conn.execute(
             "SELECT node_id, lon, lat FROM capability_points "
             "WHERE lon IS NOT NULL AND lat IS NOT NULL"
         ).fetchall()
+    finally:
+        conn.close()
     return [
         {"node_id": str(row[0]), "lon": float(row[1]), "lat": float(row[2])}
         for row in rows
@@ -271,8 +277,11 @@ def _list_hex_ids_from_grid_gpkg(gpkg_path: Path) -> list[str]:
     from exports.generate_experiment_shapefiles import GRID_TABLE_NAME
     if gpkg_path is None or not gpkg_path.exists():
         return []
-    with sqlite3.connect(gpkg_path) as conn:
+    conn = sqlite3.connect(gpkg_path)
+    try:
         rows = conn.execute(f'SELECT hex_id FROM "{GRID_TABLE_NAME}"').fetchall()
+    finally:
+        conn.close()
     return sorted({str(row[0]) for row in rows if row[0] is not None})
 
 

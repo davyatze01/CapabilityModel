@@ -70,7 +70,8 @@ def _merge_gpkg_table(src_gpkg: Path, dest_gpkg: Path, table_name: str) -> None:
     """Copy one spatial layer's table from src_gpkg into dest_gpkg via plain SQLite,
     registering it in dest's gpkg_contents/gpkg_geometry_columns. dest must already be a
     valid GeoPackage (i.e. its first layer was written normally via geopandas)."""
-    with sqlite3.connect(src_gpkg) as conn:
+    conn = sqlite3.connect(src_gpkg)
+    try:
         conn.execute("ATTACH DATABASE ? AS dest", (str(dest_gpkg),))
         try:
             conn.execute(f'DROP TABLE IF EXISTS dest."{table_name}"')
@@ -88,6 +89,8 @@ def _merge_gpkg_table(src_gpkg: Path, dest_gpkg: Path, table_name: str) -> None:
             conn.commit()
         finally:
             conn.execute("DETACH DATABASE dest")
+    finally:
+        conn.close()
 
 
 def _merge_gpkg_table_renamed(src_gpkg: Path, dest_gpkg: Path, src_table: str, dest_table: str) -> None:
@@ -96,7 +99,8 @@ def _merge_gpkg_table_renamed(src_gpkg: Path, dest_gpkg: Path, src_table: str, d
     capability_care) across all six conditions and must be disambiguated. identifier is set
     to dest_table (not copied from src) since gpkg_contents.identifier is UNIQUE and every
     condition's source row has the same identifier as its table_name."""
-    with sqlite3.connect(src_gpkg) as conn:
+    conn = sqlite3.connect(src_gpkg)
+    try:
         conn.execute("ATTACH DATABASE ? AS dest", (str(dest_gpkg),))
         try:
             conn.execute(f'DROP TABLE IF EXISTS dest."{dest_table}"')
@@ -120,17 +124,23 @@ def _merge_gpkg_table_renamed(src_gpkg: Path, dest_gpkg: Path, src_table: str, d
             conn.commit()
         finally:
             conn.execute("DETACH DATABASE dest")
+    finally:
+        conn.close()
 
-    with sqlite3.connect(dest_gpkg) as conn:
+    conn = sqlite3.connect(dest_gpkg)
+    try:
         conn.execute(LAYER_STYLES_SCHEMA)
         conn.execute(
             "INSERT OR IGNORE INTO gpkg_contents (table_name, data_type, identifier) "
             "VALUES ('layer_styles', 'attributes', 'layer_styles')"
         )
         conn.commit()
+    finally:
+        conn.close()
     style_cols = [c for c in LAYER_STYLES_COLUMNS if c != "f_table_name"]
     cols_sql = ", ".join(f'"{c}"' for c in style_cols)
-    with sqlite3.connect(src_gpkg) as conn:
+    conn = sqlite3.connect(src_gpkg)
+    try:
         conn.execute("ATTACH DATABASE ? AS dest", (str(dest_gpkg),))
         try:
             conn.execute(
@@ -141,27 +151,35 @@ def _merge_gpkg_table_renamed(src_gpkg: Path, dest_gpkg: Path, src_table: str, d
             conn.commit()
         finally:
             conn.execute("DETACH DATABASE dest")
+    finally:
+        conn.close()
 
 
 def _merge_layer_styles(src_gpkg: Path, dest_gpkg: Path) -> None:
     """Append src's layer_styles rows into dest's (creating dest's table + gpkg_contents
     registration on first use, as a non-spatial 'attributes' table). Explicit column list
     (excluding `id`) so autoincrement ids never collide across the four source files."""
-    with sqlite3.connect(dest_gpkg) as conn:
+    conn = sqlite3.connect(dest_gpkg)
+    try:
         conn.execute(LAYER_STYLES_SCHEMA)
         conn.execute(
             "INSERT OR IGNORE INTO gpkg_contents (table_name, data_type, identifier) "
             "VALUES ('layer_styles', 'attributes', 'layer_styles')"
         )
         conn.commit()
+    finally:
+        conn.close()
     cols = ", ".join(f'"{c}"' for c in LAYER_STYLES_COLUMNS)
-    with sqlite3.connect(src_gpkg) as conn:
+    conn = sqlite3.connect(src_gpkg)
+    try:
         conn.execute("ATTACH DATABASE ? AS dest", (str(dest_gpkg),))
         try:
             conn.execute(f'INSERT INTO dest.layer_styles ({cols}) SELECT {cols} FROM layer_styles')
             conn.commit()
         finally:
             conn.execute("DETACH DATABASE dest")
+    finally:
+        conn.close()
 
 
 def relocate_condition_grids() -> None:

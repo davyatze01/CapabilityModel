@@ -206,7 +206,8 @@ def _graduated_qml(attr: str) -> str:
 def _embed_gpkg_style(gpkg: Path, table: str, attr: str) -> None:
     """Insert a default style into the GeoPackage layer_styles table (self-styling drag-in)."""
     qml = _graduated_qml(attr)
-    with sqlite3.connect(gpkg) as conn:
+    conn = sqlite3.connect(gpkg)
+    try:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS layer_styles ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, f_table_catalog TEXT, f_table_schema TEXT, "
@@ -220,6 +221,9 @@ def _embed_gpkg_style(gpkg: Path, table: str, attr: str) -> None:
             "VALUES ('', '', ?, 'geom', 'default', ?, 1, ?)",
             (table, qml, f"Classification stability ({attr}); red=fragile, green=stable"),
         )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def build_qgis_layer(stability: pd.DataFrame, coords_csv: Path, sigma: float, out_gpkg: Path) -> None:

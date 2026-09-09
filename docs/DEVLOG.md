@@ -631,3 +631,45 @@ this is maintained.
   format and ARTIFACT_SCHEMA_VERSION (still 4) are untouched, `man["origins_sig"]` is still
   read and passed through into BusRoutingStageResult for other consumers, so no existing
   bundle needs reconverting and nothing that loaded before stops loading.
+- Fixed the WinError 32 masking bug diagnosed for `_merge_gpkg_table` in
+  exports/generate_experiment_shapefiles.py: `with sqlite3.connect(src_gpkg) as conn:`
+  (line 592) only manages the SQL transaction on exit (commit/rollback) -- it never calls
+  conn.close(), which is documented sqlite3 behavior, not a misuse. On a mid-transaction
+  failure (the "no such table" flake the function's own docstring already documented), the
+  exception's traceback kept conn alive with an open OS handle on src_gpkg straight through
+  the caller's `finally: staging_grid.unlink()`, which raised WinError 32 "file in use" on
+  Windows (a silent no-op on Linux) and masked the real underlying SQL error. Replaced the
+  `with` with an explicit try/finally calling conn.close(), so the handle is released before
+  the caller's unlink runs regardless of whether the SQL inside succeeded. Verified two ways
+  on real sqlite files built to the same minimal gpkg_contents/gpkg_geometry_columns shape:
+  the success path still merges and unlinks cleanly (unchanged), and on the actual failure
+  path (a genuinely missing table) the real `OperationalError: no such table` now surfaces
+  correctly and a spied-on reference to the live Connection object proves it -- not merely
+  infers it -- is closed afterward (`conn.execute` raises "Cannot operate on a closed
+  database"), which is OS-independent proof and not something a Linux-only unlink() success
+  could have shown by itself.
+- Extended the sqlite connection-leak fix to every other `with sqlite3.connect(...) as conn:`
+  site in the repo (13 total, list audited against current line numbers before touching
+  anything): exports/generate_experiment_shapefiles.py (`_hide_gpkg_layer`,
+  `_create_service_grid_views` -- the latter has an early `return` inside the old `with`
+  block, which still runs the new `finally: conn.close()` correctly since a `return` inside
+  `try` triggers `finally` first), analysis/merge_scenario_differences.py (6 sites across
+  `_merge_gpkg_table`, `_merge_gpkg_table_renamed`, `_merge_layer_styles` -- same copy-pasted
+  ATTACH/DETACH idiom), analysis/robustness_report.py and housing/housing_capability.py
+  (`_embed_gpkg_style`, one each), and tools/inspect_hex_pois.py (3 read-only SELECT sites).
+  None of the 12 beyond the already-fixed `_merge_gpkg_table` are followed by an unlink of
+  the same file, so none are confirmed *live* WinError-32 bugs -- same latent fragility
+  (relying on refcounting rather than a guaranteed close), lower urgency.
+- Caught a real bug while converting rather than templating blindly: `with conn:` commits
+  the transaction on normal exit (that's what makes the pattern look safe), but two sites
+  (`robustness_report.py` and `housing_capability.py`'s `_embed_gpkg_style`) had no explicit
+  `conn.commit()` at all -- they relied entirely on that implicit commit. `conn.close()`
+  alone discards uncommitted changes, so a mechanical swap to `try/finally: conn.close()`
+  without adding a commit would have made those two functions silently stop writing their
+  QGIS style rows. Added `conn.commit()` before close in both. Verified every other
+  conversion already had an explicit `conn.commit()` in the original code (preserved
+  as-is), and that the 3 inspect_hex_pois.py sites are genuinely read-only (nothing to
+  commit). Confirmed on disk, not just by reading the diff: wrote a style row through each
+  of the two commit-added functions, then reopened the file in a *fresh* connection and
+  read the row back -- both come back present, proving the commit is real and not silently
+  lost on close.
