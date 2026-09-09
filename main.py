@@ -10,7 +10,7 @@ from core.runtime_setup import run_runtime_setup
 faulthandler.enable(all_threads=True)
 
 # Change this to "paris" to switch the whole pipeline to Paris.
-study_city = "paris"
+study_city = "cagliari"
 
 # ── Execution knobs (edit here instead of setting environment variables) ──────────────
 # SAFE_MODE: gentle execution to avoid pinning the machine at full load — caps native math

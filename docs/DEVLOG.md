@@ -593,3 +593,41 @@ this is maintained.
   boundary, and both a rendered service-score bar (10 bands) and a capability legend (5 bands,
   boundaries correctly reading 0.0-0.3/0.3-0.5/0.5-0.7/0.7-0.8/0.8-1.0 from the same
   already-fixed ELECTRE_BOUNDARIES) look correct.
+
+## 2026-09-09
+
+- Diagnosed a real portability problem: pasting an existing impedances.npz into a fresh
+  clone printed "Bundle origins_sig doesn't match the current node set". Traced the root
+  cause -- `utils/graphml.py`'s Cagliari/boundary-based graph path (`ox.geocode_to_gdf` +
+  `ox.graph_from_polygon`, lines ~472-491) downloads live from Nominatim/Overpass with no
+  pinned OSM snapshot or date, so two machines (or the same machine at different times)
+  building "the same" city graph aren't guaranteed to get the same node set. Confirmed
+  `get_mode_csr` doesn't need the graph -- if the .graphml is absent it loads the small
+  cached `_csr_v2.npz` directly rather than rebuilding, so a bundle can be made portable by
+  shipping the matching CSR file (15-30 MB) instead of the .graphml (100-200 MB) alongside
+  the impedance artifact.
+- Re-examined whether the origins_sig check itself was doing the right thing, prompted by
+  pushback that requiring an exact match "doesn't make sense" for something as stable as
+  road topology. Confirmed two things by reading the actual code rather than assuming:
+  `_coords_signature` (routing/public_transport_routing_stage.py) hashes the node list IN
+  ORDER with no sort, so even the identical node SET in a different order (which OSM
+  re-downloads produce routinely, since Overpass element order isn't guaranteed stable) fails
+  the old check; but downstream, `accessibility_stage.py`'s actual lookups are by node ID
+  (`source_id_to_row.get(str(node_id))`), not by list position. So the real risk was never
+  misattribution -- it's a coverage gap (a current node absent from the bundle silently gets
+  zero transit/non-bus accessibility) -- and the old check was answering a stricter question
+  than the one that actually matters.
+- Replaced the ordered-hash equality check in `exports/artifact_bundle.py`'s
+  `load_impedance_bundle` with an ID-set coverage check: computes
+  `current_node_ids & bundle_node_ids` and accepts the bundle when coverage is >=
+  `_MIN_ORIGIN_COVERAGE` (0.90, a new module constant next to ARTIFACT_SCHEMA_VERSION),
+  printing which current nodes have no bundle entry (and will get zero accessibility this
+  run) instead of silently either accepting or hard-rejecting. Verified on the real Paris
+  bundle's 23,046-node set: an identical node set still gives 100% coverage/accept (so
+  nothing that worked before breaks), a simulated realistic OSM-style drift (50 dropped, 30
+  added) gives 99.9%/accept (the case that used to hard-reject and shouldn't have), and a
+  simulated unrelated node set gives 0%/reject (the safety net the original check existed
+  for is still intact). This is a pure load-time acceptance-logic change -- the bundle file
+  format and ARTIFACT_SCHEMA_VERSION (still 4) are untouched, `man["origins_sig"]` is still
+  read and passed through into BusRoutingStageResult for other consumers, so no existing
+  bundle needs reconverting and nothing that loaded before stops loading.
