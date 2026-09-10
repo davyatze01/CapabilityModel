@@ -488,7 +488,10 @@ def _stream_hexagon_export(
 
     with mp.Pool(
         processes=pool_workers,
-        maxtasksperchild=200,
+        # Windows-only: worker recycling races the Pool's result-handler thread on the
+        # same overlapped pipe there and raises "concurrent send_bytes() calls are not
+        # supported" (see non_bus_routing_stage.py for detail).
+        maxtasksperchild=200 if os.name != "nt" else None,
         initializer=_init_stream_worker,
         initargs=(poi_index, ctx.config.export_hex_radius_m, ctx.config.non_bus_poi_catalog_path),
     ) as pool:

@@ -66,7 +66,7 @@ SENSITIVITY_REPORT = False
 #   the artifact namespace like POI_RADIUS_KM does, and the accessibility-matrix cache's
 #   signature doesn't account for this value (see core.profiles.Profile.affordability) —
 #   delete artifacts/<slug>/ before a run where you change this, per project convention.
-PAID_POI_AFFORDABILITY: float | None = 1.0
+PAID_POI_AFFORDABILITY: float | None = 1
 
 def _reexec_under_run_safe_if_needed() -> None:
     """Re-run this entrypoint through run_safe.sh when not already in a cgroup scope.

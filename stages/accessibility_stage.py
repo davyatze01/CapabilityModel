@@ -1017,7 +1017,10 @@ def run_accessibility_stage(
                 global _ACTIVE_ACCESSIBILITY_POOL
                 pool = mp.Pool(
                     processes=pool_workers,
-                    maxtasksperchild=200,
+                    # Windows-only: worker recycling races the Pool's result-handler thread
+                    # on the same overlapped pipe there and raises "concurrent send_bytes()
+                    # calls are not supported" (see non_bus_routing_stage.py for detail).
+                    maxtasksperchild=200 if os.name != "nt" else None,
                     initializer=_init_accessibility_worker,
                     initargs=(
                         ctx.config.non_bus_cache_schema_version,

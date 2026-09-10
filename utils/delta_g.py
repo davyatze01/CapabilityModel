@@ -193,15 +193,17 @@ def _haversine_m(lat1, lon1, lat2, lon2):
 
 
 def _haversine_m_np(lat1, lon1, lat2, lon2):
-    """Array version of _haversine_m: one fixed origin vs many destinations."""
+    """Array version of _haversine_m: a scalar point vs an array (broadcasts), or two
+    same-shape arrays compared elementwise -- verified bit-identical to the old
+    scalar-origin-only version for that existing use case."""
     import numpy as np
 
     r = 6371000.0
-    phi1 = math.radians(lat1)
+    phi1 = np.radians(lat1)
     phi2 = np.radians(lat2)
     dphi = np.radians(lat2 - lat1)
     dlambda = np.radians(lon2 - lon1)
-    a = np.sin(dphi / 2.0) ** 2 + math.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0) ** 2
+    a = np.sin(dphi / 2.0) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0) ** 2
     return 2.0 * r * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
 
 
@@ -850,6 +852,19 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
         reachable = np.isfinite(dist_m)
         dist_km = dist_m / 1000.0
 
+        # Last-mile snap gaps: dist_km above is snapped-node to snapped-node, not
+        # true-coordinate to true-coordinate. Add the real gap at each end -- origin's true
+        # position to its own snapped node (one distance, shared by every POI this mode),
+        # and each POI's true position to ITS OWN snapped node (per-POI, vectorized).
+        origin_gap_km = _haversine_m(
+            origine[0], origine[1],
+            float(bundle["snap_y"][origin_idx]), float(bundle["snap_x"][origin_idx]),
+        ) / 1000.0
+        poi_gap_km = _haversine_m_np(
+            source_coords[:, 0], source_coords[:, 1],
+            bundle["snap_y"][poi_idxs], bundle["snap_x"][poi_idxs],
+        ) / 1000.0
+
         if mode == "walk":
             # Real per-edge walkability isn't wired into the CSR yet -- every edge carries
             # the same placeholder score (WALK_EDGE_DEFAULT_SCORE), so the length-weighted
@@ -858,14 +873,18 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
             # via path reconstruction; profiled 523/555s/origin 2026-07-15). Re-derive
             # per-path scores here if real wscore data is ever added.
             coef = 1.0 + 0.15 * ((5.0 - float(DEFAULT_WALK_SCORE)) / 4.0)
-            imp = coef * ((dist_km / config.speed_walk_kmh) * 60.0)
+            imp = coef * (((dist_km + origin_gap_km + poi_gap_km) / config.speed_walk_kmh) * 60.0)
         elif mode == "bike":
-            imp = (dist_km / config.speed_bike_kmh) * 60.0
+            imp = ((dist_km + origin_gap_km + poi_gap_km) / config.speed_bike_kmh) * 60.0
         else:  # drive
             monetary_cost = config.cost_per_liter / config.distance_for_liter
+            # Last-mile gaps are walked (to/from the car), not driven -- speed_walk_kmh,
+            # not speed_drive_kmh, for the snap-distance portion only.
+            snap_gap_min = ((origin_gap_km + poi_gap_km) / config.speed_walk_kmh) * 60.0
             imp = (
                 config.drive_access_time_min
                 + (dist_km / config.speed_drive_kmh) * 60.0
+                + snap_gap_min
                 + config.vot * monetary_cost
             )
 

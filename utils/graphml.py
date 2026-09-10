@@ -174,10 +174,23 @@ def _parse_int(value: str | None, default: int = 0) -> int:
         return default
 
 
+def _haversine_m(lat1, lon1, lat2, lon2):
+    """Great-circle distance in meters. Local copy of utils.delta_g's version --
+    graphml.py can't import delta_g (delta_g already imports graphml)."""
+    r = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+    return 2.0 * r * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+
+
 def _build_mode_csr_streaming(
     network_type: str,
     full_path: str,
     csr_path: str,
+    cfg: PipelineConfig | None = None,
 ) -> dict[str, object]:
     """Build a CSR bundle from GraphML without materializing a NetworkX graph.
 
@@ -273,6 +286,74 @@ def _build_mode_csr_streaming(
         cols_arr = np.asarray([], dtype=np.int64)
         length_vals = np.asarray([], dtype=float)
 
+    # Bridge every disconnected fragment (dangling footway stubs, unlinked path segments --
+    # common OSM gaps) into the main component with ONE synthetic edge each, rather than
+    # excluding them as snap candidates. Excluding them would break origin<->POI pairs that
+    # are genuinely co-located inside the SAME small fragment (their real, short internal
+    # path would vanish); bridging instead lets Dijkstra keep using the true internal path
+    # when it's shorter, and only fall back to the bridge (detour-inflated straight-line
+    # estimate) when nothing else connects the two ends.
+    if real_node_count > 0:
+        from scipy.sparse.csgraph import connected_components
+        from scipy.spatial import cKDTree
+
+        prelim = csr_matrix(
+            (length_vals, (rows_arr, cols_arr)), shape=(real_node_count, real_node_count)
+        )
+        n_comp, labels = connected_components(prelim, directed=False)
+        if n_comp > 1:
+            sizes = np.bincount(labels)
+            main_label = int(np.argmax(sizes))
+            main_mask = labels == main_label
+            main_idx = np.nonzero(main_mask)[0]
+            other_idx = np.nonzero(~main_mask)[0]
+
+            mean_lat_rad = math.radians(float(snap_y.mean())) if snap_y.size else 0.0
+            m_per_deg_lat_tmp = 111320.0
+            m_per_deg_lon_tmp = 111320.0 * math.cos(mean_lat_rad)
+            main_xy = np.column_stack(
+                [snap_x[main_idx] * m_per_deg_lon_tmp, snap_y[main_idx] * m_per_deg_lat_tmp]
+            )
+            other_xy = np.column_stack(
+                [snap_x[other_idx] * m_per_deg_lon_tmp, snap_y[other_idx] * m_per_deg_lat_tmp]
+            )
+            _, nn_pos = cKDTree(main_xy).query(other_xy)
+            nn_main_idx = main_idx[nn_pos]
+
+            # Keep only the single closest (fragment-node, main-node) pair per fragment --
+            # one bridge edge per component, not one per node in it.
+            approx_dist_m = np.hypot(
+                other_xy[:, 0] - main_xy[nn_pos, 0], other_xy[:, 1] - main_xy[nn_pos, 1]
+            )
+            comp_of_other = labels[other_idx]
+            best_pair: dict[int, tuple[int, int, float]] = {}
+            for pos, comp_lbl in enumerate(comp_of_other):
+                d = approx_dist_m[pos]
+                if comp_lbl not in best_pair or d < best_pair[comp_lbl][2]:
+                    best_pair[comp_lbl] = (int(other_idx[pos]), int(nn_main_idx[pos]), float(d))
+
+            detour_factor = float(getattr(cfg, "non_bus_dijkstra_detour_factor", 1.6)) if cfg else 1.6
+            bridge_rows: list[int] = []
+            bridge_cols: list[int] = []
+            bridge_lengths: list[float] = []
+            for small_node, main_node, _approx_d in best_pair.values():
+                real_dist_m = _haversine_m(
+                    float(snap_y[small_node]), float(snap_x[small_node]),
+                    float(snap_y[main_node]), float(snap_x[main_node]),
+                ) * detour_factor
+                bridge_rows += [small_node, main_node]
+                bridge_cols += [main_node, small_node]
+                bridge_lengths += [real_dist_m, real_dist_m]
+
+            rows_arr = np.concatenate([rows_arr, np.asarray(bridge_rows, dtype=np.int64)])
+            cols_arr = np.concatenate([cols_arr, np.asarray(bridge_cols, dtype=np.int64)])
+            length_vals = np.concatenate([length_vals, np.asarray(bridge_lengths, dtype=float)])
+            print(
+                f"[Graph] Bridged {len(best_pair)} disconnected component(s) into the main "
+                f"'{network_type}' graph (detour-inflated connector edge each).",
+                flush=True,
+            )
+
     mat = csr_matrix((length_vals, (rows_arr, cols_arr)), shape=(real_node_count, real_node_count))
     mat.sort_indices()
     indptr = mat.indptr.astype(np.int64)
@@ -338,7 +419,7 @@ def get_mode_csr(network_type, cfg: PipelineConfig | None = None):
         return cached
 
     full_path = _resolve_mode_graph_path(network_type, cfg)
-    csr_path = full_path[: -len(".graphml")] + "_csr_v2.npz"
+    csr_path = full_path[: -len(".graphml")] + "_csr_v3.npz"
 
     csr_stale = (
         os.path.isfile(csr_path)
@@ -372,7 +453,7 @@ def get_mode_csr(network_type, cfg: PipelineConfig | None = None):
                 ox.io.save_graphml(graph, filepath=full_path)
             clear_mode_graph_cache()
         with _ElapsedTimer(f"Graph streaming CSR build {network_type}"):
-            built = _build_mode_csr_streaming(network_type, full_path, csr_path)
+            built = _build_mode_csr_streaming(network_type, full_path, csr_path, cfg)
         indptr = built["indptr"]
         indices = built["indices"]
         length = built["length"]

@@ -673,3 +673,72 @@ this is maintained.
   of the two commit-added functions, then reopened the file in a *fresh* connection and
   read the row back -- both come back present, proving the commit is real and not silently
   lost on close.
+- Investigated a user-reported "why is contact-with-nature lower here, it's the beach" question
+  for Cagliari's Poetto peninsula (screenshot-driven). Traced it to a specific origin node
+  (11190449900, at the base of the peninsula) whose walk AND bike impedance to every candidate
+  POI was NaN (0/1449 reachable) while drive worked fine (1373/1449, ~10 min) -- confirmed via
+  the walk CSR's own adjacency that this node's connected component has size 2 (a lone 34 m
+  dangling stub to node 8297117039, which connects to nothing else): a genuine OSM digitization
+  gap (an unlinked footway/cycleway near what's likely a car-only causeway/junction), not a
+  pipeline bug in the routing math itself.
+- First proposed excluding small-component nodes from the snap-candidate KD-tree entirely, then
+  found and walked back two real flaws in that design before writing any code: (1) the KD-tree
+  in `get_mode_csr` is built from `node_xy` (ALL real nodes) while `snap_indices` (meant to
+  restrict it) is currently `np.arange(real_node_count)` -- a no-op identity -- so filtering
+  `snap_indices` alone without also filtering the tree's own input would have been either
+  inert or an index-alignment bug, not a fix; (2) more fundamentally, a POI's true nearest node
+  and an origin's true position can legitimately sit in the SAME small component, where the
+  real internal path is short and correct -- relocating the POI's snap to the main graph would
+  have broken that already-correct case to "fix" a different (possibly already-correct, if the
+  isolation is real) case for other origins. Concluded a single fixed snap per POI can't be
+  simultaneously right for same-component and cross-component origins.
+- Landed on two independent, additive fixes instead, both implemented and verified against
+  real Cagliari data:
+  1. **Last-mile snap-distance** (utils/delta_g.py): `accessibility_non_bus_from_snap_map`'s
+     dist_km was purely snapped-node-to-snapped-node graph distance, silently dropping the gap
+     between a true coordinate and its snapped node at both ends, unconditionally (not specific
+     to disconnected components). Generalized `_haversine_m_np` from scalar-origin-only to
+     elementwise array-vs-array (verified bit-identical on the existing scalar-vs-array call
+     site before relying on it), then added `origin_gap_km` (one haversine per mode) and
+     `poi_gap_km` (vectorized, per POI) into walk/bike/drive's impedance. Drive's gap portion
+     uses speed_walk_kmh, not speed_drive_kmh (per explicit direction -- the last mile to/from
+     a car is walked, not driven), added separately from the graph-distance portion which still
+     uses speed_drive_kmh. Verified on a real origin: origin gap was 0 m (this particular node
+     sits on its own snap point), POI gaps ranged 0-441 m (median 6.6 m), and every resulting
+     delta was positive and proportional to its gap (e.g. the 441 m outlier POI got exactly
+     +5.3 min, matching 441 m at ~5 km/h) -- confirms the formula, not just that it runs.
+     Bumped non_bus_cache_schema_version 11 -> 12 (every impedance value changes, however
+     slightly, so old caches must not be reused).
+  2. **Graph-level component bridging** (utils/graphml.py): rather than filtering snap
+     candidates, `_build_mode_csr_streaming` now computes undirected connected components
+     right after building the adjacency matrix and, for every non-main component, adds ONE
+     synthetic bidirectional edge to its closest node in the main component (found via a
+     KD-tree query against main-component-only coordinates), weighted by real haversine
+     distance x `non_bus_dijkstra_detour_factor` (1.6) -- not straight-line, per explicit
+     direction, to better estimate real walking distance across an undocumented gap. Needed a
+     local `_haversine_m` copy in graphml.py (can't import utils.delta_g -- delta_g already
+     imports graphml, so it would be circular). Bumped the CSR cache filename `_csr_v2.npz` ->
+     `_csr_v3.npz` to force every city to rebuild (the new edges are baked into the cached
+     adjacency itself). Verified end-to-end on Cagliari's real walk graph: rebuild found and
+     bridged exactly 169 components (matching the previously-measured 170 total, i.e. every
+     non-main component got exactly one bridge) in 8 seconds; the graph goes from 170 components
+     to 1; the previously-dead-end origin (11190449900) now gets a finite distance (2959 m /
+     ~35.5 min) to a nearby real destination instead of inf; and -- the property that actually
+     matters, since it's what the abandoned exclude-based approach would have broken -- the
+     TRUE internal 34 m edge between 11190449900 and its real neighbor is still returned as
+     exactly 34 m, confirming Dijkstra prefers the genuine short path and only engages the
+     bridge when nothing else connects the two sides.
+
+## 2026-09-10
+
+- Diagnosed a Windows-only crash reported by the user running the Paris pipeline:
+  `ValueError: concurrent send_bytes() calls are not supported`. Traced it to
+  `maxtasksperchild` worker recycling on `multiprocessing.Pool` -- a documented Windows
+  bug where a recycled worker's respawn races the Pool's result-handler thread on the same
+  overlapped-I/O pipe. The recycling itself exists purely to work around glibc/pymalloc not
+  returning freed memory mid-process (see `_trim_worker_memory`'s `malloc_trim`, which is
+  already a no-op on Windows since `_LIBC` only resolves off `libc.so.6`), so it buys nothing
+  there anyway. Fixed by making `maxtasksperchild` `None` on Windows (`os.name == "nt"`),
+  keeping the existing value elsewhere, in all four pools that set it:
+  `routing/non_bus_routing_stage.py` (20), `stages/accessibility_stage.py` (200),
+  `exports/poi_exports.py` (200), `analysis/score_report.py` (200).

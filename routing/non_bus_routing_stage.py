@@ -590,8 +590,12 @@ def run_non_bus_routing_stage(
                     # which is what turned a handful of dense origins into a 45G OOM
                     # kill within ~2 minutes (2026-07-16). Recycling every 20 origins
                     # bounds how far any one worker can ratchet before its memory is
-                    # forcibly returned via process exit.
-                    maxtasksperchild=20,
+                    # forcibly returned via process exit. Windows-only: worker recycling
+                    # here races the Pool's result-handler thread on the same overlapped
+                    # pipe and raises "concurrent send_bytes() calls are not supported" --
+                    # a documented Windows multiprocessing.Pool bug. malloc_trim is a no-op
+                    # there anyway (_LIBC is None off glibc), so there's nothing to buy.
+                    maxtasksperchild=20 if os.name != "nt" else None,
                     initializer=_init_worker,
                     initargs=(
                         ctx.config,

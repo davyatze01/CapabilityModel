@@ -388,7 +388,10 @@ def generate_score_report(city: str | None = None, ctx: "PipelineContext | None"
         )
         with mp.get_context("spawn").Pool(
             processes=pool_workers,
-            maxtasksperchild=200,  # mirrors poi_exports.py's export pool
+            # Windows-only: worker recycling races the Pool's result-handler thread on the
+            # same overlapped pipe there and raises "concurrent send_bytes() calls are not
+            # supported" (see non_bus_routing_stage.py for detail).
+            maxtasksperchild=200 if os.name != "nt" else None,  # mirrors poi_exports.py's export pool
             initializer=_init_score_worker,
             initargs=(poi_weights, poi_by_node_dir, poi_export_src_dir),
         ) as pool:
