@@ -7,15 +7,18 @@ import time
 from typing import cast
 
 import osmnx as ox
-from shapely.geometry import Point
+import geopandas as gpd
+from shapely.geometry import Point, LineString
 from tqdm import tqdm
 
 from core.context import PipelineContext
 from core.pipeline_types import SnappingStageResult
 from utils import graphml, services as serv, delta_g
+from utils.line_merge import merge_connected_lines, sample_line_every
 import numpy as np
 
 _SNAP_CACHE_SCHEMA_VERSION = 3
+LINE_SNAP_SPACING_M = 500.0
 # Bump when the checkpoint payload layout or the set of inputs folded into its signature
 # changes, so old checkpoints are treated as stale instead of silently reused.
 _SNAP_CHECKPOINT_SCHEMA_VERSION = 1
@@ -50,6 +53,32 @@ def _coord_key(coord):
     - tuple: rounded `(lat, lon)` key at 6-decimal precision.
     """
     return (round(coord[0], 6), round(coord[1], 6))
+
+
+def _line_geometry_from_item(geom):
+    """Return line-like parts (EPSG:4326 LineStrings) of this item's geometry, if any."""
+    if isinstance(geom, dict):
+        gtype = geom.get("geometry_type")
+        if gtype == "MultiLineString":
+            parts = geom.get("line_parts") or []
+            return [
+                LineString([(float(lon), float(lat)) for lat, lon in part])
+                for part in parts
+                if isinstance(part, list) and len(part) > 1
+            ]
+        if gtype != "LineString":
+            return []
+        vertices_raw = geom.get("snap_vertices")
+        if not isinstance(vertices_raw, list) or len(vertices_raw) < 2:
+            return []
+        return [LineString([(float(v[1]), float(v[0])) for v in vertices_raw])]
+    if not delta_g._is_geometry(geom):
+        return []
+    if geom.geom_type == "LineString":
+        return [geom]
+    if geom.geom_type == "MultiLineString":
+        return list(geom.geoms)
+    return []
 
 
 # Since POI can be geometries and each POI must be snapped to a node of the graph to compute routing, in this function we create a collection of candidate
@@ -341,10 +370,41 @@ def _build_poi_snap_map(mode, query_by_key, enable_progress, cache_dir, cache_ns
                 f"to fetch geometries (cache miss)",
                 flush=True,
             )
+        line_entries: list[tuple[int, object]] = []
+        for item_idx, item in enumerate(geometries):
+            for line in _line_geometry_from_item(item[0]):
+                line_entries.append((item_idx, line))
+
+        item_line_candidates: dict[int, list[tuple[float, float]]] = {}
+        if line_entries:
+            entry_idxs, entry_lines = zip(*line_entries)
+            merged, utm_crs, comp_of = merge_connected_lines(list(entry_lines))
+            if merged:
+                sampled_components = []
+                for comp_line in merged:
+                    pts_m = sample_line_every(comp_line, LINE_SNAP_SPACING_M)
+                    pts_4326 = gpd.GeoSeries(pts_m, crs=utm_crs).to_crs("EPSG:4326")
+                    sampled_components.append([(float(p.y), float(p.x)) for p in pts_4326])
+                for local_i, item_idx in enumerate(entry_idxs):
+                    comp_idx = comp_of[local_i]
+                    if comp_idx is None:
+                        continue
+                    existing = item_line_candidates.setdefault(item_idx, [])
+                    for coord in sampled_components[comp_idx]:
+                        if coord not in existing:
+                            existing.append(coord)
+
         coords = []
         geom_vertices_list = []
-        for item in geometries:
+        for item_idx, item in enumerate(geometries):
             geom, _poi_name, source_key = item
+            if item_idx in item_line_candidates:
+                geom_vertices = item_line_candidates[item_idx]
+                if not geom_vertices:
+                    continue
+                coords.append((geom_vertices[0], source_key))
+                geom_vertices_list.append(geom_vertices)
+                continue
             if isinstance(geom, dict) and "snap_coord" in geom:
                 try:
                     coord_raw = geom.get("snap_coord")

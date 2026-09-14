@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from routing.public_transport_routing_stage import _resolve_r5r_java_home
+from routing.public_transport_routing_stage import _resolve_r5r_java_home, resolve_rscript_path
 
 _REQUIRED_R_PACKAGES = ["r5r", "data.table"]
 _IN_FLATPAK = os.path.isfile("/.flatpak-info")
@@ -111,7 +111,11 @@ def _install_r() -> bool:
     if not _confirm("[Setup] Proceed?"):
         print("[Setup] Skipped. Install R yourself, then re-run this script.", flush=True)
         return False
-    return _run(full_cmd)
+    # The installer's own exit code isn't a reliable success signal -- e.g. winget returns
+    # nonzero when R is already installed and there's simply nothing to update. What actually
+    # matters is whether Rscript is findable afterward, which the caller checks next.
+    _run(full_cmd)
+    return True
 
 
 def _install_r_packages(rscript_exe: str) -> bool:
@@ -161,15 +165,16 @@ def _check_java() -> None:
 
 
 def main() -> None:
-    rscript_exe = _which("Rscript")
+    rscript_exe = resolve_rscript_path()
     if rscript_exe is None:
         if not _install_r():
             sys.exit(1)
-        rscript_exe = _which("Rscript")
+        rscript_exe = resolve_rscript_path()
         if rscript_exe is None:
             print(
-                "[Setup] R was installed but Rscript still isn't on PATH. Restart your "
-                "terminal/shell (PATH changes need a fresh session) and re-run this script.",
+                "[Setup] Rscript still can't be found after the install attempt above, even "
+                "checking R's known install locations. Install R manually from "
+                "https://cran.r-project.org/bin/windows/base/ and re-run this script.",
                 flush=True,
             )
             sys.exit(1)

@@ -880,6 +880,18 @@ def _safe_shape_from_geojson(geometry_obj):
         return None
 
 
+def _geojson_line_parts(geometry_obj):
+    """For MultiLineString, list of per-part (lat,lon) vertex lists; else None."""
+    if not isinstance(geometry_obj, dict) or geometry_obj.get("type") != "MultiLineString":
+        return None
+    parts = []
+    for line in geometry_obj.get("coordinates") or []:
+        verts = [c for c in (_coord_pair_from_lon_lat(pair) for pair in (line or [])) if c is not None]
+        if len(verts) > 1:
+            parts.append(verts)
+    return parts if parts else None
+
+
 def _read_geojson_without_gdal(path: str) -> pd.DataFrame:
     """Read cached GeoJSON as plain rows with pre-extracted snap coordinates.
 
@@ -904,6 +916,8 @@ def _read_geojson_without_gdal(path: str) -> pd.DataFrame:
         row["__snap_coord"] = vertices[0]
         row["__snap_vertices"] = vertices if len(vertices) > 1 else None
         gtype = geometry_obj.get("type", "") if isinstance(geometry_obj, dict) else ""
+        row["__geometry_type"] = gtype
+        row["__snap_line_parts"] = _geojson_line_parts(geometry_obj)
         row["__geometry_token"] = _compact_geometry_token(gtype, vertices)
         rows.append(row)
 
@@ -1160,12 +1174,16 @@ def get_poi_geometries(poi):
     else:
         geoms = np.empty(len(poi), dtype=object)
         geoms[:] = None
-    col_names = tuple(SOURCE_KEY_COLUMNS) + ("__geometry_token", "__snap_coord", "__snap_vertices")
+    col_names = tuple(SOURCE_KEY_COLUMNS) + (
+        "__geometry_token", "__geometry_type", "__snap_coord", "__snap_vertices", "__snap_line_parts",
+    )
     col_values = {col: poi[col].to_numpy() for col in col_names if col in poi.columns}
     name_vals = col_values.get("name")
     snap_coords = col_values.get("__snap_coord")
     snap_vertices = col_values.get("__snap_vertices")
     geometry_tokens = col_values.get("__geometry_token")
+    geometry_types = col_values.get("__geometry_type")
+    snap_line_parts = col_values.get("__snap_line_parts")
 
     for i in range(len(geoms)):
         geometry = geoms[i]
@@ -1182,10 +1200,13 @@ def get_poi_geometries(poi):
             coord = snap_coords[i]
             if isinstance(coord, tuple) and len(coord) >= 2:
                 vertices = snap_vertices[i] if snap_vertices is not None else None
+                line_parts = snap_line_parts[i] if snap_line_parts is not None else None
                 plain_geom = {
                     "snap_coord": coord,
                     "snap_vertices": vertices if isinstance(vertices, list) else None,
                     "geometry_token": str(geometry_tokens[i]),
+                    "geometry_type": str(geometry_types[i]) if geometry_types is not None else "",
+                    "line_parts": line_parts if isinstance(line_parts, list) else None,
                 }
                 source_key = build_poi_source_key(row, plain_geom["geometry_token"])
                 out.append((plain_geom, name, source_key))

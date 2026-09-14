@@ -71,6 +71,11 @@ _sentinel_path: str | None = None
 _label: str = ""
 
 
+def notify_config_exists() -> bool:
+    """Whether notify_config.json is present, without validating its contents."""
+    return _CONFIG_PATH.exists()
+
+
 def load_notify_config() -> dict:
     """Read and validate notify_config.json. Raises with a clear message if
     missing/incomplete — call this at startup so a bad setup fails fast, not

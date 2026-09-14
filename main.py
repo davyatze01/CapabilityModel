@@ -31,7 +31,7 @@ LIGHT_OUTPUT = True
 #   finish. Uses a detached watchdog process (outside the run_safe.sh cgroup) so even a
 #   SIGKILL of the pipeline gets reported. Needs notify_config.json (gitignored) with the
 #   bot token and chat id; setup steps and a --test command are documented in notify.py.
-NOTIFY_CRASH = True
+NOTIFY_CRASH = False
 # POI_RADIUS_KM: fixed POI search radius in km, overriding the usual decay-based threshold
 #   (see core.config.PipelineConfig.poi_radius_m). None = normal behavior (radius derived
 #   from poi_radius_decay_threshold). Set to e.g. 5.0 for a fixed-radius sensitivity run.
@@ -113,7 +113,12 @@ def _reexec_under_run_safe_if_needed() -> None:
 
 def main():
     """Run the full capability pipeline end-to-end and print generated output paths."""
+    global NOTIFY_CRASH
     _reexec_under_run_safe_if_needed()
+
+    if NOTIFY_CRASH and not notify.notify_config_exists():
+        print("[Notify] notify_config.json not found; disabling crash notifications.", flush=True)
+        NOTIFY_CRASH = False
 
     # Arm AFTER the re-exec so the watchdog tracks the real (scoped) pipeline process,
     # not the pre-exec launcher. Fails fast here if notify_config.json is missing/broken.

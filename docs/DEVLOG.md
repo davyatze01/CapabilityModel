@@ -742,3 +742,84 @@ this is maintained.
   keeping the existing value elsewhere, in all four pools that set it:
   `routing/non_bus_routing_stage.py` (20), `stages/accessibility_stage.py` (200),
   `exports/poi_exports.py` (200), `analysis/score_report.py` (200).
+
+## 2026-09-11
+
+- `main.py` (`main()`) / `core/notify.py`: `NOTIFY_CRASH = True` used to fail fast in
+  `install_crash_notifier()` whenever `notify_config.json` was missing, even though the knob
+  defaults to `False` and colleagues without Telegram set up shouldn't hit that. Added
+  `notify.notify_config_exists()` (checks `_CONFIG_PATH.exists()` without validating contents)
+  and, in `main()`, check it before arming: if `NOTIFY_CRASH` is set but the config file isn't
+  there, log a line and flip the global back to `False` instead of crashing. Covers both
+  `NOTIFY_CRASH` checks in `main()` (arm at start, `mark_success` at the end) since they read
+  the same corrected global.
+- `tools/nature_immersion/` (new): standalone Leaflet page + `exports/generate_nature_immersion_export.py`
+  to browse `high_nature_immersion` POIs on a map, filterable by the specific raw OSM tag that
+  matched (joins `pois_used.gpkg` against the cached `poi/Cagliari/all_tags_*.geojson` raw-tag
+  universe via `element_type`+`osmid`, since `pois_used.gpkg` only keeps the derived `poi_types`,
+  not the raw tag). Clicking a POI opens Google Street View for that point in a new tab
+  (`maps/@?api=1&map_action=pano&viewpoint=...`) — the no-key iframe-embed trick
+  (`layer=c&cbll=...&output=embed`) no longer works, Google has locked it down.
+- `config/poi_types.csv`: moved `natural=grassland` and `landuse=meadow` (plus their matching
+  text labels) from `high_nature_immersion`'s clause list to `perceived_nature`'s, per request.
+  Left the row's non-OSM `GI*`/`BI*` codes untouched — no confirmed mapping from those codes to
+  which specific tag they represent, so touching them risked silently misclassifying
+  shapefile-sourced POIs.
+- `stages/snapping_stage.py` / `utils/line_merge.py` (new) / `utils/graphml.py`: line-like POIs
+  (coastline, rivers, streams, hiking/running routes, etc.) get snap-candidate access points
+  every 500m along their merged connected components, instead of the raw OSM way vertices
+  `_extract_geom_vertices` used to return. Went through several design iterations in
+  conversation before landing here — first built coastline-only independent POIs sampled every
+  500m in `exports/poi_exports.py` (fully reverted, see below), then moved to per-connected-
+  component snap candidates, then generalized from coastline-only to every line-like poi_type.
+  `utils/line_merge.py` holds the reusable bits (`merge_connected_lines`: union-find on shared
+  endpoints + `shapely.ops.linemerge`, in a UTM CRS; `sample_line_every`: fixed-spacing
+  `line.interpolate()` walk) — kept out of `stages/snapping_stage.py` and `exports/poi_exports.py`
+  proper since the latter already imports from the former, so it can't import back.
+  `_build_poi_snap_map` now runs a pre-pass per query: pulls out every line-like item via the
+  new `_line_geometry_from_item`, merges/samples once, and only those items get their candidate
+  list replaced (points and polygons untouched). Along the way, fixed a real bug this surfaced:
+  the no-GDAL cached-geometry path (`_read_geojson_without_gdal`, used for Cagliari) flattened
+  a `MultiLineString`'s separate parts into one combined vertex list with no boundary between
+  them (`_geojson_vertices`'s `Polygon`/`MultiLineString` branch) — naively rebuilding a single
+  `LineString` from that would silently draw a bogus straight segment connecting two disjoint
+  parts. Fixed by adding `_geojson_line_parts()` to preserve per-part vertex lists (new
+  `__snap_line_parts` cached column, threaded through `get_poi_geometries` as `"line_parts"`),
+  so `_line_geometry_from_item` now rebuilds one `LineString` per actual part. Also added
+  `__geometry_type` (new cached column) since the dict/no-GDAL geometry shape previously carried
+  no type info at all — needed to safely tell a line from a flattened polygon ring using only
+  vertices. `exports/poi_exports.py` itself ended up back at exactly its pre-session state (one
+  centroid point per raw OSM feature, uniformly, no coastline special-casing) — confirmed via
+  `git diff --stat` showing no changes once the coastline-specific code was removed.
+- `scripts/setup_r.py` (`_install_r`) / `routing/public_transport_routing_stage.py` (new
+  `resolve_rscript_path`): `main.py` crashed with `RscriptNotFoundError` even though R was
+  genuinely installed (`winget list --id RProject.R -e` confirmed R 4.6.1 present). Two bugs:
+  (1) `_install_r()` gated success on the installer subprocess's exit code, but winget returns
+  nonzero when the package is already installed and there's nothing to update ("Non sono
+  disponibili versioni più recenti") — a false negative that made the script exit before ever
+  rechecking whether `Rscript` was actually reachable. Fixed by always running the install
+  command and letting the caller decide success based on whether `Rscript` is now findable,
+  not the subprocess's return code. (2) Even after that fix, `Rscript` genuinely wasn't
+  reachable: confirmed via `Get-ChildItem`/`[Environment]::GetEnvironmentVariable` that R's
+  Windows installer (via winget) put `Rscript.exe` at `C:\Program Files\R\R-4.6.1\bin\` but
+  never added that folder to either the Machine or User `PATH` — so a bare `shutil.which
+  ("Rscript")` (used both in `scripts/setup_r.py` and, more importantly, in the actual pipeline
+  call at `routing/public_transport_routing_stage.py`'s `_run_r5r_script`) would keep failing
+  on every run, PATH-restart or not. Added `resolve_rscript_path()`: tries `shutil.which` first,
+  then falls back to globbing R's known Windows install roots
+  (`%ProgramFiles%\R\R-*\bin\Rscript.exe`, `%LOCALAPPDATA%\Programs\R\R-*\bin\Rscript.exe`,
+  highest version first). Wired into both the actual `_run_r5r_script` call site and
+  `setup_r.py`'s two detection points, so setup and the real pipeline run agree on what
+  "Rscript is installed" means and neither depends on PATH being correctly configured.
+- `routing/public_transport_routing_stage.py` (`_autobuild_pbf_from_place`): next blocker in
+  the same run — `osmium-tool` missing, and the error message hardcoded a Fedora-only
+  `sudo dnf install osmium-tool` hint with no Windows guidance at all. Added
+  `_osmium_install_hint()` (platform-aware: Windows gets conda-forge/OSGeo4W/WSL options, macOS
+  gets brew, Linux detects apt/dnf/pacman). Actually installed it on this machine via Miniconda
+  (`winget install --id Anaconda.Miniconda3`, then `conda install -c conda-forge osmium-tool`,
+  after accepting the three default-channel ToS prompts conda now requires non-interactively).
+  Hit the exact same PATH gap as the Rscript fix above — conda doesn't add an env's
+  `Library\bin` to PATH unless activated — so added `resolve_osmium_path()` mirroring
+  `resolve_rscript_path()`'s fallback pattern (checks `%USERPROFILE%\miniconda3`,
+  `...\anaconda3`, `%LOCALAPPDATA%\miniconda3`, `C:\ProgramData\miniconda3`), wired into
+  `_autobuild_pbf_from_place` in place of the bare `shutil.which("osmium")`.

@@ -4,6 +4,7 @@ import glob
 import hashlib
 import os
 import pickle
+import platform
 import queue as _queue
 import signal
 import shutil
@@ -27,6 +28,30 @@ class RscriptNotFoundError(RuntimeError):
     """Raised when Rscript isn't on PATH -- distinct from RuntimeError so callers can
     catch specifically this and offer to run scripts/setup_r.py, without swallowing
     unrelated routing failures."""
+
+
+def resolve_rscript_path() -> str | None:
+    """Find Rscript, falling back to known Windows install locations when it's on disk but
+    not on PATH -- R's Windows installer (including via winget) doesn't always add itself to
+    PATH, so a bare shutil.which("Rscript") is not a reliable "R is installed" check there.
+    """
+    found = shutil.which("Rscript")
+    if found:
+        return found
+    if platform.system() != "Windows":
+        return None
+    roots = [
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "R",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "R",
+    ]
+    candidates = []
+    for root in roots:
+        if root.is_dir():
+            candidates.extend(root.glob("R-*/bin/Rscript.exe"))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.parent.parent.name, reverse=True)
+    return str(candidates[0])
 
 # Wall-clock stall watchdog for the R5 subprocess. r5r prints per-chunk progress
 # (build_network, per-chunk routing with progress=TRUE, per-chunk mem reports), so a
@@ -320,6 +345,48 @@ def _study_area_bbox_wgs84(cfg) -> tuple[float, float, float, float]:
     return west - dlon, south - dlat, east + dlon, north + dlat
 
 
+def _osmium_install_hint() -> str:
+    system = platform.system()
+    if system == "Windows":
+        return (
+            "osmium-tool has no single-command Windows installer. Options: "
+            "(1) install Miniconda/Anaconda, then `conda install -c conda-forge osmium-tool`; "
+            "(2) install OSGeo4W (https://trac.osgeo.org/osgeo4w/) and select the osmium-tool "
+            "package; (3) use WSL and `sudo apt install osmium-tool` there."
+        )
+    if system == "Darwin":
+        return "Install it with: brew install osmium-tool"
+    if shutil.which("apt"):
+        return "Install it with: sudo apt install osmium-tool"
+    if shutil.which("dnf"):
+        return "Install it with: sudo dnf install osmium-tool"
+    if shutil.which("pacman"):
+        return "Install it with: sudo pacman -S osmium-tool"
+    return "Install osmium-tool for your platform: https://osmcode.org/osmium-tool/"
+
+
+def resolve_osmium_path() -> str | None:
+    """Find osmium, falling back to known Windows conda install locations when it's on disk
+    but not on PATH -- conda doesn't add its envs' bin dirs to PATH unless activated.
+    """
+    found = shutil.which("osmium")
+    if found:
+        return found
+    if platform.system() != "Windows":
+        return None
+    roots = [
+        Path(os.environ.get("USERPROFILE", "")) / "miniconda3",
+        Path(os.environ.get("USERPROFILE", "")) / "anaconda3",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "miniconda3",
+        Path("C:/ProgramData/miniconda3"),
+    ]
+    for root in roots:
+        candidate = root / "Library" / "bin" / "osmium.exe"
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 def _autobuild_pbf_from_place(cfg, pbf_path: str) -> None:
     """Clip the study-area PBF out of a regional Geofabrik extract with osmium.
 
@@ -329,11 +396,10 @@ def _autobuild_pbf_from_place(cfg, pbf_path: str) -> None:
     tags. Here the data stays real, compressed PBF end to end and osmium streams it
     with bounded memory.
     """
-    osmium_exe = shutil.which("osmium")
+    osmium_exe = resolve_osmium_path()
     if osmium_exe is None:
         raise RuntimeError(
-            "osmium-tool is required to clip the OSM extract. "
-            "Install it with: sudo dnf install osmium-tool"
+            f"osmium-tool is required to clip the OSM extract. {_osmium_install_hint()}"
         )
     if not cfg.osm_extract_url:
         raise RuntimeError(
@@ -602,7 +668,7 @@ def _run_r5r_script(
                 "Cannot launch host Rscript. Run the pipeline from a regular terminal instead."
             )
     else:
-        rscript_exe = shutil.which("Rscript")
+        rscript_exe = resolve_rscript_path()
         if not rscript_exe:
             raise RscriptNotFoundError(
                 "Rscript executable not found. Run `python scripts/setup_r.py` to check/install "
