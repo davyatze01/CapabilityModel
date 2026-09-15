@@ -823,3 +823,54 @@ this is maintained.
   `resolve_rscript_path()`'s fallback pattern (checks `%USERPROFILE%\miniconda3`,
   `...\anaconda3`, `%LOCALAPPDATA%\miniconda3`, `C:\ProgramData\miniconda3`), wired into
   `_autobuild_pbf_from_place` in place of the bare `shutil.which("osmium")`.
+
+## 2026-09-14
+
+- `utils/graphml.py`: OSM/shapefile can split one physical polygon POI into several
+  fragments (e.g. a school cut by an internal road, a park split by a bridge), which
+  were counted/routed as distinct POIs. Added a merge step, grouped by the raw
+  matched OSM tag or Paris `TYPEQU` code — not the config `poi_type`, since a
+  poi_type's tag clause can OR together several distinct raw tags that must NOT be
+  merged into each other. Added in three pieces: `_stamp_poi_raw_tag()` +
+  `_row_raw_tags()` persist a new `poi_raw_tag` column (`"key=value&key2=value2"`,
+  `&` only ever joining distinct keys — a row whose actual value is itself
+  semicolon multi-valued, e.g. `access=private;customers`, is duplicated once per
+  matched value so each copy carries one unambiguous identity) so the tag that
+  matched is legible later, e.g. for a planned tag-relabeling interface, instead of
+  being re-derived on demand; `_merge_polygon_cluster()` does the actual geometric
+  merge within one raw-tag group (buffer by `distance_m/2` in the group's UTM zone,
+  `unary_union` overlapping buffers to find clusters, union the original — unbuffered
+  — geometries per cluster); `merge_nearby_polygon_pois()` (default `distance_m=10`)
+  dispatches per `poi_raw_tag` group. Wired into `get_poi()` at all three points
+  where a fresh, single-query POI set is finalized (city-universe filtered result,
+  shapefile load, fresh OSM download) — before caching to GeoJSON, so the merge is
+  persisted and future cache reads get pre-merged data for free.
+- `config/osm_raw_tag_codes.csv` (new) + `utils/graphml.py` (`_load_osm_raw_tag_codes()`):
+  added a raw_tag -> short-code lookup (21 rows, green-infrastructure `GI01..GI12` and
+  blue-infrastructure `BI01..BI09`, from a table the user pasted) so OSM-sourced POIs
+  get the same kind of stable short identity Paris already has via `TYPEQU`. Wired into
+  `_stamp_poi_raw_tag()`'s OSM branch: a computed `"key=value&..."` string is replaced
+  by its code when the table has an entry, left as-is otherwise.
+- `utils/graphml.py` (`_merge_polygon_cluster`, `_cluster_by_adjacency`, `_split_cluster_by_name`):
+  tested the polygon-merge feature above against real cached Cagliari OSM data
+  (`poi/Cagliari/all_tags_*.geojson`) instead of synthetic cases, per the user's
+  request, and found two real bugs. (1) The original clustering built one big
+  `unary_union` blob from every buffered polygon in a raw-tag group and assigned
+  membership via `blob.intersects(polygon)`; on a large/complex union (hundreds of
+  polygons across the whole group) that test numerically misfired, lumping polygons
+  7,977m apart into the same "cluster" (verified: two differently-named parks,
+  `Parco 22 ottobre 2008` and `Parco Dell'Acqua`, wrongly merged into one 974m-wide
+  record). Fixed by replacing the blob-membership test with `_cluster_by_adjacency()`:
+  a spatial-index-backed exact pairwise buffer-intersects graph, clustered via
+  `scipy.sparse.csgraph.connected_components` — the same ground-truth method used to
+  catch the bug, made into the actual implementation. (2) Added `_split_cluster_by_name()`
+  so a cluster containing 2+ distinct non-null names gets split by nearest-named-anchor
+  instead of unioned wholesale (a genuine single facility split by a road shares one
+  name or has it on only one fragment; two distinct names means the buffer bridged
+  unrelated facilities) — first version had a tie-breaking bug where a named anchor
+  touching another anchor at distance 0 could be reassigned away from its own name;
+  fixed by never reassigning anchors, only unnamed fragments. Verified with a full
+  correctness pass across all 173 distinct tag clauses in `config/poi_types.csv`
+  against the real Cagliari dataset (918 multi-fragment merge groups): worst chain
+  link found anywhere is 9.989m, zero groups exceed the 10m threshold, zero
+  name-conflict violations remain.

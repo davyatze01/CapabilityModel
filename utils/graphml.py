@@ -4,10 +4,13 @@ import math
 import warnings
 import geopandas as gpd
 import pandas as pd
+import csv
 import hashlib
+import itertools
 import json
 import numpy as np
 from shapely.geometry import shape
+from shapely.ops import unary_union
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -740,6 +743,236 @@ def _filter_by_tags(gdf: gpd.GeoDataFrame, tags: TagQuery) -> gpd.GeoDataFrame:
         out = out[out["geometry"].notna()].copy()
     return out
 
+def _split_cluster_by_name(cluster_group):
+    """Split a candidate cluster into per-named-anchor sub-groups when names conflict.
+
+    A genuine single facility split by a road either shares one name across its
+    fragments or has the name on only one of them; two distinct non-null names inside
+    one geometric cluster mean the buffer chained together unrelated facilities (e.g.
+    two different parks bridged by a small unnamed fragment between them, or two
+    distinctly-named facilities that happen to directly touch/overlap). Named rows are
+    anchors and always keep their own name — an anchor is never reassigned to another
+    anchor's group, even one it touches at distance 0, since distance-to-self and
+    distance-to-a-touching-neighbor are both 0 and indistinguishable by nearest-anchor
+    alone. Only unnamed fragments are assigned to whichever anchor is nearest.
+    """
+    if "name" not in cluster_group.columns:
+        return [cluster_group]
+    names = cluster_group["name"]
+    distinct_names = names.dropna().astype(str).unique()
+    if len(distinct_names) < 2:
+        return [cluster_group]
+
+    is_anchor = names.notna()
+    anchors = cluster_group[is_anchor]
+    anchor_geoms = list(anchors.geometry.values)
+    anchor_labels = list(anchors["name"].astype(str).values)
+
+    assigned_label = pd.Series(index=cluster_group.index, dtype=object)
+    assigned_label[is_anchor] = names[is_anchor].astype(str)
+    for idx in cluster_group.index[~is_anchor]:
+        geom = cluster_group.loc[idx, "geometry"]
+        dists = [geom.distance(a) for a in anchor_geoms]
+        assigned_label[idx] = anchor_labels[int(np.argmin(dists))]
+
+    return [sub for _, sub in cluster_group.groupby(assigned_label)]
+
+
+def _cluster_by_adjacency(polys_m, distance_m: float):
+    """Ground-truth connected components: edge i-j iff their `distance_m/2` buffers truly touch.
+
+    Replaces building one big unary_union blob and testing blob-membership via
+    `intersects()` — on a large/complex union (hundreds of buffered polygons across a
+    whole raw-tag group) that test is numerically unreliable and can misassign
+    genuinely distant, disconnected polygons to the same blob. A spatial index keeps
+    candidate-pair lookups cheap; each candidate pair is still verified with an exact
+    intersects check before becoming a graph edge.
+    """
+    import scipy.sparse as sp
+    from scipy.sparse import csgraph as sp_csgraph
+
+    buffered = polys_m.geometry.buffer(distance_m / 2)
+    sindex = buffered.sindex
+    rows, cols = [], []
+    for i, geom in enumerate(buffered.values):
+        for j in sindex.query(geom, predicate="intersects"):
+            if j > i:
+                rows.append(i)
+                cols.append(j)
+    adj = sp.csr_matrix((np.ones(len(rows), dtype=bool), (rows, cols)), shape=(len(polys_m), len(polys_m)))
+    _, labels = sp_csgraph.connected_components(adj, directed=False)
+    return labels
+
+
+def _merge_polygon_cluster(group, distance_m: float):
+    """Union polygons within `distance_m` of each other inside one raw-tag group.
+
+    Inputs:
+    - group: GeoDataFrame, all rows sharing one raw OSM tag / TYPEQU value.
+    - distance_m: merge threshold in meters.
+
+    Outputs:
+    - GeoDataFrame: same columns, with nearby polygons unioned into single rows.
+    """
+    is_polygon = group.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
+    if is_polygon.sum() < 2:
+        return group
+
+    polys, rest = group[is_polygon], group[~is_polygon]
+    utm_crs = polys.estimate_utm_crs()
+    polys_m = polys.to_crs(utm_crs)
+
+    cluster_id = _cluster_by_adjacency(polys_m, distance_m)
+
+    merged_rows = []
+    for _, candidate_group in polys_m.groupby(cluster_id):
+        if len(candidate_group) == 1:
+            merged_rows.append(candidate_group.iloc[0])
+            continue
+        for cluster_group in _split_cluster_by_name(candidate_group):
+            if len(cluster_group) == 1:
+                merged_rows.append(cluster_group.iloc[0])
+                continue
+            row = cluster_group.iloc[0].copy()
+            row["geometry"] = unary_union(cluster_group.geometry.values)
+            if "name" in cluster_group.columns:
+                names = [n for n in cluster_group["name"].dropna().astype(str).unique()]
+                row["name"] = "; ".join(names) if names else row.get("name")
+            merged_rows.append(row)
+
+    merged = gpd.GeoDataFrame(merged_rows, crs=utm_crs).to_crs(polys.crs)
+    return gpd.GeoDataFrame(pd.concat([merged, rest], ignore_index=True), crs=group.crs)
+
+
+_OSM_RAW_TAG_CODES_PATH = os.path.join("config", "osm_raw_tag_codes.csv")
+_osm_raw_tag_codes_cache: dict[str, str] | None = None
+
+
+def _load_osm_raw_tag_codes() -> dict[str, str]:
+    """Load the raw_tag -> short code lookup (e.g. "leisure=park" -> "GI01").
+
+    Gives OSM-sourced POIs the same kind of stable short identity Paris already gets
+    from TYPEQU, for the raw tags this table covers; anything not listed keeps its
+    plain "key=value&..." poi_raw_tag string.
+    """
+    global _osm_raw_tag_codes_cache
+    if _osm_raw_tag_codes_cache is None:
+        codes: dict[str, str] = {}
+        if os.path.exists(_OSM_RAW_TAG_CODES_PATH):
+            with open(_OSM_RAW_TAG_CODES_PATH, encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    codes[row["raw_tag"]] = row["code"]
+        _osm_raw_tag_codes_cache = codes
+    return _osm_raw_tag_codes_cache
+
+
+def _row_raw_tags(row, clause: dict) -> list[str]:
+    """All "key=value&key2=value2" combinations a row's actual OR-values satisfy in `clause`.
+
+    Each key contributes exactly one value per string; & only joins the AND across
+    different keys. If a row's actual tag value is semicolon multi-valued (an OR on
+    that one key), one string is produced per matched value instead of merging them
+    into one key=value with a stray "&" — "&" is a key/key separator, never a
+    value/value separator.
+    """
+    per_key_values: list[list[tuple[str, str]]] = []
+    for key in sorted(clause):
+        wanted = clause[key]
+        wanted_set = {str(v) for v in wanted} if isinstance(wanted, list) else (
+            {str(wanted)} if wanted is not True else None
+        )
+        value_str = str(row.get(key)) if row.get(key) is not None else ""
+        candidates = [p.strip() for p in value_str.split(";") if p.strip()]
+        if wanted_set is not None:
+            candidates = [c for c in candidates if c in wanted_set] or [value_str]
+        if not candidates:
+            candidates = [value_str]
+        per_key_values.append([(key, v) for v in candidates])
+
+    combos = list(itertools.product(*per_key_values)) if per_key_values else []
+    return ["&".join(f"{k}={v}" for k, v in combo) for combo in combos] or [""]
+
+
+def _stamp_poi_raw_tag(poi, tags: TagQuery | None):
+    """Attach `poi_raw_tag`: the raw OSM key=value combination(s) (or TYPEQU/poi_type) that matched.
+
+    Persisted per POI row instead of recomputed on demand, so later consumers (nearby-
+    polygon merging, and the planned tag-relabeling interface) can read/edit one stable
+    column instead of replaying `tags` against wide OSM tag columns every time. A row
+    whose OR-multivalue matches several alternatives is duplicated once per alternative,
+    so each duplicate carries one unambiguous raw_tag identity.
+
+    Inputs:
+    - poi: GeoDataFrame (or plain DataFrame with no usable geometry, passed through).
+    - tags: OSM tags clause(s) used to fetch `poi` (dict or list of dicts); None in
+      shapefile mode, where `poi["poi_type"]` already is the raw TYPEQU value.
+
+    Outputs:
+    - poi with a new "poi_raw_tag" column, row count possibly increased by OR-duplication.
+    """
+    if poi is None or poi.empty:
+        return poi
+    if "poi_raw_tag" in poi.columns:
+        return poi
+
+    if tags:
+        clauses = tags if isinstance(tags, list) else [tags]
+        remaining = poi
+        stamped_frames = []
+        for clause in clauses:
+            if not isinstance(clause, dict) or remaining.empty:
+                continue
+            matched = _filter_by_clause(remaining, clause)
+            if matched.empty:
+                continue
+            codes = _load_osm_raw_tag_codes()
+            exploded = []
+            for _, row in matched.iterrows():
+                for raw_tag_value in _row_raw_tags(row, clause):
+                    new_row = row.copy()
+                    new_row["poi_raw_tag"] = codes.get(raw_tag_value, raw_tag_value)
+                    exploded.append(new_row)
+            stamped_frames.append(pd.DataFrame(exploded))
+            remaining = remaining.loc[~remaining.index.isin(matched.index)]
+        if not remaining.empty:
+            leftover = remaining.copy()
+            leftover["poi_raw_tag"] = "__unmatched__"
+            stamped_frames.append(leftover)
+        combined = pd.concat(stamped_frames, ignore_index=True)
+        poi = gpd.GeoDataFrame(combined, geometry="geometry", crs=poi.crs)
+    elif "poi_type" in poi.columns:
+        poi = poi.copy()
+        poi["poi_raw_tag"] = poi["poi_type"]
+    else:
+        poi = poi.copy()
+        poi["poi_raw_tag"] = "__all__"
+    return poi
+
+
+def merge_nearby_polygon_pois(poi, distance_m: float = 10.0):
+    """Merge polygon POIs sharing the same `poi_raw_tag` that lie within `distance_m`.
+
+    Groups by the persisted raw OSM tag / TYPEQU identity (see _stamp_poi_raw_tag), not
+    the config poi_type, since fragments of one physical facility only share a single
+    raw tag/TYPEQU identity even when the config poi_type is an OR of several.
+
+    Inputs:
+    - poi: GeoDataFrame with a "poi_raw_tag" column (or plain DataFrame, passed through).
+    - distance_m: merge threshold in meters (default 10).
+
+    Outputs:
+    - GeoDataFrame with nearby same-raw-tag polygons unioned into single rows.
+    """
+    if poi is None or poi.empty or "geometry" not in poi.columns:
+        return poi
+    if not poi.geometry.geom_type.isin(["Polygon", "MultiPolygon"]).any():
+        return poi
+
+    raw_key = poi["poi_raw_tag"] if "poi_raw_tag" in poi.columns else pd.Series("__all__", index=poi.index)
+    merged_groups = [_merge_polygon_cluster(group, distance_m) for _, group in poi.groupby(raw_key)]
+    return gpd.GeoDataFrame(pd.concat(merged_groups, ignore_index=True), crs=poi.crs)
+
+
 def _get_city_poi_universe(place_name: str, cache_slug: str, city_poi_dir: str, buffer_m: float = 0.0) -> gpd.GeoDataFrame:
     cache_key = f"{cache_slug}|buffer={buffer_m:.1f}"
     cached = _CITY_POI_UNIVERSE_CACHE.get(cache_key)
@@ -1007,6 +1240,8 @@ def get_poi(
                 if universe is not None and not universe.empty:
                     poi = _filter_by_tags(universe, tags)
                     if poi is not None and not poi.empty:
+                        poi = _stamp_poi_raw_tag(poi, tags)
+                        poi = merge_nearby_polygon_pois(poi)
                         # Persist the per-query result as a fast-path cache, but treat this as
                         # best-effort: when the universe was loaded from the on-disk GeoJSON cache
                         # it comes back as a plain DataFrame (see _read_geojson_without_gdal, which
@@ -1046,6 +1281,8 @@ def get_poi(
                 # In shapefile mode, selection is based on poi_type -> labels mapping.
                 # OSM tags are irrelevant for source filtering.
                 poi = feature_from_shapefile(cfg.name_shapefile, query_tags={}, poi_type=poi_type)
+                poi = _stamp_poi_raw_tag(poi, None)
+                poi = merge_nearby_polygon_pois(poi)
             else:
                 if tags:
                     if not isinstance(tags, dict):
@@ -1059,6 +1296,8 @@ def get_poi(
                     flush=True,
                 )
                 poi = _download_poi_for_place(place_name, query_tags, buffer_m=buffer_m)
+                poi = _stamp_poi_raw_tag(poi, query_tags)
+                poi = merge_nearby_polygon_pois(poi)
         except Exception as e:
             print(
                 f"[POI] No POIs found for city={place_name}, poi_type={poi_type}, feature={feature}, value={value}, tags={tags}: {e}",
