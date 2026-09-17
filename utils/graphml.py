@@ -916,6 +916,8 @@ def _stamp_poi_raw_tag(poi, tags: TagQuery | None):
         return poi
 
     if tags:
+        if "geometry" not in poi.columns:
+            return poi  # plain-DataFrame/__snap_coord form: nothing meaningful to stamp, pass through
         clauses = tags if isinstance(tags, list) else [tags]
         remaining = poi
         stamped_frames = []
@@ -973,6 +975,96 @@ def merge_nearby_polygon_pois(poi, distance_m: float = 10.0):
     return gpd.GeoDataFrame(pd.concat(merged_groups, ignore_index=True), crs=poi.crs)
 
 
+def _enumerate_clause_tag_strings(clause: dict) -> list[str] | None:
+    """All concrete "key=value&key2=value2" strings a clause can produce.
+
+    Returns None if the clause contains a True-wildcard key (matches any value for
+    that key) — those can't be enumerated without a real row to consult, and are
+    handled separately by _tag_to_poi_type_map() via key-only fallback matching.
+    """
+    per_key_options = []
+    for key in sorted(clause):
+        wanted = clause[key]
+        if wanted is True:
+            return None
+        values = wanted if isinstance(wanted, list) else [wanted]
+        per_key_options.append([(key, str(v)) for v in values])
+    combos = itertools.product(*per_key_options) if per_key_options else []
+    return ["&".join(f"{k}={v}" for k, v in combo) for combo in combos]
+
+
+def _tag_to_poi_type_map() -> tuple[dict[str, str], dict[str, str]]:
+    """Reverse of poi_types.csv's tag clauses: which poi_type a corrected tag belongs to.
+
+    Returns (tag_string -> poi_type, wildcard_key -> poi_type). First poi_type in
+    config/poi_types.csv row order wins a tag string, matching the "first match wins"
+    convention already used elsewhere (e.g. poi_dedup.py's ownership resolution).
+    """
+    tag_to_poi_type: dict[str, str] = {}
+    wildcard_key_to_poi_type: dict[str, str] = {}
+    path = os.path.join("config", "poi_types.csv")
+    with open(path, encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            poi_type = row["poi_type"]
+            try:
+                clauses = json.loads(row["tags"])
+            except Exception:
+                clauses = []
+            if isinstance(clauses, dict):
+                clauses = [clauses]
+            for clause in clauses:
+                if not isinstance(clause, dict) or not clause:
+                    continue
+                strings = _enumerate_clause_tag_strings(clause)
+                if strings is None:
+                    for key, wanted in clause.items():
+                        if wanted is True and key not in wildcard_key_to_poi_type:
+                            wildcard_key_to_poi_type[key] = poi_type
+                    continue
+                for s in strings:
+                    if s not in tag_to_poi_type:
+                        tag_to_poi_type[s] = poi_type
+
+            # Shapefile mode (Paris): poi_raw_tag is the raw TYPEQU code directly, and
+            # poi_from_shp() already uses this same "labels" column to decide which
+            # TYPEQU codes belong to which poi_type — reuse it here so a relabel to a
+            # new TYPEQU code resolves to the right target poi_type the same way.
+            try:
+                labels = json.loads(row.get("labels") or "[]")
+            except Exception:
+                labels = []
+            for label in labels:
+                if isinstance(label, str) and label not in tag_to_poi_type:
+                    tag_to_poi_type[label] = poi_type
+    return tag_to_poi_type, wildcard_key_to_poi_type
+
+
+# Real-geometry re-read of an on-disk universe cache is only attempted below this
+# file size. Cagliari's universe is ~71MB and re-reads safely (~8.6s, no crash,
+# verified against real data); Paris's universe is dramatically larger and this exact
+# kind of full-file real-geometry read is what _read_geojson_without_gdal's own
+# docstring says causes hard GEOS/Shapely crashes there. If a large-city run ever
+# crashes or misbehaves in or around get_poi()/merge/stamp, treat this threshold as a
+# likely suspect and tighten it rather than assuming it's safe at that scale.
+_REAL_GEOMETRY_UNIVERSE_SIZE_LIMIT_BYTES = 150_000_000
+
+
+def _read_universe_with_real_geometry_if_safe(path: str):
+    """Re-read an on-disk universe cache file with real geometry, if small enough.
+
+    Returns None (caller keeps the token-only form) when the file is too large to
+    risk it. See _REAL_GEOMETRY_UNIVERSE_SIZE_LIMIT_BYTES for why this is gated by
+    size at all.
+    """
+    try:
+        if os.path.getsize(path) > _REAL_GEOMETRY_UNIVERSE_SIZE_LIMIT_BYTES:
+            return None
+        return gpd.read_file(path)
+    except Exception as exc:
+        print(f"[POI] Real-geometry universe re-read failed for {path}: {exc}")
+        return None
+
+
 def _get_city_poi_universe(place_name: str, cache_slug: str, city_poi_dir: str, buffer_m: float = 0.0) -> gpd.GeoDataFrame:
     cache_key = f"{cache_slug}|buffer={buffer_m:.1f}"
     cached = _CITY_POI_UNIVERSE_CACHE.get(cache_key)
@@ -998,6 +1090,153 @@ def _get_city_poi_universe(place_name: str, cache_slug: str, city_poi_dir: str, 
     _CITY_POI_UNIVERSE_CACHE[cache_key] = gdf
     return gdf
 
+
+_UNIVERSE_SOURCE_KEY_INDEX_CACHE: dict[str, dict[str, dict]] = {}
+
+
+def _universe_source_key_index(cache_slug: str, city_poi_dir: str, buffer_m: float) -> dict[str, dict]:
+    """source_key -> {"row": Series, "geometry": shapely geometry} for every element
+    in the city-wide universe.
+
+    Built once per process (cached, like _get_city_poi_universe's own in-memory
+    cache) from a REAL-geometry read of the universe cache file — needed to fetch a
+    relabeled-in POI's actual shape regardless of which query originally found it.
+    Reads the file directly with geopandas rather than through
+    _get_city_poi_universe(), which can return the fast GEOS-avoiding cache form
+    (only a __snap_coord token, no real geometry) once the universe is cached on disk.
+    """
+    cache_key = f"{cache_slug}|buffer={buffer_m:.1f}"
+    cached = _UNIVERSE_SOURCE_KEY_INDEX_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    from utils.poi_identity import SOURCE_KEY_COLUMNS
+
+    universe_path = os.path.join(city_poi_dir, _all_tags_file_name(_build_city_universe_tags(), buffer_m))
+    index: dict[str, dict] = {}
+    if os.path.exists(universe_path):
+        universe = gpd.read_file(universe_path)
+        if universe is not None and not universe.empty and "geometry" in universe.columns:
+            col_vals = {col: universe[col].to_numpy() for col in SOURCE_KEY_COLUMNS if col in universe.columns}
+            geoms = universe.geometry.to_numpy()
+            for i in range(len(universe)):
+                row_dict = {col: vals[i] for col, vals in col_vals.items()}
+                key = build_poi_source_key(row_dict, geoms[i])
+                if key not in index:
+                    index[key] = {"row": universe.iloc[i], "geometry": geoms[i]}
+    _UNIVERSE_SOURCE_KEY_INDEX_CACHE[cache_key] = index
+    return index
+
+
+_RELABELS_CACHE: dict[str, dict] = {}
+RELABELS_PATH = os.path.join("tools", "gi_bi_relabeling", "relabels.json")
+
+
+def _load_relabels() -> dict:
+    """Cached read of the manual-relabeling tool's relabels.json artifact."""
+    if "data" in _RELABELS_CACHE:
+        return _RELABELS_CACHE["data"]
+    data = {}
+    if os.path.exists(RELABELS_PATH):
+        try:
+            with open(RELABELS_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            print(f"[POI] Could not read {RELABELS_PATH}: {exc}")
+    _RELABELS_CACHE["data"] = data
+    return data
+
+
+def _resolve_tag_poi_type(tag: str, tag_map: dict[str, str], wildcard_map: dict[str, str]) -> str | None:
+    """poi_type owning a tag string: exact match first, then wildcard-key fallback."""
+    if tag in tag_map:
+        return tag_map[tag]
+    for part in tag.split("&"):
+        if "=" not in part:
+            continue
+        key = part.split("=", 1)[0]
+        if key in wildcard_map:
+            return wildcard_map[key]
+    return None
+
+
+def apply_relabels(poi, poi_type: str, cache_slug: str, city_poi_dir: str, buffer_m: float):
+    """Apply saved manual corrections (tools/gi_bi_relabeling/relabels.json) to poi_type's result.
+
+    Drops any POI relabeled AWAY from this poi_type (its corrected tag now belongs
+    elsewhere) or marked "removed" outright. Pulls in any POI relabeled INTO this
+    poi_type from elsewhere, fetched by source_key from the city-wide universe with
+    its raw tag overridden to the correction, then re-merges so it groups correctly
+    with whatever's already there.
+    """
+    relabels = _load_relabels()
+    if not relabels or "geometry" not in poi.columns:
+        return poi
+
+    tag_map, wildcard_map = _tag_to_poi_type_map()
+    from utils.poi_identity import SOURCE_KEY_COLUMNS
+
+    def row_source_key(frame, i, geoms):
+        row_dict = {col: frame[col].to_numpy()[i] for col in SOURCE_KEY_COLUMNS if col in frame.columns}
+        return build_poi_source_key(row_dict, geoms[i])
+
+    geoms = poi.geometry.to_numpy()
+    current_keys = [row_source_key(poi, i, geoms) for i in range(len(poi))]
+
+    keep_mask = []
+    for key in current_keys:
+        entry = relabels.get(key)
+        if entry is None:
+            keep_mask.append(True)
+            continue
+        new_tag = entry.get("new_tag")
+        if new_tag == "removed":
+            keep_mask.append(False)
+            continue
+        target = _resolve_tag_poi_type(new_tag, tag_map, wildcard_map)
+        keep_mask.append(target is None or target == poi_type)
+
+    present_keys = {k for k, keep in zip(current_keys, keep_mask) if keep}
+    if not all(keep_mask):
+        poi = poi[pd.Series(keep_mask, index=poi.index)].reset_index(drop=True)
+
+    pull_in_keys = [
+        key for key, entry in relabels.items()
+        if entry.get("new_tag") not in (None, "removed")
+        and _resolve_tag_poi_type(entry["new_tag"], tag_map, wildcard_map) == poi_type
+        and key not in present_keys
+    ]
+    if pull_in_keys:
+        index = _universe_source_key_index(cache_slug, city_poi_dir, buffer_m)
+        new_rows = []
+        for key in pull_in_keys:
+            found = index.get(key)
+            if found is None:
+                continue
+            row = found["row"].copy()
+            row["geometry"] = found["geometry"]
+            row["poi_raw_tag"] = relabels[key]["new_tag"]
+            new_rows.append(row)
+        if new_rows:
+            added = gpd.GeoDataFrame(new_rows, geometry="geometry", crs=poi.crs)
+            poi = gpd.GeoDataFrame(pd.concat([poi, added], ignore_index=True), crs=poi.crs)
+            poi = merge_nearby_polygon_pois(poi)
+
+    return poi
+
+
+def _flatten_osm_index(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Promote OSMnx's default (element_type, osmid) index into real columns.
+
+    Without this, osmid/element_type only exist as index levels on a freshly
+    downloaded GeoDataFrame, so build_poi_source_key can't see them and falls back
+    to a geometry-derived signature instead of the real, stable OSM id.
+    """
+    if gdf.index.name is not None or isinstance(gdf.index, pd.MultiIndex):
+        return gdf.reset_index()
+    return gdf
+
+
 def _download_poi_for_place(place_name: str, query_tags: TagClause, buffer_m: float = 0.0):
     """Download POIs for one place, optionally expanding the query area by buffer_m metres."""
     if buffer_m > 0:
@@ -1011,11 +1250,11 @@ def _download_poi_for_place(place_name: str, query_tags: TagClause, buffer_m: fl
         polygon = gdf_buffered.to_crs("EPSG:4326").geometry.iloc[0]
         print(f"[POI] Query area expanded by {buffer_m/1000:.1f} km buffer", flush=True)
         with _ElapsedTimer(f"POI download (buffered polygon, {len(query_tags)} tags)"):
-            return ox.features_from_polygon(polygon, query_tags)
+            return _flatten_osm_index(ox.features_from_polygon(polygon, query_tags))
 
     try:
         with _ElapsedTimer(f"POI download {place_name} ({len(query_tags)} tags)"):
-            return ox.features_from_place(place_name, query_tags)
+            return _flatten_osm_index(ox.features_from_place(place_name, query_tags))
     except Exception as place_exc:
         print(
             f"[POI] features_from_place failed for '{place_name}' ({place_exc}); "
@@ -1026,7 +1265,7 @@ def _download_poi_for_place(place_name: str, query_tags: TagClause, buffer_m: fl
             raise RuntimeError(f"geocode_to_gdf returned no geometry for place '{place_name}'")
         polygon = place_gdf.geometry.iloc[0]
         with _ElapsedTimer(f"POI download {place_name} retry (polygon, {len(query_tags)} tags)"):
-            return ox.features_from_polygon(polygon, query_tags)
+            return _flatten_osm_index(ox.features_from_polygon(polygon, query_tags))
 
 def _coords_are_finite(obj) -> bool:
     """Return True when a GeoJSON coordinate tree contains only finite numbers."""
@@ -1237,11 +1476,22 @@ def get_poi(
         if tags and not cfg.poi_from_shp:
             try:
                 universe = _get_city_poi_universe(place_name, poi_cache_slug, city_poi_dir, buffer_m=buffer_m)
+                if universe is not None and not universe.empty and "geometry" not in universe.columns:
+                    # Token-only cache form: stamp/merge/relabel need real geometry to do
+                    # anything. Upgrade in place and cache it so this process doesn't
+                    # re-read the file on every subsequent query.
+                    universe_path = os.path.join(city_poi_dir, _all_tags_file_name(_build_city_universe_tags(), buffer_m))
+                    real_universe = _read_universe_with_real_geometry_if_safe(universe_path)
+                    if real_universe is not None and not real_universe.empty:
+                        universe = real_universe
+                        _CITY_POI_UNIVERSE_CACHE[f"{poi_cache_slug}|buffer={buffer_m:.1f}"] = universe
                 if universe is not None and not universe.empty:
                     poi = _filter_by_tags(universe, tags)
                     if poi is not None and not poi.empty:
                         poi = _stamp_poi_raw_tag(poi, tags)
                         poi = merge_nearby_polygon_pois(poi)
+                        if poi_type:
+                            poi = apply_relabels(poi, poi_type, poi_cache_slug, city_poi_dir, buffer_m)
                         # Persist the per-query result as a fast-path cache, but treat this as
                         # best-effort: when the universe was loaded from the on-disk GeoJSON cache
                         # it comes back as a plain DataFrame (see _read_geojson_without_gdal, which
@@ -1283,6 +1533,8 @@ def get_poi(
                 poi = feature_from_shapefile(cfg.name_shapefile, query_tags={}, poi_type=poi_type)
                 poi = _stamp_poi_raw_tag(poi, None)
                 poi = merge_nearby_polygon_pois(poi)
+                if poi_type:
+                    poi = apply_relabels(poi, poi_type, poi_cache_slug, city_poi_dir, buffer_m)
             else:
                 if tags:
                     if not isinstance(tags, dict):
@@ -1298,6 +1550,8 @@ def get_poi(
                 poi = _download_poi_for_place(place_name, query_tags, buffer_m=buffer_m)
                 poi = _stamp_poi_raw_tag(poi, query_tags)
                 poi = merge_nearby_polygon_pois(poi)
+                if poi_type:
+                    poi = apply_relabels(poi, poi_type, poi_cache_slug, city_poi_dir, buffer_m)
         except Exception as e:
             print(
                 f"[POI] No POIs found for city={place_name}, poi_type={poi_type}, feature={feature}, value={value}, tags={tags}: {e}",

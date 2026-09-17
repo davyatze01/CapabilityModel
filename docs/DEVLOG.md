@@ -874,3 +874,628 @@ this is maintained.
   against the real Cagliari dataset (918 multi-fragment merge groups): worst chain
   link found anywhere is 9.989m, zero groups exceed the 10m threshold, zero
   name-conflict violations remain.
+
+## 2026-09-15
+
+- Renamed `tools/nature_immersion/` -> `tools/gi_bi_relabeling/` and
+  `exports/generate_nature_immersion_export.py` ->
+  `exports/generate_gi_bi_relabeling_export.py` (title updated to "Blue/Green
+  Infrastructure Relabeling"): the tool was previously hardcoded to one poi_type
+  (`high_nature_immersion`) and only showed centroid points, so its old name/scope no
+  longer matched what it does now that it covers the whole `nature_contact` service.
+- `exports/generate_gi_bi_relabeling_export.py`: rewritten to (1) pull every poi_type
+  contributing to the `nature_contact` service (`utils.services.get_service_queries`)
+  instead of one hardcoded poi_type, so all 3 poi_types' OSM queries feed the
+  interface; (2) show real polygon/line shapes instead of centroid points — needed to
+  visually inspect/fix the merge feature above, so `pois_used.gpkg`'s POI identity
+  (`source_key`, built the same way `exports/poi_exports.py` builds it) is used only
+  to filter down to POIs actually used by the pipeline, then the real geometry is
+  pulled fresh from `graphml.get_poi()` per poi_type and joined back by `source_key`;
+  Point geometries are dropped (only Polygon/MultiPolygon/LineString/MultiLineString
+  kept, per the user — this tool is for relabeling shape data, not point POIs).
+  Deliberately left `pois_used.gpkg` itself untouched (a plain-points interface
+  elsewhere depends on it); the new tool writes its own `tools/gi_bi_relabeling/
+  data.geojson` instead of reusing/extending the old `data.json`.
+- `tools/gi_bi_relabeling/index.html`: switched from manually-built `L.circleMarker`
+  points to `L.geoJSON` rendering real shapes from `data.geojson`, grouped/filterable
+  by `poi_type — tag` (checkboxes, one layer group per combination, with a POI count
+  per group). Clicking a shape now opens its Street View link automatically in a new
+  tab (`window.open`, previously required a manual click on a separate link) at the
+  clicked point on the shape (`e.latlng`) rather than a fixed centroid — more useful
+  for inspecting one particular fragment of a merged/split polygon.
+- `utils/graphml.py` (`_download_poi_for_place`, new `_flatten_osm_index()`): found and
+  fixed a real (pre-existing) identity bug while testing the interface above end to
+  end against a fresh `main.py` run. OSMnx returns downloaded POIs with
+  `osmid`/`element_type` as an index, not real columns, so `build_poi_source_key()`
+  couldn't see them on a freshly-downloaded (not-yet-cached) GeoDataFrame and fell
+  back to a geometry-derived signature — which differs depending on whether the
+  geometry is later read as a real shapely object or as a cached token, so
+  `pois_used.gpkg` and the accessibility stage's per-node writer silently disagreed on
+  every POI's identity. Symptom: `accessibility_stage` wrote zero `.npz` files into
+  `artifacts/<city>/accessibility/poi_by_node` with no error (the per-node writer
+  drops unmatched POIs silently), and the pipeline only crashed 3 stages later in
+  `generate_score_report` (`FileNotFoundError`, poi_by_node empty). Fixed at the root:
+  `_flatten_osm_index()` calls `.reset_index()` right after every OSMnx download call
+  in `_download_poi_for_place()`, so `osmid` is a real column from the very first
+  moment — uses the stable id already in the data instead of adding a synthetic one,
+  per explicit direction. Rebuilding a synthetic persisted `source_key` column was
+  considered and deliberately rejected (adds a second identity scheme that itself
+  needs to stay in sync — the same class of problem, not a fix). This only fixes
+  *future* downloads; existing `poi/<city>/*.geojson` cache, `non_bus_poi_catalog.pkl`,
+  `artifacts/<city>/non_bus/`, `artifacts/<city>/accessibility/`,
+  `artifacts/<city>/snapping/`, and `outputs/poi_exports/<city>/` all still need
+  clearing/regenerating to actually pick up the corrected identities (bus/subway
+  routing caches confirmed unaffected — their destination ids are synthetic sequential
+  labels tied to sampled graph nodes, not POI source_keys).
+- `exports/generate_gi_bi_relabeling_export.py`: after the fix above, `graphml.get_poi()`
+  was still returning a stripped point-token form for already-cached queries (correct
+  for the main pipeline's hot loop, useless here). Added `_cached_geojson_path()` +
+  switched to reading that same cache file directly via `geopandas.read_file()` for
+  real geometry, calling `get_poi()` only to guarantee the cache file exists.
+- `tools/gi_bi_relabeling/`: added `avvia_interfaccia.sh` (Linux/macOS) and
+  `avvia_interfaccia.bat` (Windows) double-click launchers — start a local HTTP server
+  and open the map in the default browser, for a non-technical colleague — and vendored
+  Leaflet 1.9.4 locally (`vendor/leaflet/`, ~184KB: JS, CSS, marker icons) so the page
+  no longer depends on the `unpkg.com` CDN; `index.html` now points at
+  `vendor/leaflet/...`. The OpenStreetMap basemap tiles still require internet (too
+  large to bundle), so the page isn't fully offline — only the Leaflet library itself
+  is now local.
+- `exports/generate_gi_bi_relabeling_export.py` (`_load_code_to_raw_tag()`): the "tag"
+  field was showing the GI0x/BI0x short code when `config/osm_raw_tag_codes.csv` had
+  one, instead of the plain OSM query — confusing for a colleague relabeling raw OSM
+  data who needs to see e.g. `leisure=park`, not `GI01`. Added a reverse lookup
+  (code -> plain "key=value" text) applied only to the exported "tag" property; the
+  underlying merge/grouping logic (which uses the codes) is untouched.
+- `tools/gi_bi_relabeling/index.html`: UI overhaul per user feedback after first trying
+  the interface — (1) nothing is selected/rendered on load, with "Select all"/
+  "Deselect all" buttons added above the filter list, instead of every group starting
+  checked; (2) each poi_type/tag group gets a distinct color (golden-angle hue
+  rotation, `colorForIndex()`) shown as a swatch next to its checkbox, instead of one
+  fixed green for every shape, so overlapping groups are distinguishable on the map;
+  (3) hovering any shape restyles it (and, since a merged POI is already one Leaflet
+  feature — possibly multi-part — the whole merged shape) to yellow and reverts to its
+  group color on mouseout, to visually show what the merge feature considers "the same
+  POI"; (4) removed the unused "Open Street View" link/button (clicking already
+  auto-opens it) and repurposed that panel space to show POI details (name, poi_type,
+  tag, source_key) on click instead.
+- `tools/gi_bi_relabeling/index.html`: added hover-to-locate on the filter-list labels
+  themselves — hovering a category row highlights every shape in that category in
+  yellow across the whole map, temporarily adding it to the map first if its checkbox
+  is unchecked (and removing it again on mouseout, without touching the checkbox
+  state), so a category's spatial extent can be previewed without selecting it.
+  Verified visually end to end with a headless Playwright browser (initial empty
+  state, Select all rendering distinct per-group colors, shape hover, click ->
+  detail panel + Street View, and this label-hover reveal/unreveal).
+- `tools/gi_bi_relabeling/index.html`: fixed a real bug the user hit — checking a
+  category's checkbox *while* hovering its label left the checkbox checked but the
+  shape missing from the map. Cause: `mouseleave` decided whether to remove the layer
+  from a `wasVisible` flag captured once on `mouseenter`, which went stale the moment
+  the checkbox was toggled mid-hover. Fixed by reading the checkbox's live `.checked`
+  state on `mouseleave` instead of a captured flag. Reproduced the exact sequence
+  (hover -> click checkbox -> move mouse away) with Playwright before and after the
+  fix to confirm it.
+- `tools/gi_bi_relabeling/`: added POI relabeling, persisted to a file. New
+  `server.py` (standard-library only, no dependencies — a `http.server.SimpleHTTPRequestHandler`
+  subclass) replaces the plain `python -m http.server` in both launcher scripts;
+  it still serves the same static files but adds one endpoint, `POST /save_relabel`,
+  which merges the posted `{source_key, poi_type, name, original_tag, new_tag}` into
+  `relabels.json` in the same folder (atomic write via a `.tmp` + `os.replace`, same
+  pattern as `poi_dedup.py`'s `write_drop_map`). `index.html`: the detail panel's
+  static "tag" text became a `<select>` populated with every distinct plain-text tag
+  seen in `data.geojson`; per explicit direction there is no Save button — choosing a
+  different option in the dropdown (`change` event) immediately POSTs the correction
+  and updates the shape's style to a dashed border so already-corrected POIs are
+  visually distinguishable on the map. Also switched the port from 8765 to 8766 after
+  discovering a stale process (outside this session's reach) still holding 8765 from
+  before this change. Verified the full flow with Playwright: dropdown lists all 21
+  known tags, changing it POSTs successfully, `relabels.json` is written correctly on
+  disk, and the "Saved." status appears in the panel.
+- `tools/gi_bi_relabeling/index.html`: fixed a real bug the user hit — relabeling a
+  POI never actually moved it into its new category. `groups`/counts were computed
+  once from `data.geojson`'s original `tag` at load time, and `relabels.json` was
+  only ever used for the dropdown default and the dashed-border style, never fed back
+  into grouping — so a corrected POI stayed under its old category forever, counts
+  never changed, and this persisted across refreshes (there was nothing to refresh
+  into). Fixed by refactoring the render logic into `loadAndRender()`: it now
+  overwrites each feature's effective `tag` with its saved correction (if any) via
+  `effectiveTag()` *before* computing groups, so a relabeled POI is grouped/counted
+  under its corrected tag from that point on. `loadAndRender()` is called both on
+  initial page load and again after every successful save (instead of just patching
+  one shape's style in place), preserving the currently-checked categories and map
+  view across the rebuild so the colleague's place isn't lost. Also added
+  zoom-to-nearest: checking a category's checkbox now pans/zooms the map to whichever
+  POI in that category is closest to the current view center (`zoomToNearest()`),
+  making rare categories easy to actually find. Verified with Playwright: relabeling
+  a "perceived_nature — natural=water&water=pond" POI to "amenity=fountain" moved it
+  out of the old group entirely and into the new one (66 -> 67), confirmed on a
+  completely fresh page load (not just in the live session); checking a category
+  jumped the map from the default view straight to a zoom-15 view centered on one of
+  its POIs.
+- `exports/generate_gi_bi_relabeling_export.py`: broadened scope per the user — pulls
+  every configured poi_type across all services now (`utils.services.unique_query_keys()`)
+  instead of just `nature_contact`'s 3, still filtered to POIs actually used by the
+  pipeline (`_used_source_keys()` simplified accordingly, no poi_type intersection
+  needed since we want all of them). Added a `seen_keys` guard since a POI can be
+  matched by more than one poi_type's query — each now appears exactly once, under
+  whichever poi_type's query processes it first, instead of being duplicated once per
+  matching poi_type. Regenerated `data.geojson`: 5,598 shapes from 7,482 used POIs
+  (up from 3,881/3,964 when scoped to nature_contact alone), 13s to build since
+  everything was already cached from the earlier full pipeline run.
+- `tools/gi_bi_relabeling/index.html`: added the ability to remove a POI from the
+  analysis. Per explicit direction, removing is literally picking a special
+  `"removed"` value from the same tag dropdown used for every other correction (no
+  separate button/action) — always present as an option even when no POI is currently
+  removed (`allTags` gets it force-added). `groupKey()` special-cases it so every
+  removed POI collapses into one unified `"removed"` category regardless of its
+  original poi_type (rather than splitting into `"poi_type — removed"` per type), and
+  that group is forced to pure black instead of a `colorForIndex()` hue. Added a small
+  centroid icon marker on every edited shape (✎, or ✕ specifically for removed) so
+  modified shapes are recognizable at a glance without opening the panel. Added a
+  persistent "currently selected" highlight (solid blue, `SELECTED_STYLE`) distinct
+  from the transient yellow hover — tracked via `selectedSourceKey`, survives
+  `loadAndRender()` rebuilds (re-applied after each one), and correctly hands off
+  between shapes as a new one is clicked. Verified with Playwright: the "removed"
+  group doesn't exist until first used, then appears as "removed (1)"; the dropdown
+  always offers "removed"; the removed shape renders black with a dashed border and
+  ✕ icon; clicking a second shape reverts the first from blue back to its own style
+  while the new one turns blue.
+- `exports/generate_gi_bi_relabeling_export.py` (`_poi_type_order()`) + `tools/gi_bi_relabeling/index.html`:
+  reorganized the sidebar into collapsible per-poi_type sections instead of one flat
+  "poi_type — tag (count)" list. `_poi_type_order()` reads `config/poi_types.csv`
+  top-to-bottom (first-occurrence order, since one poi_type spans several clause rows)
+  and writes it to a new `tools/gi_bi_relabeling/poi_type_order.json`, so the sidebar
+  section order matches the CSV exactly rather than alphabetical or discovery order.
+  `index.html` fetches that file alongside the other two, builds one native
+  `<details>/<summary>` per poi_type (free expand/collapse, no extra JS needed) in
+  that order, with "removed" as its own section first (a poi_type of its own, per the
+  user) — labels underneath now show just `tag (count)`, not the poi_type name
+  repeated on every row. Per-group color/layer/checkbox logic is untouched; only
+  where each label gets appended (into its poi_type's `<details>` instead of flatly
+  into `#filter-list`) and its text changed. Sections start collapsed on first load
+  and each one's open/closed state is preserved across `loadAndRender()` rebuilds
+  (captured before the rebuild, re-applied after), the same way checked categories
+  already were. Also bumped the edit/removed icon size (14px/16px box -> 22px bold
+  text in a 24px box) since the user found the original too small. Verified with
+  Playwright: collapsed sidebar shows one row per poi_type in exact CSV order;
+  expanding one shows its tags indented underneath with per-tag color swatches;
+  marking a POI removed correctly promotes "removed" to the first section; the icon
+  is now clearly legible when zoomed to the shape.
+- `tools/gi_bi_relabeling/index.html`: fixed a gap the user caught — relabeling only
+  ever overrode `tag`, never `poi_type`, so a POI relabeled to a tag belonging to a
+  completely different poi_type (e.g. a hospital corrected to `amenity=ice_cream`)
+  stayed grouped under its old poi_type section (`residential_healthcare`) instead of
+  the one the new tag actually belongs to (`takeaway_consumption`). Fixed in
+  `loadAndRender()`: build a `tag -> poi_type` map from the natural, pre-relabel data
+  first (every tag in the dropdown occurs on at least one real POI, so its "home"
+  poi_type is always discoverable from `data.geojson` itself — no new export file
+  needed), then when applying each POI's effective tag, also override its effective
+  `poi_type` from that map (falling back to the original poi_type only if the new tag
+  isn't found in it, e.g. "removed", which stays in its own unified section).
+  Verified with Playwright: relabeling a real `residential_healthcare` POI to
+  `amenity=ice_cream` moved it into the `takeaway_consumption` section's
+  `amenity=ice_cream (2)` row, and re-inspecting that same POI's live feature data
+  directly confirmed its effective `poi_type` is now `takeaway_consumption`.
+- `tools/gi_bi_relabeling/index.html`: stopped auto-opening a new tab on every click
+  (too noisy once you're clicking through hundreds of shapes) in favor of a button.
+  Initially swapped the target to OpenStreetMap (misread of the request — briefly
+  added `openStreetMapUrl()`, linking straight to the real OSM feature page via
+  `source_key`), then corrected back to Google Street View per the user's
+  clarification: kept `streetViewUrl()` as before, restored `#detail-link`'s original
+  green-button styling and "Open Street View ↗" label, just no longer auto-fired on
+  click. Also dropped the stale "(also opens Street View)" placeholder text, since the
+  button, not the click itself, is now what opens it. Verified with Playwright:
+  clicking a shape opens zero new browser tabs (checked via context.pages() count
+  before/after), and the button's href resolves to the correct Street View viewpoint
+  at the clicked coordinates.
+- `tools/gi_bi_relabeling/index.html`: added a red "Remove POI" button next to the
+  green "Open Street View" one, as a one-click shortcut for the most common
+  correction. Refactored the dropdown's save logic out into a shared `saveRelabel(props,
+  newTag)` so the button and the dropdown's `change` handler both call the exact same
+  path instead of duplicating the POST/loadAndRender logic — the button just calls
+  `saveRelabel(props, REMOVED_TAG)`. Caught via testing (not just assumed correct):
+  clicking the button correctly moved the POI into the "removed" section, but the
+  still-open detail panel's own dropdown kept showing the POI's old tag, since
+  `loadAndRender()` rebuilds the sidebar/map but never touches the already-rendered
+  panel. Fixed by setting `#tag-select`'s value to `REMOVED_TAG` immediately in the
+  button's click handler, mirroring what picking it from the dropdown does natively.
+- `tools/gi_bi_relabeling/index.html`: added an "original tag" row above the editable
+  tag dropdown, so a colleague can see what a POI was tagged before any correction and
+  restore it if needed. Deliberately sourced from `data.geojson` itself
+  (`f.properties.originalTag`, captured once per load before any relabel override is
+  applied), not from `relabels.json`'s own `original_tag` field — the latter only
+  records the value at the time of the *most recent* save, so it would drift to an
+  intermediate value across a second or third relabel of the same POI; `originalTag`
+  always stays the true, first OSM-sourced tag regardless of how many times it's been
+  corrected since. Verified with Playwright: relabeling a POI from
+  `leisure=nature_reserve` to `amenity=ice_cream` left "original tag:
+  leisure=nature_reserve" unchanged in the panel both before and after the edit.
+
+Discussed but not yet started: a "Split/Merge" tool to manually override the
+automatic polygon-merge decisions (`utils/graphml.py`'s `merge_nearby_polygon_pois`)
+from inside this interface — select/deselect nearby pre-merge OSM fragments to define
+what counts as one POI, persisted live (survives reload, same as relabels already do)
+to a new file that should actually feed back into real POI formation on the next
+pipeline run, not just annotate the browsing tool. Also noted: relabels/removals made
+here should eventually flow back into the actual pipeline data (`graphml.get_poi()`
+excluding "removed" POIs and honoring corrected tags for real), not stay confined to
+this tool's own `relabels.json`. Planned as a multi-step sequence: raw-fragment
+export, new persisted format, new UI mode, then the `graphml.py` integration.
+
+- Step 1 done: `exports/generate_gi_bi_relabeling_export.py` (`_load_raw_fragments()`)
+  exports every pre-merge OSM fragment across all configured poi_types to a new
+  `tools/gi_bi_relabeling/raw_fragments.geojson`, real osmid-based identity per
+  fragment, deliberately NOT filtered to "used" POIs (a fragment the automatic merge
+  excluded is exactly what Split/Merge needs to be able to pull back in). Reuses
+  `graphml`'s own fetch/filter/stamp internals directly (`_filter_by_tags`,
+  `_stamp_poi_raw_tag`) rather than touching `graphml.py` itself — purely additive,
+  read-only reuse, same pattern already used for `_cached_geojson_path`. Hit and fixed
+  a real bug immediately: `graphml._get_city_poi_universe()` returned the fast,
+  GEOS-avoiding cache form once the universe was already cached on disk (only a
+  `__snap_coord` token per row, no real geometry — fine for the main pipeline's hot
+  loop, useless here), so every query was silently skipped and the file came out
+  empty. Fixed by reading the same universe cache file directly with
+  `geopandas.read_file()` instead, which always yields real geometry (and moved the
+  universe load outside the per-query loop while at it, since it only needs loading
+  once). Verified: 6,906 real fragments, 4.7MB, genuine `osmid`-based source_keys and
+  plain-text tags, real Polygon/LineString/MultiPolygon geometry (not tokens).
+- Step 2 done: `tools/gi_bi_relabeling/server.py` refactored to a shared
+  `_load_json_dict`/`_save_json_dict` pair plus an `ENDPOINTS` map, and gained a
+  second endpoint, `POST /save_manual_merge`, persisting a manually-defined fragment
+  grouping (`{group_id, poi_type, tag, fragment_keys: [...]}`) to a new
+  `manual_merges.json`, anchored the same way `relabels.json` already is: by the
+  `source_key` of the merged POI you were viewing when you started editing its
+  composition. `/save_relabel` behaves identically to before (regression-tested).
+  Hit the same recurring port-8766 conflict as earlier sessions (a process outside
+  this session's reach still holding it) — rather than fight it again, verified
+  against a throwaway copy on a scratch port instead of the real file/port.
+- Step 3 (data side) done: `exports/generate_gi_bi_relabeling_export.py` now computes
+  `member_keys` per merged POI — which raw fragments (from the new
+  `_raw_fragment_rows()`, shared between `_load_raw_fragments()` and
+  `_load_all_shapes()` so the expensive universe filter/stamp only happens once) the
+  automatic merge actually combined into it, via real shapely containment
+  (`geoms[i].buffer(1e-7).contains(fragment.geometry.centroid)`) — what Split/Merge
+  will pre-check when opened on a POI. Caught via a sanity check (not assumed
+  correct): a merged POI's own representative fragment was missing from its own
+  `member_keys` in ~1,031/5,598 cases. Cause: `_raw_fragment_rows()` and the merged
+  loop each run an independent first-match dedup across `unique_query_keys()`, so the
+  same physical element could get recorded under a *different* `poi_type` in
+  `raw_rows` than the one its merged row was produced under, and candidates were
+  grouped by `(poi_type, tag)` — a mismatch on poi_type alone hid the fragment
+  entirely. Fixed by grouping by `tag` alone instead, matching what the real
+  automatic merge (`merge_nearby_polygon_pois` in `graphml.py`) actually groups by
+  (poi_raw_tag only, never poi_type) — plus a defensive fallback that always includes
+  a merged POI's own key in its `member_keys`. Verified: 5,598/5,598 (100%, was
+  4,567/5,598) now correctly self-contained, and multi-fragment merges went up
+  slightly (647 -> 664) since some previously-mismatched genuine members are now
+  correctly found too.
+- Step 3 (UI) done: `tools/gi_bi_relabeling/index.html` gained the Split/Merge tool
+  itself. New "Split/Merge" button in the detail panel opens `enterSplitMerge(props)`:
+  finds every raw fragment (`raw_fragments.geojson`, fetched alongside the other three
+  files now) sharing the POI's `originalTag` within 150m (`CANDIDATE_RADIUS_M`) of its
+  bounds center, renders each as its own clickable shape colored green (included) or
+  grey (excluded), pre-checked from a saved `manual_merges.json` entry if one exists
+  for this POI's `source_key` (the group_id), else from `member_keys` (what the
+  automatic merge actually included, computed server-side in step 3's data pass).
+  Clicking a fragment toggles it and immediately POSTs the full current set to
+  `/save_manual_merge` — no save button, same live-autosave pattern as tag relabeling.
+  A persistent `#split-merge-panel` (sibling of `#detail-body`, not wiped by
+  `showDetail()`) shows the running count and an "Exit Split/Merge" control. This
+  first version is deliberately a checklist over visible fragment shapes, not a live
+  re-union of geometry in the browser — the actual re-formed POI shape is meant to
+  happen later when `manual_merges.json` feeds into a real pipeline run (step 4,
+  the `graphml.py` integration, not built yet). Verified via direct state inspection
+  (not just visual screenshots, after a pixel-click test gave a confusing result that
+  turned out to be stale test state + a test-script bug, not an app bug): starting
+  from 2 pre-checked members, toggling one via `toggleFragment()` leaves exactly the
+  other selected, and the save round-trips correctly through the server.
+- `tools/gi_bi_relabeling/index.html`: user reported the server seemed to not accept
+  multiple fragment selections and asked for selected fragments to visually count as
+  one multipolygon POI. Checked the server was up and serving the latest code (it
+  was). Tested multi-select extensively (direct `toggleFragment()` calls, real
+  `page.mouse.click()`, simulated Leaflet `.fire('click')`) and found no reproducible
+  bug in the underlying selection logic — every method correctly added/removed
+  fragments from the `splitMergeIncluded` Set one at a time. Concluded the real gap
+  was visual: selected fragments rendered as separate individually-colored shapes
+  with nothing tying them together, so multi-selection may have been working but not
+  look like it was. Added `updateUnionLayer()`: bundles every currently-included
+  fragment's real geometry into one `GeometryCollection` Feature (no geometric union
+  math needed, just wrapping — `GeometryCollection` rather than `MultiPolygon` since
+  candidates can mix Polygon and LineString) and draws a thick dashed purple outline
+  around the whole group, `interactive: false` so it doesn't block clicks on the
+  individual shapes underneath. Called after both `enterSplitMerge()` and
+  `toggleFragment()`, cleared in `exitSplitMerge()`, and skipped entirely for 0-1
+  fragments (nothing to visually group). Verified: a 2-fragment group's union layer
+  has exactly 2 geometries and renders a continuous purple outline around them.
+- `tools/gi_bi_relabeling/index.html`: found and fixed the real bug behind the user's
+  next report ("clicking the other POI opens its own detail panel instead, and
+  Split/Merge doesn't exit") — `showDetail()` never called `exitSplitMerge()`, so a
+  stray click during Split/Merge mode silently swapped the whole panel to an unrelated
+  POI while leaving the old `splitMergeLayer`/`splitMergeIncluded` state dangling on
+  the map. Traced why the stray click happens at all: candidates are filtered to
+  same-`originalTag` fragments within 150m (`CANDIDATE_RADIUS_M`), and for a
+  single-fragment POI that radius is very often genuinely empty — checked one example
+  directly and its nearest same-tag fragment was 1.8km away, not a bug, just sparse
+  data (anything genuinely close with the same tag would likely already have been
+  auto-merged). So clicking a visually-nearby but differently-tagged POI hits no
+  candidate overlay at all and falls through to the regular POI layer beneath. Fixed
+  the immediate inconsistency by guarding `showDetail()`: while `splitMergeGroupId` is
+  set, a POI click is ignored entirely rather than treated as a new selection — the
+  colleague must explicitly "Exit Split/Merge" first. Verified: triggering `showDetail()`
+  for an unrelated POI while Split/Merge is active no longer changes
+  `splitMergeGroupId` or hides the panel. Resolved the open scope question: keep the
+  same-tag restriction (cross-category merging is a separate, bigger decision), but
+  raised `CANDIDATE_RADIUS_M` from 150 to 500 so sparser categories have a realistic
+  chance of finding a genuinely-nearby same-tag candidate. Checked the worst case
+  before settling on 500 rather than guessing: even the single densest raw tag
+  city-wide (`waterway=stream`, 1,111 fragments) only produced 1 candidate within
+  500m at a real test location, and rendering stayed fast — no clutter or performance
+  concern from the wider radius.
+- `tools/gi_bi_relabeling/avvia_interfaccia.sh` / `.bat`: found the real, root cause
+  of the recurring "phantom stale server outside this session's reach" problem that
+  had been hit repeatedly all session (had to work around it with throwaway ports
+  each time rather than actually fix it) — confirmed directly when the user hit
+  "could not save" on a genuinely-running server: `curl` showed `/save_relabel`
+  working (200) but `/save_manual_merge` 404ing, meaning the live instance predated
+  that endpoint and nobody had a way to restart it. Root cause: the `.sh` launcher
+  backgrounded `python3 server.py &` and `wait`ed on it — if the terminal/file-manager
+  window that launched it ever closed (or was never a real interactive terminal to
+  begin with, common for double-clicked scripts), the backgrounded server became
+  orphaned, still running but detached from anything that could Ctrl+C it. Fixed by
+  running `exec python3 server.py` as the script's last line instead — `exec`
+  replaces the shell process with python entirely (same PID), so any signal sent to
+  the script (Ctrl+C, closing the terminal, a plain `kill`) reaches the server
+  directly. Verified the fix matters: without `exec`, sending SIGINT to the script's
+  PID left the child python process running and the port still serving; with `exec`,
+  the same SIGINT killed it immediately (port stopped responding). Also un-minimized
+  `avvia_interfaccia.bat`'s server window (previously `/min`) so it isn't as easy to
+  lose track of on Windows, where `start` already creates a genuinely separate,
+  properly-closable window (a different, already-correct mechanism from the `.sh`
+  backgrounding bug).
+- `tools/gi_bi_relabeling/index.html`: fixed the "merge said Saved but exiting still
+  shows the old polygon" gap the user hit — a real, correctly-diagnosed problem, not
+  just the known "no live re-union" limitation: `manual_merges.json` was being saved
+  correctly, but nothing ever read it back to change what got *displayed*, so exiting
+  Split/Merge silently reverted to the stale automatic shape with no trace the merge
+  had happened. Fixed in `loadAndRender()`: for any POI with a saved manual-merge
+  entry, its displayed geometry is now replaced with the union of its
+  manually-selected fragments (a `GeometryCollection`, same bundling approach as the
+  Split/Merge highlight — built from a new `rawFragmentsBySourceKey` lookup), tracked
+  in a new `manuallyMergedKeys` Set. `styleFor()` now dashes the border for manual
+  merges too (previously only tag relabels), and the centroid-icon logic gained a
+  third symbol, ⛓, taking priority over ✎/✕ when both apply. Per the user's explicit
+  condition before applying ("if the answer is the moment I merged, you can apply"):
+  made `exitSplitMerge()` trigger a `loadAndRender()` refresh so this takes effect the
+  moment you leave Split/Merge, not just on the next page load — but only on the
+  user-facing "Exit Split/Merge" button, not `enterSplitMerge()`'s internal reset call
+  to itself (added a `reload` parameter, defaulting true, called as `exitSplitMerge(false)`
+  internally — an unconditional reload there would race the new session being set up,
+  since `loadAndRender()` tears down and rebuilds `layersBySourceKey` while
+  `enterSplitMerge()` is simultaneously reading from it). Verified live, no manual
+  reload: merged a second fragment into a real single-fragment POI, clicked "Exit
+  Split/Merge", and immediately confirmed both `manuallyMergedKeys` contains it and
+  its displayed geometry is now a `GeometryCollection` — screenshot also shows the ⛓
+  icon on the now-larger merged shape.
+
+Step 4 (pipeline integration) started: `relabels.json`/`manual_merges.json` are meant
+to be artifacts a separate loading step feeds back into real POI formation, not just
+annotate this browsing tool. Confirmed with the user this needs full tag-switching,
+not just filtering: a POI relabeled from `healthcare=hospital` to `amenity=ice_cream`
+must disappear from `residential_healthcare`'s results and appear in
+`takeaway_consumption`'s (`get_poi()` is called once per poi_type/tags query, so
+nothing currently maps "a corrected tag string" back to which query owns it).
+
+- Block 1 done: `utils/graphml.py` gained `_tag_to_poi_type_map()` — reverse of
+  `config/poi_types.csv`'s clauses, `{tag_string: poi_type}` built by enumerating
+  every concrete key=value combination each clause can produce
+  (`_enumerate_clause_tag_strings()`, cartesian product over list-valued keys), first
+  poi_type in CSV row order wins a given string (same convention used elsewhere, e.g.
+  `poi_dedup.py`'s ownership resolution). A `craft=True`-style wildcard clause can't
+  be enumerated without a real row, so those are collected separately into a
+  `{key: poi_type}` fallback map for key-only matching (handled in a later block, not
+  this one). Verified against real, previously-confirmed cases: `amenity=ice_cream`
+  -> `takeaway_consumption`, `healthcare=hospital` -> `residential_healthcare`,
+  `access=private&leisure=pitch` -> `organized_sport_outdoor` (a multi-key clause);
+  193 tag strings mapped total, 1 wildcard key (`craft` -> `cultural_production`).
+- Block 2 done: `_universe_source_key_index()` — city-wide `source_key -> {row,
+  geometry}`, needed to fetch a relabeled-in POI's real shape regardless of which
+  query originally found it. Process-level in-memory cache, same convention as
+  `_get_city_poi_universe`'s own cache (keyed by `cache_slug|buffer_m`). Reads the
+  universe cache file directly with `geopandas.read_file()` rather than going through
+  `_get_city_poi_universe()`, which can return the fast GEOS-avoiding form (only a
+  `__snap_coord` token, no real geometry) once the universe is already cached on disk
+  — the same class of bug hit and fixed earlier in the raw-fragment export. Verified
+  against real data: 8,969 entries built in 8.6s, correctly retrieves the real
+  "AcquaSport" POI (Polygon geometry, correct name) by its known `source_key`, and a
+  second call hits the in-memory cache (instant, same object returned).
+- Block 3 done: `apply_relabels(poi, poi_type, ...)` — drops any POI relabeled away
+  from `poi_type` (via `_resolve_tag_poi_type`) or marked `"removed"`, pulls in any
+  POI relabeled into `poi_type` from elsewhere (fetched from
+  `_universe_source_key_index()`, `poi_raw_tag` overridden to the correction), then
+  re-runs `merge_nearby_polygon_pois()` so pulled-in POIs group correctly with
+  whatever's already there. Reads `tools/gi_bi_relabeling/relabels.json` (cached
+  in-memory, `_load_relabels()`). Not yet wired into `get_poi()` (that's block 4).
+  Testing this surfaced the same "fast cache-hit path lacks real geometry" issue hit
+  earlier in the raw-fragment export — confirms `apply_relabels()` must be called
+  from `get_poi()`'s *fresh-build* branches only (right after merge, before caching),
+  so the correction gets baked into the cache file itself; it won't retroactively fix
+  already-cached files, which will need clearing to pick it up — consistent with
+  every other correction made to `get_poi()` this session. Verified end to end
+  against real data with a real hospital -> ice_cream relabel: "Policlinico
+  Universitario Duilio Casula" correctly dropped from `residential_healthcare`
+  (30 -> 29 rows) and appeared in `takeaway_consumption` (163 -> 164 rows) with
+  `poi_raw_tag` correctly overridden to `amenity=ice_cream`.
+- Real, pre-existing bug found and fixed while testing block 3/4, unrelated to the
+  relabeling feature itself: `_stamp_poi_raw_tag`'s `if tags:` branch (graphml.py)
+  unconditionally rebuilt `poi` as a `GeoDataFrame` with `crs=poi.crs` at the end,
+  without ever checking whether the input actually had real geometry first — crashing
+  with `AttributeError: 'DataFrame' object has no attribute 'crs'` whenever the
+  universe was loaded via the fast, GEOS-avoiding token-only path (`__snap_coord`, no
+  `.crs`), silently caught by `get_poi()`'s outer exception handler and returning
+  **zero POIs** for that poi_type with no visible error. Reproduced with zero
+  relabeling code involved (deleted a per-query cache, called `get_poi()` fresh) to
+  confirm it predates this session's relabeling work entirely. Fixed by adding the
+  same `"geometry" not in poi.columns` pass-through guard `merge_nearby_polygon_pois()`
+  already had, matching the function's own docstring promise.
+- Deeper investigation this crash led to: confirmed (via an Explore agent, checking
+  every call site and the multiprocessing start method) that `get_poi()` is only ever
+  called from the single main process before any worker pool spawns — not a
+  multiprocessing gap. But there's a real, narrower one: the universe's fast
+  token-only path only gets bypassed on a city's *very first* download; any later
+  rebuild of a *specific* per-query cache (new poi_type added to config, a cache file
+  cleared, etc.) while the universe is already cached on disk silently skips
+  real-geometry-dependent stamping/merging/relabeling in that process — exactly what
+  the crash above was masking. Discussed with the user (clarified this is "re-read
+  the already-downloaded file with a real-geometry parser," not "re-download from
+  OSM") and agreed on a size-gated fix: added
+  `_read_universe_with_real_geometry_if_safe()` + `_REAL_GEOMETRY_UNIVERSE_SIZE_LIMIT_BYTES`
+  (150MB; Cagliari's universe is ~71MB and re-reads safely in ~8.6s, verified against
+  real data) to `get_poi()`'s universe branch — upgrades a token-only universe to real
+  geometry in place and caches the upgrade (`_CITY_POI_UNIVERSE_CACHE`) so the file
+  isn't re-read per query within the same process. **Caveat requested explicitly by
+  the user, for future debugging**: this size threshold is a guess with a safety
+  margin over Cagliari's real file size, not validated against Paris's actual
+  universe file size (which is not available in this environment). Paris's universe
+  is known to be dramatically larger than Cagliari's, and `_read_geojson_without_gdal`'s
+  own docstring already documents that this exact kind of full-file real-geometry
+  read has caused hard GEOS/Shapely crashes there before. **If a crash, hang, or
+  memory blowup ever occurs in or around `get_poi()`/`merge_nearby_polygon_pois()`
+  on a Paris (or other large-city) run, this threshold is a likely suspect — check
+  whether Paris's universe file size sits under 150MB (if so, this path is being
+  taken and may be the cause) before assuming it's unrelated.** Full end-to-end
+  verification (real `get_poi()`, fresh process, universe pre-cached on disk — the
+  exact scenario that used to crash) confirmed: `residential_healthcare` 30 -> 29,
+  `takeaway_consumption` 163 -> 164, target POI correctly moved between them with its
+  tag overridden.
+- Generated a Paris counterpart of the Blue/Green Infrastructure Relabeling tool
+  (`tools/gi_bi_relabeling_paris/`, a standalone sibling of `tools/gi_bi_relabeling/`
+  with its own `data.geojson`/`raw_fragments.geojson`/`poi_type_order.json` and a copy
+  of `index.html`/`server.py`/launchers/`vendor/`). Required a `CITY` in-script knob
+  in `exports/generate_gi_bi_relabeling_export.py` (`"cagliari"` or `"paris"`), since
+  the script previously hardcoded Cagliari's `pois_used.gpkg` path and output folder;
+  now both are derived from `PipelineConfig(study_city=CITY).artifact_slug`.
+  - Found and fixed a real design gap while building this: `_raw_fragment_rows()`
+    (raw pre-merge fragments, used for Split/Merge candidate discovery) only knew how
+    to build an OSM-tag "city universe" via Overpass — meaningless for Paris, which is
+    `cfg.use_shapefile=True` and never touches Overpass in the real pipeline
+    (`get_poi()`'s shapefile branch reads local MGP shapefiles via
+    `feature_from_shapefile`/`poi_from_shp`). Added `_raw_fragment_rows_shapefile()`,
+    mirroring `get_poi()`'s own shapefile branch (per-`poi_type` `feature_from_shapefile`
+    call + `_stamp_poi_raw_tag(poi, None)`, where `poi_raw_tag` is the raw TYPEQU code)
+    instead of downloading anything. First attempt at running this against live
+    Overpass (before this fix existed) timed out after OSMnx's default 180s on the
+    buffered Paris polygon — a red herring the user correctly called out: the real fix
+    was to not hit Overpass at all for a shapefile-mode city, not to raise the timeout.
+  - Second, deeper gap the user flagged: `apply_relabels()` resolves a relabel's
+    target poi_type via `_tag_to_poi_type_map()`, which only parsed `poi_types.csv`'s
+    `"tags"` column (OSM clauses) — so for Paris, relabeling a POI to a new TYPEQU
+    code could never resolve a target poi_type, and the relabel would silently no-op
+    (kept in its original poi_type regardless of the correction). Fixed by also
+    folding `poi_types.csv`'s `"labels"` column (the same TYPEQU-code list
+    `poi_from_shp()` itself already uses to filter by poi_type) into the same
+    `tag_to_poi_type` dict built by `_tag_to_poi_type_map()` — no collision risk with
+    OSM `"key=value"` strings since TYPEQU codes never contain `=`, so
+    `_resolve_tag_poi_type()`'s exact-match lookup needed no other change. Verified
+    against real data: `F110`/`F114` -> `organised_sport_indoor`, `F120` ->
+    `informal_sport_indoor`, and an unconfigured code (`C107`, absent from
+    `poi_types.csv`) correctly resolves to `None` rather than mismapping.
+  - Also found that the export script's direct call into
+    `utils.load_shapefile.feature_from_shapefile()` fell back to Cagliari's
+    OSM/Overpass branch even with the `CITY` knob set to `"paris"`: that function (and
+    others like it) builds its own bare `PipelineConfig()` internally instead of
+    taking the caller's, and that bare config's `study_city` default reads
+    `os.environ["CAP_STUDY_CITY"]` — which only `main.py` was setting
+    (`main.py:137`). Fixed by setting the same env var at the top of the export
+    script, matching `main.py`'s own convention, rather than changing the shared
+    `load_shapefile.py`/`graphml.py` code paths. Re-verified end to end after both
+    fixes: `raw_fragments.geojson` went from 0 fragments (Overpass branch, wrong city)
+    to 5441 real fragments sourced from the local shapefile.
+  - User caught a third issue by inspecting the output: all 699 shapes in that
+    "working" run showed `tag=unknown`. Root cause: `poi/mgp_boundary/` held 27
+    per-query cache files pre-dating the switch to shapefile-sourced Paris POIs
+    (leftover from when Paris was still OSM/Overpass-sourced) — they lack
+    `poi_raw_tag` and have OSM-style columns (`natural`/`landuse`/`leisure`/`water`/
+    `waterway`/`fid`) instead. `get_poi()`'s cache-hit path doesn't validate schema,
+    so it silently served these stale files instead of rebuilding via the (now
+    correct) shapefile branch. Deleted all 27 (verified first, by checking every
+    `unique_query_keys()` cache path for a missing `poi_raw_tag` column) and
+    re-ran; `get_poi()` rebuilt them correctly from the shapefile.
+  - That rebuild then surfaced a deeper, structural issue: with the used-filter back
+    on, `data.geojson` came back with 0 shapes. `outputs/poi_exports/mgp_boundary/
+    pois_used.gpkg` (the production "POIs actually used by the pipeline" artifact,
+    dated 2026-08-26) turned out to itself predate the shapefile switch — every one
+    of its `source_key`s is `{"kind": "fid", ...}`, an identity that only ever came
+    from that same now-deleted OSM-era cache (confirmed: `Paris/POI_polygon2.shp`
+    has no id column at all, so reading it today yields a plain RangeIndex and
+    `build_poi_source_key()` falls back to a geometry-hash signature instead —
+    structurally unable to match the old `fid`-based keys). Regenerating
+    `pois_used.gpkg` needs a full Paris `main.py` run, which weighs
+    [[paris-oom-memory]]'s known risk, so asked the user rather than doing it
+    unilaterally. Per their choice, `_load_all_shapes()` in the export script now
+    accepts `used_keys=None` to skip the used-filter entirely for shapefile-mode
+    cities (`main()` branches on `cfg.use_shapefile`) — shows every shape-typed POI
+    the configured queries match, not just ones cross-referenced against the stale
+    artifact. Cagliari's OSM branch is unaffected (still filters by `pois_used.gpkg`
+    as before). Final verified result: 45255 real shapes across the 9 nature/
+    aesthetic/quietness poi_types (the only ones with polygon/line geometry in
+    Paris's shapefiles — sport/food/health poi_types are point-only there), with
+    real readable tags (`landuse=grass`, `waterway=stream`, etc.) — Paris's green/
+    blue infrastructure shapefile layers turn out to themselves be OSM-derived using
+    the same GI/BI short-code scheme as Cagliari, so `config/osm_raw_tag_codes.csv`
+    correctly reverses them for display.
+  - User asked whether `natural=scrub` (GI10) was simply absent from Paris data —
+    investigation found it's actively configured (`high_nature_immersion`, part of
+    the `nature_contact` service), yet `high_nature_immersion` was completely absent
+    from `data.geojson` despite `get_poi()` having cached 20268 real polygon rows for
+    it (7132 of them GI10). Root cause was in `utils/poi_identity.py`'s
+    `build_poi_source_key()` — a real, shared-code bug, not specific to this export
+    tool. Paris's `poi_from_shp()` concatenates 3 shapefiles (point/line/polygon)
+    with different native columns; only the line layer has a real `osmid` column, so
+    polygon rows get `NaN` for it after the concat. `build_poi_source_key()` checked
+    `if osmid is not None`, but `float('nan') is not None` is `True` in Python, so
+    every polygon row with no real osmid took the "osmid" branch anyway and
+    normalized to one single collapsed key (`{"kind": "osmid", "value": null,
+    "element_type": null}`) — e.g. 15258 of `high_nature_immersion`'s 20268 cached
+    rows all shared that one key, so only the first one encountered (globally, across
+    the whole poi_type sweep) survived the export's `seen_keys` dedup. Fixed by
+    adding `_is_missing()` (treats both `None` and `pd.isna()` as missing) and using
+    it in both the `osmid` check and the `id`/`fid`/`objectid`/`OBJECTID`/`osm_id`
+    loop, so NaN-osmid rows correctly fall through to the geometry-hash fallback
+    signature (unique per polygon) instead of collapsing. Affects the real pipeline
+    too (`apply_relabels`, any other `build_poi_source_key` caller), not just this
+    export script. Re-verified against real data: Paris `data.geojson` went from
+    45255 to 50594 shapes, `natural=scrub` now present (3749, under
+    `high_nature_immersion`), `natural_aesthetic` 5011 -> 14298, `accessible_nature`
+    430 -> 2021 (previously-collapsed distinct polygons now correctly separated).
+  - User also reported switching from the Paris interface to the Cagliari one still
+    showed Paris POIs — both `tools/gi_bi_relabeling/server.py` and
+    `tools/gi_bi_relabeling_paris/server.py` were hardcoded to the same port (8766),
+    so a still-running Paris server process (even an orphaned background one) could
+    keep answering requests meant for the newly-started Cagliari one. Changed the
+    Paris copy's `PORT` to 8767 (server.py + both launcher scripts' browser-open
+    URL), so the two tools can no longer collide regardless of what's still running.
+  - User reported Split/Merge finding no candidates on Paris. Root cause:
+    `_raw_fragment_rows_shapefile()`'s `"tag"` field was left as the bare raw code
+    (`"GI10"`), while `_load_all_shapes()`'s `"tag"` field (in `data.geojson`) is the
+    human-readable reversal (`"natural=scrub"`) — Split/Merge's candidate search
+    (`index.html`) matches fragments by exact `tag` equality, so for Paris the two
+    vocabularies never matched and candidate lists were always empty. Fixed by
+    reversing through the same `code_to_raw_tag` lookup in
+    `_raw_fragment_rows_shapefile()` too, so both files agree.
+  - Re-running to verify surfaced a real multi-minute hang (killed after 13+ minutes
+    with zero incremental output — the exact "silent long loop" pattern flagged in
+    this file's own conventions). Timed profiling (per-query `get_poi()` calls: all
+    cache hits, ~6s total combined) ruled out the POI loading itself, isolating the
+    actual cost to `_load_all_shapes()`'s `member_keys` computation: for every POI
+    row it did a real Shapely `.buffer()` then linearly scanned *every* raw fragment
+    sharing that tag, checking `.contains()` one by one — O(rows_in_poi_type x
+    candidates_for_tag). Before the `poi_identity.py` NaN fix above, most fragments
+    collapsed into one bogus duplicate, keeping this loop accidentally cheap; fixing
+    that identity bug correctly made fragment lists real and large (e.g. ~45000 for
+    `landuse=grass`), which is what turned this into a ~2-billion-check hang for
+    `perceived_nature` alone. Fixed by building one `shapely.strtree.STRtree` per tag
+    group (indexing fragment centroids) instead of a linear scan — verified: full
+    Paris export now completes in 1m23s (previously killed after 13+ minutes,
+    unfinished), same 50594-shape/95383-fragment result, `data.geojson`/
+    `raw_fragments.geojson` tag vocabularies now 19/19 matching, and a spot-checked
+    POI's `member_keys` now correctly lists multiple real fragments instead of just
+    itself.

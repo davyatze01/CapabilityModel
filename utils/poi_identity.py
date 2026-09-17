@@ -43,6 +43,15 @@ def _normalize_scalar(value: Any) -> Any:
     return value
 
 
+def _is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False  # arrays/geometries etc. — never "missing" by this check
+
+
 def build_poi_source_key(row: Mapping[str, Any], geom: BaseGeometry) -> str:
     """Build a stable identifier for one POI source row.
 
@@ -50,7 +59,7 @@ def build_poi_source_key(row: Mapping[str, Any], geom: BaseGeometry) -> str:
     :data:`SOURCE_KEY_COLUMNS` is used, so both behave identically.
     """
     osmid = row.get("osmid")
-    if osmid is not None:
+    if not _is_missing(osmid):
         return json.dumps(
             {
                 "kind": "osmid",
@@ -63,7 +72,7 @@ def build_poi_source_key(row: Mapping[str, Any], geom: BaseGeometry) -> str:
         )
 
     for column in ("id", "fid", "objectid", "OBJECTID", "osm_id"):
-        if column in row and row.get(column) is not None:
+        if column in row and not _is_missing(row.get(column)):
             return json.dumps(
                 {
                     "kind": column.lower(),

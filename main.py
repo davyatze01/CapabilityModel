@@ -25,7 +25,7 @@ WORKER_COUNT = 8
 #   capability CSVs, the GeoPackage, and the QGIS project. Meant for colleagues starting
 #   from a shipped impedances.npz who only need to inspect results in QGIS.
 #   Also settable without editing this file: CAP_LIGHT_OUTPUT=1 python main.py
-LIGHT_OUTPUT = True
+LIGHT_OUTPUT = False
 # NOTIFY_CRASH: send a Telegram message when the run stops for ANY reason — unhandled
 #   exception, Ctrl+C, OOM/cgroup SIGKILL, hard crash, terminal dying — plus one on a clean
 #   finish. Uses a detached watchdog process (outside the run_safe.sh cgroup) so even a
