@@ -2481,6 +2481,15 @@ nothing currently maps "a corrected tag string" back to which query owns it).
   `ARTIFACT_SCHEMA_VERSION` was checked, so an old `impedances.npz` would have been loaded and
   routing skipped. The unused twin formula in `utils/get_impedance.py` is not changed yet.
 
+## 2026-11-25
+
+- Cagliari data handoff: removed the ignore rules for the manual relabel and merge
+  inputs and added their existing contents to version control; Paris corrections
+  remain ignored. Published the main Cagliari impedance snapshot separately as a
+  GitHub Release asset, with its SHA-256 and schema metadata in
+  `config/cagliari_impedance_bundle.json` and transfer instructions in
+  `docs/CAGLIARI_BUNDLE.md`. No routing data or correction contents were changed.
+
 ## 2026-11-03
 
 - `utils/services.py` `_build_runtime_structures`: the 2-additive Choquet capacity built from

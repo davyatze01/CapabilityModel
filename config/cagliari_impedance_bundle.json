@@ -1,0 +1,11 @@
+{
+  "release_tag": "impedance-bundles-2026-11-25",
+  "repository": "davyatze01/CapabilityModel",
+  "asset": "Cagliari_impedances.npz",
+  "restore_path": "artifacts/Cagliari/impedances.npz",
+  "size_bytes": 115918698,
+  "sha256": "0ef7cc43de3dd8a19409b0264581cf0ff5b50490a3579308be85d065b62fd4fe",
+  "schema_version": 4,
+  "non_bus_cache_schema_version": 13,
+  "download_url": "https://github.com/davyatze01/CapabilityModel/releases/download/impedance-bundles-2026-11-25/Cagliari_impedances.npz"
+}

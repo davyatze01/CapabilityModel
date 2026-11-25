@@ -1,0 +1,562 @@
+{
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11669017615}": {
+    "name": "Velodromo comunale",
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 158,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11669017615}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11810296192}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=pitch",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 209,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11810296192}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11818999947}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 187,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11818999947}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11818999948}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 189,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11818999948}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11818999949}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 194,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11818999949}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11818999950}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 193,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11818999950}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11818999951}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 185,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11818999951}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11818999953}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 196,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11818999953}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11818999954}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 198,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11818999954}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11832807440}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 180,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11832807440}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11916044197}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 182,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 11916044197}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 12176487252}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 176,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 12176487252}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 12176487253}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 178,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 12176487253}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 14094566411}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 174,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 14094566411}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 14094566412}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 172,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 14094566412}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 14094566413}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 170,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 14094566413}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 2016355523}": {
+    "name": "Fortezza Nuragica \"su niu de su pilloi\"",
+    "new_tag": "removed",
+    "original_tag": "historic=archaeological_site",
+    "poi_type": "mediated_experience",
+    "seq": 289,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 2016355523}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 4071708527}": {
+    "name": "Pronto Soccorso",
+    "new_tag": "removed",
+    "original_tag": "amenity=hospital",
+    "poi_type": "residential_healthcare",
+    "seq": 107,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 4071708527}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 4229609947}": {
+    "name": "Nonna Isa",
+    "new_tag": "removed",
+    "original_tag": "shop=supermarket",
+    "poi_type": "general_food_retail",
+    "seq": 119,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 4229609947}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 5078725006}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 162,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 5078725006}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 5078725007}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 160,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 5078725007}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 5078725009}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 166,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 5078725009}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 5078727569}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 164,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 5078727569}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 5078727570}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "sport=fitness",
+    "poi_type": "informal_sport_indoor",
+    "seq": 168,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 5078727570}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 5244774601}": {
+    "name": "Pronto Soccorso",
+    "new_tag": "removed",
+    "original_tag": "amenity=hospital",
+    "poi_type": "residential_healthcare",
+    "seq": 105,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 5244774601}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 5544948312}": {
+    "name": "Darsena Portus Karalis",
+    "new_tag": "removed",
+    "original_tag": "leisure=marina",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 207,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 5544948312}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 5544948313}": {
+    "name": "Marina Portus Karalis",
+    "new_tag": "removed",
+    "original_tag": "leisure=marina",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 205,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 5544948313}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 8467708177}": {
+    "name": "Yacht Club Cagliari",
+    "new_tag": "removed",
+    "original_tag": "leisure=marina",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 200,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 8467708177}"
+  },
+  "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 8467708178}": {
+    "name": "Vela Navale Italiana Cagliari Marina Piccola",
+    "new_tag": "removed",
+    "original_tag": "leisure=marina",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 202,
+    "source_key": "{\"element_type\": \"node\", \"kind\": \"osmid\", \"value\": 8467708178}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1042939358}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 129,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1042939358}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1089455832}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 154,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1089455832}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 118633603}": {
+    "name": "Tennis Club Su Planu",
+    "new_tag": "removed",
+    "original_tag": "leisure=sports_centre",
+    "poi_type": "organised_sport_indoor",
+    "seq": 19,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 118633603}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1272796249}": {
+    "name": "Ippodromo Rossi",
+    "new_tag": "leisure=horse_riding",
+    "original_tag": "leisure=sports_centre",
+    "poi_type": "organised_sport_indoor",
+    "seq": 8,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1272796249}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1274613537}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 147,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1274613537}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1356022659}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 141,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1356022659}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 184990895}": {
+    "name": "Piazza Salvo d'Acquisto",
+    "new_tag": "removed",
+    "original_tag": "leisure=park",
+    "poi_type": "managed_aesthetic",
+    "seq": 40,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 184990895}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229065744}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "landuse=meadow",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 60,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229065744}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229065775}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "landuse=meadow",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 56,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229065775}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229069389}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "landuse=meadow",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 90,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229069389}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229163041}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "landuse=meadow",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 54,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229163041}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229266584}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "landuse=meadow",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 85,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229266584}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229266599}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "landuse=meadow",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 58,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229266599}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229266617}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "landuse=meadow",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 62,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229266617}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229324079}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "natural=grassland",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 88,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229324079}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229761882}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "landuse=meadow",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 66,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229761882}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229761894}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "landuse=meadow",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 64,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229761894}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276948764}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 151,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276948764}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949440}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 149,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949440}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 27704483}": {
+    "name": null,
+    "new_tag": "leisure=stadium",
+    "original_tag": "leisure=pitch",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 15,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 27704483}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277184018}": {
+    "name": "Clinica Villa S.Elena",
+    "new_tag": "amenity=clinic",
+    "original_tag": "amenity=hospital",
+    "poi_type": "residential_healthcare",
+    "seq": 111,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277184018}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277184173}": {
+    "name": "Stadio Amsicora",
+    "new_tag": "leisure=stadium",
+    "original_tag": "leisure=sports_centre",
+    "poi_type": "organised_sport_indoor",
+    "seq": 10,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277184173}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277185536}": {
+    "name": "Casa di cura Sant'Anna",
+    "new_tag": "amenity=clinic",
+    "original_tag": "amenity=hospital",
+    "poi_type": "residential_healthcare",
+    "seq": 113,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277185536}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277195647}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 121,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277195647}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277195728}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 137,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277195728}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277195753}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 143,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277195753}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196029}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 131,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196029}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196199}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 133,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196199}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197141}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 125,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197141}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197305}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 123,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197305}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197543}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 139,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197543}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197703}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 127,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197703}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197772}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 145,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197772}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197945}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 135,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197945}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 295718765}": {
+    "name": "Stadio Sant'Elena",
+    "new_tag": "removed",
+    "original_tag": "leisure=sports_centre",
+    "poi_type": "organised_sport_indoor",
+    "seq": 13,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 295718765}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 302579014}": {
+    "name": null,
+    "new_tag": "natural=grassland",
+    "original_tag": "landuse=meadow",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 44,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 302579014}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 521546134}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=track",
+    "poi_type": "organized_sport_outdoor",
+    "seq": 156,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 521546134}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 552123092}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=park",
+    "poi_type": "managed_aesthetic",
+    "seq": 38,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 552123092}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 675801942}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "landuse=meadow",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 92,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 675801942}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 814983134}": {
+    "name": null,
+    "new_tag": "removed",
+    "original_tag": "leisure=park",
+    "poi_type": "managed_aesthetic",
+    "seq": 36,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 814983134}"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 911006116}": {
+    "name": "Piazza Spolitu Fracasso",
+    "new_tag": "removed",
+    "original_tag": "leisure=park",
+    "poi_type": "managed_aesthetic",
+    "seq": 42,
+    "source_key": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 911006116}"
+  }
+}

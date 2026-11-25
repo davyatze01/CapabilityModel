@@ -1,0 +1,519 @@
+{
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 118610641}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 118610641}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 118610642}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 259880724}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 259880723}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277198094}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 259880725}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 118610641}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 257,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 118944930}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 713335502}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 118944930}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 118944936}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 118944927}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 713335503}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 118944938}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1268721214}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 118944932}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 118944931}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 118944935}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197708}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196555}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196080}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 118944930}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 211,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1372431724}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1372431724}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1373649875}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1372431719}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1372431724}",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 100,
+    "tag": "natural=grassland"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1376959514}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1376959514}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1376959516}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1376959521}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1376959514}",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 48,
+    "tag": "landuse=meadow"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1381651073}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1381651076}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1381651075}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1381651074}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1381651073}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1381651080}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1381651079}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1381651078}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1381651077}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196635}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1381651073}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 244,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 142027923}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949070}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949024}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 142027923}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276948824}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 142027912}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949032}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 142027923}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 223,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1467043673}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1467043673}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1467043671}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1467043673}",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 96,
+    "tag": "natural=grassland"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1469138269}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1469138269}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1469138269}",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 102,
+    "tag": "natural=grassland"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 155011946}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196881}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196564}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197964}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 155012414}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277195789}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197844}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 155011946}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196521}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277198028}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196359}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196315}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196134}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197659}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196157}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 155011946}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 240,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 156500836}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 156500836}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 156979610}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 156500836}",
+    "poi_type": "residential_healthcare",
+    "seq": 109,
+    "tag": "amenity=hospital"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 165221718}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 165221718}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1274613551}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1274613552}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278324151}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278324262}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278324174}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278324268}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278324199}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 165221718}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 219,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 204022752}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196289}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 204022752}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197580}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 204022752}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 215,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 204022757}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 266089674}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 204022757}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 266089671}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 266089672}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 266089669}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196365}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196942}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 204022757}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 213,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229065710}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229065710}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229163045}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229163050}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229163052}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229163056}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229163048}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229163055}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229065710}",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 75,
+    "tag": "landuse=meadow"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229069429}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229069431}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229069429}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229069430}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229069432}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229069427}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229069429}",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 76,
+    "tag": "landuse=meadow"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229163063}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229163063}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229065713}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229065712}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229163063}",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 80,
+    "tag": "landuse=meadow"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 258243520}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 258243520}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1214759452}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 258243520}",
+    "poi_type": "spontaneous_aesthetic",
+    "seq": 50,
+    "tag": "natural=grassland"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276948785}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949016}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276948785}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949403}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949035}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 27890348}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949539}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229761867}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276948921}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276948785}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 225,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276948937}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276948983}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276948937}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 1040537171}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949212}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949165}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949319}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276948937}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 278,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276948941}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276948941}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949550}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949530}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276948941}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 227,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949435}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949518}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949435}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949431}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949538}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949522}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 229065704}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 276949435}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 276,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196036}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197357}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196036}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197109}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197014}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196036}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 235,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196113}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196996}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196113}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196861}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196966}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196113}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 246,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196209}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196209}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196591}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277195955}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196303}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197048}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196407}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196209}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 273,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196221}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196953}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196221}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196735}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197499}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196500}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196422}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 402027391}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196152}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196221}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 267,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196417}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196417}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197392}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196980}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197040}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196480}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197518}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196598}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196717}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196184}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196482}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197253}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196417}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 231,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196588}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196588}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196675}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196225}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197334}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196588}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 233,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196743}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196743}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197168}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196743}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 259,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196979}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196979}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197612}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196979}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 237,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197153}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197153}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 118498925}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196552}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196925}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196944}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 402762485}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197153}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 271,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197284}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197284}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197222}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196392}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197284}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 255,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197473}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197473}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196019}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196360}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197473}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 229,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197566}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197566}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196947}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197600}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196394}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197063}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196517}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196341}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196168}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197152}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277197566}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 249,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278301564}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278301564}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278301693}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278301559}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278301598}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278301632}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278301700}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278301564}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 221,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278324198}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278324310}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278324198}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278324164}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278324169}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 278324198}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 217,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 281464240}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 281464240}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 281464322}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 281464252}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 281464311}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 281464248}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 281464240}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 281,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 281464257}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 281464257}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 281464343}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 595813704}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 595813709}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 281464289}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 281464277}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 281464257}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 283,
+    "tag": "leisure=pitch"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 551881926}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 551881926}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 642237463}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 551881926}",
+    "poi_type": "managed_aesthetic",
+    "seq": 30,
+    "tag": "leisure=park"
+  },
+  "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 770344359}": {
+    "fragment_keys": [
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 770344359}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277196122}",
+      "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 277195965}"
+    ],
+    "group_id": "{\"element_type\": \"way\", \"kind\": \"osmid\", \"value\": 770344359}",
+    "poi_type": "informal_sport_outdoor",
+    "seq": 264,
+    "tag": "leisure=pitch"
+  }
+}
