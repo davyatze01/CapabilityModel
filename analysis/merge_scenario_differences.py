@@ -1,4 +1,4 @@
-"""Merges the four scenarios/<key>/differences.gpkg files, plus each condition's own raw
+"""Merges the three scenarios/<key>/differences.gpkg files, plus each condition's own raw
 per-hexagon capability grid, into one combined GeoPackage,
 scenarios/all_scenarios_differences.gpkg -- so both the diffs and the underlying values they
 were computed from are browsable/stylable in one QGIS file.
@@ -10,8 +10,8 @@ BLOB with a small header wrapping standard WKB, so a raw `CREATE TABLE ... AS SE
 byte-copies valid geometries as-is; every source file shares the same CRS (EPSG:4326) and hex
 grid, so no reprojection/alignment is needed.
 
-The four differences.gpkg files already have unique layer names (the arm name is baked in,
-e.g. diff_baseline_to_student__care vs. diff_baseline_to_new_metro__care). The six condition
+The three differences.gpkg files already have unique layer names (the arm name is baked in,
+e.g. diff_baseline_to_student__care vs. diff_baseline_to_public_strike__care). The five condition
 capability grids all reuse the SAME three table names (capability_care/nutrition/
 restorativeness) across conditions, so those need renaming on the way in (capability_<cap>__
 <condition>) -- see _merge_gpkg_table_renamed.
@@ -39,9 +39,9 @@ import fiona
 import geopandas as gpd
 
 # ── Knobs ────────────────────────────────────────────────────────────────────
-SCENARIO_KEYS: tuple[str, ...] = ("public-strike", "elder-student", "underservice-is-mirrionis", "new-metro")
+SCENARIO_KEYS: tuple[str, ...] = ("public-strike", "elder-student", "underservice-is-mirrionis")
 CONDITION_KEYS: tuple[str, ...] = (
-    "baseline", "student", "elderly", "public_strike", "underservice_is_mirrionis", "new_metro",
+    "baseline", "student", "elderly", "public_strike", "underservice_is_mirrionis",
 )
 CAPABILITY_LAYERS: tuple[str, ...] = ("capability_care", "capability_nutrition", "capability_restorativeness")
 SCENARIOS_DIR = Path("scenarios")

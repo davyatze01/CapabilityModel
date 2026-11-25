@@ -14,9 +14,9 @@ class PipelineContext:
     # utils.capabilities.CAPABILITY_SERVICES) -- not fixed to any particular set of
     # capability names.
     capability_services: dict[str, list[str]]
-    # Individual-profile override (see core.profiles.Profile) -- set by main.py/scenarios.py
-    # after construction, never by build_context itself. None reproduces the baseline
-    # universal traveler exactly (see accessibility_stage's getattr(ctx, "profile", None) reads).
+    # Individual-profile override (see core.profiles.Profile) -- set by scenarios.py after
+    # construction, never by build_context itself. None = the baseline universal traveler at
+    # the study city's paid-POI affordability (core.profiles.city_paid_poi_affordability).
     profile: Profile | None = None
 
 

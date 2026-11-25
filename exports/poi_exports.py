@@ -165,6 +165,13 @@ def _collect_poi_records() -> list[dict[str, Any]]:
             # materialising a full wide pd.Series per row (the iterrows() crash path).
             col_vals = {col: poi_valid[col].to_numpy() for col in SOURCE_KEY_COLUMNS if col in poi_valid.columns}
             geoms_arr = poi_valid.geometry.to_numpy()
+            # Plain-DataFrame POIs (cached GeoJSON) are keyed by their geometry token in
+            # snapping (graphml.get_poi_geometries) — key them the same way here, or
+            # fallback (no-osmid) POIs never match the accessibility catalog.
+            geometry_tokens = (
+                poi_valid["__geometry_token"].to_numpy()
+                if "__geometry_token" in poi_valid.columns else None
+            )
 
             poi_type_str = str(query.poi_type)
             for i in range(len(poi_valid)):
@@ -178,7 +185,8 @@ def _collect_poi_records() -> list[dict[str, Any]]:
                     continue
 
                 row_dict = {col: vals[i] for col, vals in col_vals.items()}
-                key = build_poi_source_key(row_dict, geoms_arr[i])
+                key_geom = str(geometry_tokens[i]) if geometry_tokens is not None else geoms_arr[i]
+                key = build_poi_source_key(row_dict, key_geom)
 
                 record = records.get(key)
                 if record is None:

@@ -992,18 +992,23 @@ def run_accessibility_stage(
     monitor_thread = threading.Thread(target=_monitor, daemon=True)
     monitor_thread.start()
 
-    # Individual-profile knobs passed to each worker. When ctx carries no profile these
-    # reproduce the baseline exactly (all non-bus modes, utility multiplier 1.0 everywhere).
+    # Individual-profile knobs passed to each worker. No profile (or affordability=None) means
+    # the baseline traveler at the study city's own paid-POI affordability, so every caller
+    # (main, scenarios, sensitivity sweep) uses the same per-city value.
+    from core.profiles import city_paid_poi_affordability
     _profile = getattr(ctx, "profile", None)
     _profile_mode_tuple = tuple(
         getattr(ctx.config, "enabled_non_bus_modes", ("walk", "bike", "drive"))
     )
+    _afford = getattr(_profile, "affordability", None)
+    _profile_util_default = float(
+        _afford if _afford is not None else city_paid_poi_affordability(ctx.config.study_city)
+    )
+    print(f"[Accessibility] paid-POI affordability u = {_profile_util_default:g}", flush=True)
     if _profile is not None:
-        _profile_util_default = float(_profile.affordability)
         _profile_util_canteen = float(_profile.canteen_utility)
         _profile_canteen_osmids = tuple(str(x) for x in _profile.canteen_source_keys)
     else:
-        _profile_util_default = 1.0
         _profile_util_canteen = 1.0
         _profile_canteen_osmids = ()
 

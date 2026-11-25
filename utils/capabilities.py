@@ -304,6 +304,25 @@ def electre_tri_integration(x, capability):
     """
     return float(electre_tri_details(x, capability)["score"])
 
+def service_mean_integration(x, capability):
+    """Arithmetic mean of a capability's services, independent of ELECTRE weights.
+
+    Zero scores remain in the denominator. This is a scenario evaluation score,
+    not an ELECTRE capability assignment.
+    """
+    services = CAPABILITY_SERVICES[capability]
+    if len(x) != len(services):
+        raise ValueError("Service scores and services must have matching lengths.")
+    return math.fsum(float(value) for value in x) / len(services) if services else 0.0
+
+
+def weighted_sum_integration(x, capability):
+    services = CAPABILITY_SERVICES[capability]
+    if len(x) != len(services):
+        raise ValueError("Service scores and services must have matching lengths.")
+    weights = [CAP_ELECTRE_W[capability][s] for s in services]
+    return sum(w * float(value) for w, value in zip(weights, x)) / sum(weights)
+
 
 def electre_tri_continuous_score(x, capability):
     """Aggregate service scores into one capability score, keeping ELECTRE TRI's
@@ -327,6 +346,7 @@ def electre_tri_continuous_score(x, capability):
         # computed, so fall back to the discrete band score already picked in details.
         return float(details["score"])
     return float(sum(b["credibility"] for b in boundaries) / len(boundaries))
+
 
 
 CAPABILITY_CSV_PATH = Path(__file__).resolve().parents[1] / "config" / "capability.csv"
@@ -541,6 +561,13 @@ SERVICE_COLOR_STOPS: list[str] = [
     "#d7191c", "#e85b3b", "#f99d59", "#fec981", "#ffedab",
     "#ebf7ad", "#c4e687", "#96d265", "#58b453", "#1a9641",
 ]
+SCORE_BOUNDS = [i / 10 for i in range(11)]
+
+SCORE_LABELS = [
+    f"{SCORE_BOUNDS[i]:.1f}–{SCORE_BOUNDS[i + 1]:.1f}"
+    for i in range(10)
+]
+
 
 
 def service_step_color(value: float) -> str:

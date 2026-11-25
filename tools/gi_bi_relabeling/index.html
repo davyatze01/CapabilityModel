@@ -26,11 +26,15 @@
   .detail-actions { display: flex; gap: 8px; margin-top: 8px; }
   #detail-link { flex: 1; padding: 8px 12px; background: #2e7d32; color: white; text-decoration: none; border-radius: 4px; font-size: 13px; text-align: center; }
   #remove-poi-btn { flex: 1; padding: 8px 12px; background: #c62828; color: white; border: none; border-radius: 4px; font-size: 13px; cursor: pointer; }
+  #approve-btn { width: 100%; margin-top: 8px; padding: 8px 12px; background: #f9a825; color: #000; border: none; border-radius: 4px; font-size: 13px; cursor: pointer; }
   #detail-placeholder { padding: 12px; font-size: 13px; color: #666; }
   .edited-icon { font-size: 22px; font-weight: bold; text-align: center; line-height: 24px; text-shadow: 0 0 3px #fff, 0 0 3px #fff, 0 0 3px #fff; pointer-events: none; }
+  .approved-icon { font-size: 20px; font-weight: bold; text-align: center; line-height: 20px; color: #2e7d32; text-shadow: 0 0 3px #fff, 0 0 3px #fff, 0 0 3px #fff; pointer-events: none; }
+  #show-approved-label { display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 10px; cursor: pointer; }
   #split-merge-btn { width: 100%; margin-top: 8px; padding: 8px 12px; background: #1565c0; color: white; border: none; border-radius: 4px; font-size: 13px; cursor: pointer; }
   #split-merge-panel { padding: 12px; border-top: 1px solid #ccc; font-size: 13px; display: none; }
   #split-merge-status { margin-bottom: 8px; color: #333; }
+  #confirm-split-merge-btn { width: 100%; margin-bottom: 6px; padding: 8px 12px; background: #2e7d32; color: white; border: none; border-radius: 4px; font-size: 13px; cursor: pointer; }
   #exit-split-merge-btn { width: 100%; padding: 8px 12px; background: #555; color: white; border: none; border-radius: 4px; font-size: 13px; cursor: pointer; }
 </style>
 </head>
@@ -42,6 +46,9 @@
       <button id="select-all">Select all</button>
       <button id="deselect-all">Deselect all</button>
     </div>
+    <label id="show-approved-label"><input type="checkbox" id="show-approved-toggle"> Show approved</label>
+    <label id="show-osm-label"><input type="checkbox" id="show-osm-toggle" checked> Show OSM basemap</label>
+    <label id="show-points-label"><input type="checkbox" id="show-points-toggle"> Include points</label>
     <div id="filter-list"></div>
   </div>
   <div id="map"></div>
@@ -51,7 +58,8 @@
     <div id="detail-body"></div>
     <div id="split-merge-panel">
       <div id="split-merge-status"></div>
-      <button id="exit-split-merge-btn" type="button">Exit Split/Merge</button>
+      <button id="confirm-split-merge-btn" type="button">Confirm Merge / Split</button>
+      <button id="exit-split-merge-btn" type="button">Cancel</button>
     </div>
   </div>
 </div>
@@ -59,9 +67,14 @@
 <script src="vendor/leaflet/leaflet.js"></script>
 <script>
 const map = L.map('map').setView([39.22, 9.11], 12);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '&copy; OpenStreetMap contributors'
 }).addTo(map);
+
+document.getElementById('show-osm-toggle').addEventListener('change', e => {
+  if (e.target.checked) osmLayer.addTo(map);
+  else map.removeLayer(osmLayer);
+});
 
 const REMOVED_TAG = 'removed';
 const SELECTED_STYLE = { color: '#2196f3', fillColor: '#2196f3', fillOpacity: 0.5, weight: 4 };
@@ -83,6 +96,16 @@ let splitMergeGroupId = null;
 let splitMergeAnchor = null;
 let splitMergeIncluded = new Set();
 const CANDIDATE_RADIUS_M = 500;
+let approvals = {};
+let showApproved = false;
+let includePoints = false;
+let approvedMarkerBySourceKey = {};
+// Tracked so a relabel can be applied to ONE POI in place instead of re-running
+// loadAndRender(), which on Paris re-fetches 344MB and rebuilds 50k+ layers per click.
+let editedMarkerBySourceKey = {};
+let tagToPoiTypeMap = {};
+let countByGroup = {};
+let labelTextByGroup = {};
 
 function groupKey(props) {
   // Removed POIs form one unified category regardless of their original poi_type.
@@ -101,6 +124,9 @@ function streetViewUrl(lat, lon) {
 
 function styleFor(color, sourceKey) {
   const modified = !!relabels[sourceKey] || manuallyMergedKeys.has(sourceKey);
+  if (showApproved && approvals[sourceKey]) {
+    return { color: '#9e9e9e', fillColor: '#9e9e9e', fillOpacity: 0.3, weight: 2, dashArray: modified ? '6,4' : null };
+  }
   return { color: color, fillColor: color, fillOpacity: 0.3, weight: 2, dashArray: modified ? '6,4' : null };
 }
 
@@ -108,18 +134,20 @@ function effectiveTag(props) {
   return relabels[props.source_key] ? relabels[props.source_key].new_tag : props.tag;
 }
 
-function zoomToNearest(group) {
+function zoomToFirstUnapproved(group) {
   const layerGroup = layersByGroup[group];
   if (!layerGroup) return;
-  const center = map.getCenter();
-  let best = null, bestDist = Infinity;
+  let target = null;
   layerGroup.eachLayer(sub => {
-    if (!sub.getBounds && !sub.getLatLng) return; // skip icon markers
-    const c = sub.getBounds ? sub.getBounds().getCenter() : sub.getLatLng();
-    const d = center.distanceTo(c);
-    if (d < bestDist) { bestDist = d; best = c; }
+    if (target || !sub.feature) return; // skip icon markers (no feature), keep the first hit
+    if (approvals[sub.feature.properties.source_key]) return;
+    target = sub.getBounds ? sub.getBounds().getCenter() : sub.getLatLng();
   });
-  if (best) map.setView(best, Math.max(map.getZoom(), 15));
+  if (target) map.setView(target, Math.max(map.getZoom(), 15));
+}
+
+function layerCenter(lyr) {
+  return lyr.getBounds ? lyr.getBounds().getCenter() : lyr.getLatLng();
 }
 
 function loadAndRender() {
@@ -138,19 +166,28 @@ function loadAndRender() {
     fetch('poi_type_order.json').then(r => r.ok ? r.json() : []).catch(() => []),
     fetch('raw_fragments.geojson').then(r => r.ok ? r.json() : { features: [] }).catch(() => ({ features: [] })),
     fetch('manual_merges.json').then(r => r.ok ? r.json() : {}).catch(() => ({})),
-  ]).then(([fc, savedRelabels, poiTypeOrder, rawFc, savedManualMerges]) => {
+    fetch('approvals.json').then(r => r.ok ? r.json() : {}).catch(() => ({})),
+    includePoints
+      ? fetch('points.geojson').then(r => r.ok ? r.json() : { features: [] }).catch(() => ({ features: [] }))
+      : Promise.resolve({ features: [] }),
+  ]).then(([fc, savedRelabels, poiTypeOrder, rawFc, savedManualMerges, savedApprovals, pointsFc]) => {
+    fc.features = fc.features.concat(pointsFc.features);
     relabels = savedRelabels || {};
     rawFragments = (rawFc && rawFc.features) || [];
     manualMerges = savedManualMerges || {};
+    approvals = savedApprovals || {};
+    approvedMarkerBySourceKey = {};
+    editedMarkerBySourceKey = {};
+    countByGroup = {}; labelTextByGroup = {};
     manuallyMergedKeys = new Set();
     const rawFragmentsBySourceKey = {};
     rawFragments.forEach(f => { rawFragmentsBySourceKey[f.properties.source_key] = f; });
     // tag -> its "home" poi_type, from the natural (pre-relabel) data — every tag in the
     // dropdown occurs on at least one real POI, so this tells us where a relabeled POI
     // should actually live, not just what it used to be tagged as.
-    const tagToPoiType = {};
+    tagToPoiTypeMap = {};
     fc.features.forEach(f => {
-      if (!(f.properties.tag in tagToPoiType)) tagToPoiType[f.properties.tag] = f.properties.poi_type;
+      if (!(f.properties.tag in tagToPoiTypeMap)) tagToPoiTypeMap[f.properties.tag] = f.properties.poi_type;
     });
     // A saved correction is the POI's effective tag from here on, so it groups/counts
     // under its corrected category instead of the one OSM originally suggested — and,
@@ -161,8 +198,8 @@ function loadAndRender() {
       f.properties.originalTag = f.properties.tag; // true, OSM-sourced tag — survives any number of relabels
       const newTag = effectiveTag(f.properties);
       f.properties.tag = newTag;
-      if (newTag !== REMOVED_TAG && tagToPoiType[newTag]) {
-        f.properties.poi_type = tagToPoiType[newTag];
+      if (newTag !== REMOVED_TAG && tagToPoiTypeMap[newTag]) {
+        f.properties.poi_type = tagToPoiTypeMap[newTag];
       }
 
       // A saved manual merge replaces what's actually drawn, not just what's
@@ -223,30 +260,43 @@ function loadAndRender() {
 
       const layer = L.geoJSON(features, {
         style: feature => styleFor(color, feature.properties.source_key),
+        pointToLayer: (feature, latlng) => L.circleMarker(latlng, { radius: 7 }),
         onEachFeature: (feature, lyr) => {
-          layersBySourceKey[feature.properties.source_key] = { layer: lyr, color: color };
+          layersBySourceKey[feature.properties.source_key] = { layer: lyr, color: color, group: group };
           lyr.on('mouseover', () => lyr.setStyle({ color: 'yellow', fillColor: 'yellow', fillOpacity: 0.5, weight: 3 }));
           lyr.on('mouseout', () => {
-            const style = feature.properties.source_key === selectedSourceKey
+            const key = feature.properties.source_key;
+            // Read the colour from layersBySourceKey rather than the captured `color`:
+            // an in-place relabel moves this layer to another group, and the captured
+            // one would snap it back to its old group's colour on hover.
+            const entry = layersBySourceKey[key];
+            const style = key === selectedSourceKey
               ? SELECTED_STYLE
-              : styleFor(color, feature.properties.source_key);
+              : styleFor(entry ? entry.color : color, key);
             lyr.setStyle(style);
           });
           lyr.on('click', (e) => showDetail(feature.properties, e.latlng));
         },
       });
 
-      // Mark edited/removed/merged shapes with a small icon at their centroid.
+      // Mark edited/removed/merged/approved shapes with a small icon at their centroid.
       features.forEach(f => {
         const key = f.properties.source_key;
         const isMerged = manuallyMergedKeys.has(key);
         const isRelabeled = !!relabels[key];
-        if (!isMerged && !isRelabeled) return;
         const entry = layersBySourceKey[key];
-        const center = entry.layer.getBounds().getCenter();
-        const symbol = isMerged ? '⛓' : (f.properties.tag === REMOVED_TAG ? '✕' : '✎');
-        const icon = L.divIcon({ html: symbol, className: 'edited-icon', iconSize: [16, 16] });
-        L.marker(center, { icon: icon, interactive: false }).addTo(layer);
+        if (isMerged || isRelabeled) {
+          const center = layerCenter(entry.layer);
+          const symbol = isMerged ? '⛓' : (f.properties.tag === REMOVED_TAG ? '✕' : '✎');
+          const icon = L.divIcon({ html: symbol, className: 'edited-icon', iconSize: [16, 16] });
+          editedMarkerBySourceKey[key] = L.marker(center, { icon: icon, interactive: false }).addTo(layer);
+        }
+        if (showApproved && approvals[key]) {
+          const center = layerCenter(entry.layer);
+          const icon = L.divIcon({ html: '✓', className: 'approved-icon', iconSize: [16, 16] });
+          const marker = L.marker(center, { icon: icon, interactive: false }).addTo(layer);
+          approvedMarkerBySourceKey[key] = marker;
+        }
       });
 
       if (selectedSourceKey && layersBySourceKey[selectedSourceKey]) {
@@ -261,7 +311,7 @@ function loadAndRender() {
       checkbox.checked = previouslyChecked.has(group);
       if (checkbox.checked) map.addLayer(layer);
       checkbox.addEventListener('change', () => {
-        if (checkbox.checked) { map.addLayer(layer); zoomToNearest(group); }
+        if (checkbox.checked) { map.addLayer(layer); zoomToFirstUnapproved(group); }
         else map.removeLayer(layer);
       });
       checkboxByGroup[group] = checkbox;
@@ -281,7 +331,9 @@ function loadAndRender() {
 
       label.appendChild(checkbox);
       label.appendChild(swatch);
-      label.appendChild(document.createTextNode(`${tagPartOf(group)} (${features.length})`));
+      countByGroup[group] = features.length;
+      labelTextByGroup[group] = document.createTextNode(`${tagPartOf(group)} (${features.length})`);
+      label.appendChild(labelTextByGroup[group]);
       sectionEls[sectionTitleOf(group)].appendChild(label);
     });
   });
@@ -300,6 +352,57 @@ document.getElementById('deselect-all').addEventListener('click', () => {
   });
 });
 
+function refreshApprovedMarker(key) {
+  const existing = approvedMarkerBySourceKey[key];
+  if (existing) { map.removeLayer(existing); delete approvedMarkerBySourceKey[key]; }
+  if (!showApproved || !approvals[key]) return;
+  const entry = layersBySourceKey[key];
+  if (!entry) return;
+  const center = layerCenter(entry.layer);
+  const icon = L.divIcon({ html: '✓', className: 'approved-icon', iconSize: [16, 16] });
+  const marker = L.marker(center, { icon: icon, interactive: false });
+  const groupLayer = layersByGroup[entry.group];
+  if (groupLayer) marker.addTo(groupLayer); else marker.addTo(map);
+  approvedMarkerBySourceKey[key] = marker;
+}
+
+// Restyles/re-icons a single POI in place — used for approve/unapprove and the "show
+// approved" toggle so those stay fast even on Paris's 50k+ shapes, instead of paying
+// for a full loadAndRender() (which re-fetches everything and rebuilds every layer)
+// on every single click.
+function restyleApproved(key) {
+  const entry = layersBySourceKey[key];
+  if (!entry) return;
+  entry.layer.setStyle(key === selectedSourceKey ? SELECTED_STYLE : styleFor(entry.color, key));
+  refreshApprovedMarker(key);
+}
+
+function setApproved(props, isApproved) {
+  const key = props.source_key;
+  if (isApproved) approvals[key] = { source_key: key, poi_type: props.poi_type, tag: props.tag };
+  else delete approvals[key];
+  restyleApproved(key);
+  return fetch('/save_approval', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(isApproved
+      ? { source_key: key, poi_type: props.poi_type, tag: props.tag }
+      : { source_key: key, remove: true }),
+  }).catch(() => {
+    document.getElementById('relabel-status').textContent = 'Could not save — is the server running?';
+  });
+}
+
+document.getElementById('show-points-toggle').addEventListener('change', (e) => {
+  includePoints = e.target.checked;
+  loadAndRender();
+});
+
+document.getElementById('show-approved-toggle').addEventListener('change', (e) => {
+  showApproved = e.target.checked;
+  Object.keys(layersBySourceKey).forEach(restyleApproved);
+});
+
 loadAndRender();
 
 function showDetail(props, latlng) {
@@ -312,6 +415,8 @@ function showDetail(props, latlng) {
   if (layersBySourceKey[selectedSourceKey]) {
     layersBySourceKey[selectedSourceKey].layer.setStyle(SELECTED_STYLE);
   }
+  if (!approvals[props.source_key]) setApproved(props, true);
+  const isPoint = dataFeatureBySourceKey[props.source_key].geometry.type === 'Point';
 
   document.getElementById('detail-header').textContent = props.name || '(unnamed)';
   document.getElementById('detail-placeholder').style.display = 'none';
@@ -327,7 +432,8 @@ function showDetail(props, latlng) {
       <a id="detail-link" href="${streetViewUrl(latlng.lat, latlng.lng)}" target="_blank" rel="noopener">Open Street View ↗</a>
       <button id="remove-poi-btn" type="button">Remove POI</button>
     </div>
-    <button id="split-merge-btn" type="button">Split/Merge</button>
+    <button id="approve-btn" type="button">To approve</button>
+    ${isPoint ? '' : '<button id="split-merge-btn" type="button">Split/Merge</button>'}
     <div id="relabel-status"></div>
   `;
 
@@ -336,7 +442,73 @@ function showDetail(props, latlng) {
     document.getElementById('tag-select').value = REMOVED_TAG;
     saveRelabel(props, REMOVED_TAG);
   });
-  document.getElementById('split-merge-btn').addEventListener('click', () => enterSplitMerge(props));
+  document.getElementById('approve-btn').addEventListener('click', () => setApproved(props, false));
+  if (!isPoint) document.getElementById('split-merge-btn').addEventListener('click', () => enterSplitMerge(props));
+}
+
+function updateGroupCount(group, delta) {
+  if (!(group in countByGroup)) return;
+  countByGroup[group] += delta;
+  const node = labelTextByGroup[group];
+  if (!node) return;
+  const tagPart = group === REMOVED_TAG ? REMOVED_TAG : group.split(' — ').slice(1).join(' — ');
+  node.nodeValue = `${tagPart} (${countByGroup[group]})`;
+}
+
+// Redraws one POI's edited/removed/merged icon, the same way refreshApprovedMarker()
+// handles the approved tick — needed because the in-place path never rebuilds the layer.
+function refreshEditedMarker(key, tag) {
+  const existing = editedMarkerBySourceKey[key];
+  if (existing) { map.removeLayer(existing); delete editedMarkerBySourceKey[key]; }
+  const entry = layersBySourceKey[key];
+  if (!entry) return;
+  const isMerged = manuallyMergedKeys.has(key);
+  if (!isMerged && !relabels[key]) return;
+  const symbol = isMerged ? '⛓' : (tag === REMOVED_TAG ? '✕' : '✎');
+  const icon = L.divIcon({ html: symbol, className: 'edited-icon', iconSize: [16, 16] });
+  const marker = L.marker(layerCenter(entry.layer), { icon: icon, interactive: false });
+  const groupLayer = layersByGroup[entry.group];
+  if (groupLayer) marker.addTo(groupLayer); else marker.addTo(map);
+  editedMarkerBySourceKey[key] = marker;
+}
+
+// Applies an already-saved relabel to ONE POI, instead of re-running loadAndRender()
+// (which on Paris re-fetches 344MB and rebuilds 50k+ layers for a single click).
+// Returns false when the corrected tag has no group on the map yet, so the caller can
+// fall back to the full rebuild rather than silently losing the POI.
+function applyRelabelInPlace(props, newTag) {
+  const key = props.source_key;
+  const entry = layersBySourceKey[key];
+  const feature = dataFeatureBySourceKey[key];
+  if (!entry || !feature) return false;
+
+  const oldGroup = entry.group;
+  const newPoiType = (newTag !== REMOVED_TAG && tagToPoiTypeMap[newTag]) ? tagToPoiTypeMap[newTag] : props.poi_type;
+  const newGroup = newTag === REMOVED_TAG ? REMOVED_TAG : `${newPoiType} — ${newTag}`;
+  if (newGroup !== oldGroup && (!layersByGroup[newGroup] || !layersByGroup[oldGroup])) return false;
+
+  feature.properties.tag = newTag;
+  feature.properties.poi_type = newPoiType;
+
+  if (newGroup !== oldGroup) {
+    // Pull the layer and its markers out of the old group BEFORE entry.group moves,
+    // otherwise they stay orphaned in a layer nobody looks at again.
+    layersByGroup[oldGroup].removeLayer(entry.layer);
+    const edited = editedMarkerBySourceKey[key];
+    if (edited) { layersByGroup[oldGroup].removeLayer(edited); delete editedMarkerBySourceKey[key]; }
+    const approved = approvedMarkerBySourceKey[key];
+    if (approved) { layersByGroup[oldGroup].removeLayer(approved); delete approvedMarkerBySourceKey[key]; }
+    layersByGroup[newGroup].addLayer(entry.layer);
+    entry.group = newGroup;
+    entry.color = colorByGroup[newGroup];
+    updateGroupCount(oldGroup, -1);
+    updateGroupCount(newGroup, +1);
+  }
+
+  entry.layer.setStyle(key === selectedSourceKey ? SELECTED_STYLE : styleFor(entry.color, key));
+  refreshEditedMarker(key, newTag);
+  refreshApprovedMarker(key);
+  return true;
 }
 
 function saveRelabel(props, newTag) {
@@ -354,6 +526,8 @@ function saveRelabel(props, newTag) {
   }).then(r => {
     if (!r.ok) throw new Error('save failed');
     document.getElementById('relabel-status').textContent = 'Saved.';
+    relabels[props.source_key] = payload;
+    if (applyRelabelInPlace(props, newTag)) return;  // fast path: one POI, no refetch
     return loadAndRender();
   }).catch(() => {
     document.getElementById('relabel-status').textContent = 'Could not save — is the server running?';
@@ -398,7 +572,7 @@ function updateUnionLayer() {
 
 function updateSplitMergeStatus(savedNote) {
   document.getElementById('split-merge-status').textContent =
-    `Click a shape to include/exclude it. ${splitMergeIncluded.size} fragment(s) selected.` + (savedNote ? ` ${savedNote}` : '');
+    `Click a shape to include/exclude it. ${splitMergeIncluded.size} fragment(s) selected. Press Confirm to save.` + (savedNote ? ` ${savedNote}` : '');
 }
 
 function enterSplitMerge(props) {
@@ -445,7 +619,10 @@ function toggleFragment(sourceKey, lyr) {
   lyr.setStyle(candidateStyle(splitMergeIncluded.has(sourceKey)));
   updateSplitMergeStatus();
   updateUnionLayer();
+}
 
+function confirmSplitMerge() {
+  if (splitMergeGroupId === null) return;
   const payload = {
     group_id: splitMergeGroupId,
     poi_type: splitMergeAnchor.poi_type,
@@ -458,13 +635,16 @@ function toggleFragment(sourceKey, lyr) {
     body: JSON.stringify(payload),
   }).then(r => {
     if (!r.ok) throw new Error('save failed');
-    manualMerges[splitMergeGroupId] = payload;
-    updateSplitMergeStatus('Saved.');
+    return r.json();
+  }).then(result => {
+    manualMerges = result.merges;
+    exitSplitMerge();
   }).catch(() => {
     updateSplitMergeStatus('Could not save — is the server running?');
   });
 }
 
+document.getElementById('confirm-split-merge-btn').addEventListener('click', confirmSplitMerge);
 document.getElementById('exit-split-merge-btn').addEventListener('click', exitSplitMerge);
 </script>
 </body>

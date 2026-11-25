@@ -29,7 +29,7 @@ OUT_PDF = Path("docs/SCENARIO_VALIDATION_REPORT.pdf")
 # reading is flagged stale in the console output (absolute, on the [0,1] score scale).
 STALENESS_TOLERANCE = 0.01
 
-# ── Static methodology sections (1-4, 6) -- unchanged, transcribed verbatim ────
+# ── Methodology sections (1-4, 6): service-average scenario evaluation ────
 STATIC_SECTIONS_HTML = """
 <h2>1. What is being compared, in general</h2>
 <p>Every scenario compares two or more <b>conditions</b> — a baseline plus one or more
@@ -47,22 +47,16 @@ held identical to baseline.</p>
 <p>Each condition's capability score is computed independently for every hexagon, then the
 results are lined up so that each hexagon has one score per condition, side by side.</p>
 
-<h2>2. Choosing a capability score: discrete bands vs. a continuous score</h2>
-<p>The model's production output places every hexagon into one of five ordered capability
-bands (very low through very high) and reports the band's midpoint value. That is the right
-choice for presenting results on a map, but it is a poor choice for detecting change
-statistically: two hexagons that both remain in the "medium" band register as zero
-difference even if one moved much closer to the boundary than the other, and the
-significance test used here treats exact-zero differences as uninformative and discards
-them. If most hexagons don't fully cross a band boundary, most of the sample ends up
-contributing nothing to the test.</p>
-<p>To avoid discarding real, sub-band movement, this analysis uses a continuous version of
-the same underlying score instead: the smooth outranking credibility that the banding
-procedure computes internally, before it collapses everything into five bands. It uses the
-same concordance/discordance/veto logic as the production score, without the final rounding
-step. It is not a different measure of accessibility, only a higher-resolution readout of
-the same one. This continuous mode is opt-in. It never affects the model's normal
-(production) output. Every result in this report was generated with it turned on.</p>
+<h2>2. Capability assignment and scenario evaluation</h2>
+<p>Capability scores and their maps retain the ELECTRE TRI assignment to five ordered
+classes. Scenario evaluation uses a separate measure: the equal-weight arithmetic mean of
+all services belonging to each capability, including zero service scores. This average is
+computed at each node and passed through the same spatial grid export as the capability
+scores. ELECTRE weights, vetoes and thresholds do not enter the service average.</p>
+<p>The statistical tests use the numerical service averages, not ELECTRE classes or
+outranking credibility. Differences are alternative minus reference on the 0–1 scale;
+a difference of −0.04 means a decrease of four percentage points of that scale.
+Ten 0.1-wide bands are used only to display service-average changes on maps.</p>
 
 <h2>3. Baseline test: paired Wilcoxon signed-rank test</h2>
 <p>For every (scenario, capability, condition) combination, the analysis:</p>
@@ -74,7 +68,7 @@ hexagon.</li>
 that there is no systematic shift between the two conditions — i.e., that the paired
 differences are symmetric around zero.</li>
 <li>Estimates an effect size via a bootstrap 95% confidence interval on the
-<b>median</b> difference (2,000 resamples).</li>
+<b>median</b> difference by resampling entire spatial blocks (2,000 resamples).</li>
 </ol>
 
 <h2>4. Correction: spatial block sign-flip permutation test</h2>
@@ -112,9 +106,9 @@ them, for both the naive and the spatially-corrected p-values.</li>
 METHODOLOGICAL_NOTES_HTML = """
 <h2>6. Methodological notes for reproducibility</h2>
 <ul>
-<li>All results use the continuous capability score described in Section 2, not the
-production five-band score.</li>
-<li>The bootstrap confidence interval on the median difference uses 2,000 resamples at the
+<li>All results use the arithmetic service average described in Section 2. Capability
+assignment remains ELECTRE TRI.</li>
+<li>The spatial block bootstrap confidence interval on the median difference uses 2,000 resamples at the
 95% confidence level.</li>
 <li>Multiple-comparison correction (Benjamini-Hochberg) is applied across all tests run
 together in a given report.</li>
@@ -171,30 +165,8 @@ SCENARIO_READINGS: dict[str, dict] = {
             ("restorativeness", "baseline", "underservice_is_mirrionis"): 0.0,
         },
     },
-    "new-metro": {
-        "title": "5.3 New metro line",
-        "what_changes": (
-            "a new transit line is added to the network — an extension of the existing "
-            "Metrocagliari line further into the city, with several new stops — while walking "
-            "speed, affordability, and the set of enabled travel modes are all identical to "
-            "baseline. The only difference from baseline is the presence and routing of this "
-            "one additional line."
-        ),
-        "reading": [
-            "this is the most spatially localized scenario by design — a single new corridor "
-            "only affects a narrow band of hexagons (2.7%–28.5%, depending on capability), so "
-            "the citywide median stays at zero for all three capabilities even though the "
-            "effect within the corridor itself is real and consistently positive. The "
-            "spatial-block test confirms that the localized effect is genuine."
-        ],
-        "reading_basis": {
-            ("care", "baseline", "new_metro"): 0.0,
-            ("nutrition", "baseline", "new_metro"): 0.0,
-            ("restorativeness", "baseline", "new_metro"): 0.0,
-        },
-    },
     "elder-student": {
-        "title": "5.4 Traveler profiles: student vs. elderly",
+        "title": "5.3 Traveler profiles: student vs. elderly",
         "intro": (
             "This scenario compares three distinct traveler profiles, each simulated as a "
             "completely independent run (not a perturbation layered on baseline) — a "
@@ -306,7 +278,7 @@ def render_results_table(df: pd.DataFrame, scenario: str) -> str:
 
 
 def render_parameters_table(parameters: dict[str, tuple[str, str, str]]) -> str:
-    """elder-student's baseline/student/elderly persona-parameter table (Section 5.4 only)."""
+    """elder-student's baseline/student/elderly persona-parameter table (Section 5.3 only)."""
     rows_html = "".join(
         f"<tr><td>{param}</td><td>{baseline}</td><td>{student}</td><td>{elderly}</td></tr>"
         for param, (baseline, student, elderly) in parameters.items()
@@ -368,6 +340,10 @@ li { margin-bottom: 0.4em; }
 
 
 def build_report_html(df: pd.DataFrame) -> str:
+    if "aggregation_method" not in df or not df["aggregation_method"].eq("arithmetic_service_mean").all():
+        raise ValueError("Regenerate significance results using service_mean before generating this report.")
+    if "score_mode" not in df or not df["score_mode"].eq("service_mean").all():
+        raise ValueError("This report describes numerical service means; set R SCORE_MODE to service_mean.")
     scenario_blocks = []
     for scenario, entry in SCENARIO_READINGS.items():
         parts = [f"<h3>{entry['title']}</h3>"]
@@ -376,12 +352,10 @@ def build_report_html(df: pd.DataFrame) -> str:
             parts.append(render_parameters_table(entry["parameters"]))
         parts.append(f"<p><b>What changes vs. baseline</b>: {entry['what_changes']}</p>")
         parts.append(render_results_table(df, scenario))
-        reading = entry["reading"]
-        if len(reading) == 1:
-            parts.append(f"<p><b>Reading</b>: {reading[0]}</p>")
-        else:
-            items = "".join(f"<li>{p}</li>" for p in reading)
-            parts.append(f"<p><b>Reading</b> — multiple findings:</p><ol>{items}</ol>")
+        # Existing approved interpretations were based on ELECTRE credibility.
+        # Preserve them in SCENARIO_READINGS, but do not attach them to a new measure.
+        parts.append("<p><b>Reading</b>: Interpretation must be reviewed against the new "
+                     "service-average results; earlier ELECTRE-based readings are not reproduced.</p>")
         scenario_blocks.append("\n".join(parts))
 
     return f"""<!doctype html>

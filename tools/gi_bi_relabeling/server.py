@@ -1,9 +1,10 @@
 """Local server for the Blue/Green Infrastructure Relabeling page.
 
 Standard-library only (no dependencies). Serves the static files in this folder and
-adds two endpoints: POST /save_relabel persists a POI's manually-corrected tag to
+adds three endpoints: POST /save_relabel persists a POI's manually-corrected tag to
 relabels.json, POST /save_manual_merge persists a manually-defined fragment grouping
-to manual_merges.json, both in this same folder.
+to manual_merges.json, POST /save_approval persists a POI's "checked" status to
+approvals.json (or removes it, given {"remove": true}) — all three in this same folder.
 """
 
 import http.server
@@ -14,6 +15,7 @@ PORT = 8766
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RELABELS_PATH = os.path.join(BASE_DIR, "relabels.json")
 MANUAL_MERGES_PATH = os.path.join(BASE_DIR, "manual_merges.json")
+APPROVALS_PATH = os.path.join(BASE_DIR, "approvals.json")
 
 
 def _load_json_dict(path: str) -> dict:
@@ -30,10 +32,36 @@ def _save_json_dict(path: str, data: dict) -> None:
     os.replace(tmp_path, path)
 
 
+def _next_seq() -> int:
+    """Progressive number of the next saved operation, global across the three files."""
+    return 1 + max(
+        (entry.get("seq", 0)
+         for path in (RELABELS_PATH, MANUAL_MERGES_PATH, APPROVALS_PATH)
+         for entry in _load_json_dict(path).values()),
+        default=0,
+    )
+
+
+def _release_fragments(merges: dict, group_id: str, fragment_keys: list) -> None:
+    """A fragment belongs to one POI only: strip the fragments now claimed by
+    `group_id` from every other group, so the newest merge overwrites the old relation.
+    A group left with no fragments is a removed POI, so its entry is deleted."""
+    claimed = set(fragment_keys)
+    for other_id in list(merges):
+        if other_id == group_id:
+            continue
+        after = [k for k in merges[other_id]["fragment_keys"] if k not in claimed]
+        if after:
+            merges[other_id]["fragment_keys"] = after
+        else:
+            del merges[other_id]
+
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     ENDPOINTS = {
         "/save_relabel": (RELABELS_PATH, "source_key"),
         "/save_manual_merge": (MANUAL_MERGES_PATH, "group_id"),
+        "/save_approval": (APPROVALS_PATH, "source_key"),
     }
 
     def do_POST(self):
@@ -52,10 +80,19 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
 
         data = _load_json_dict(path)
-        data[key] = payload
+        if payload.get("remove"):
+            data.pop(key, None)
+        else:
+            payload["seq"] = _next_seq()
+            data[key] = payload
+            if path == MANUAL_MERGES_PATH:
+                _release_fragments(data, key, payload["fragment_keys"])
         _save_json_dict(path, data)
 
-        body = json.dumps({"status": "ok"}).encode("utf-8")
+        result = {"status": "ok"}
+        if path == MANUAL_MERGES_PATH and not payload.get("remove"):
+            result["merges"] = data
+        body = json.dumps(result).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

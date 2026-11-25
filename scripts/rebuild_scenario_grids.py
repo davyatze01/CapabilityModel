@@ -5,13 +5,20 @@ Targets scenarios/_capability_grids/<key>/Cagliari_<key>.gpkg, the exact file
 the colleague opens directly (not profile_comparison.qgz). Re-registers the
 service_*/capability_* views and their embedded default styles.
 """
+import sys
 from pathlib import Path
+
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from core.config import PipelineConfig
 from core.pipeline_runner import _build_qgis_project, _resolve_qgis_executable
 from exports.generate_experiment_shapefiles import generate_combined_experiment_gpkg
 
-SCENARIO_KEYS = ["underservice_is_mirrionis", "public_strike"]
+SCENARIO_KEYS = [
+    "baseline", "student", "elderly", "public_strike", "underservice_is_mirrionis",
+]
 
 def rebuild(key: str) -> None:
     cfg = PipelineConfig(study_city="cagliari")

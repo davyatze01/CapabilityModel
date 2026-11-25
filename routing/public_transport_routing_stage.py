@@ -77,6 +77,33 @@ _R5_STALL_TIMEOUT_S_DEFAULT = 60.0
 _R5_BUILD_TIMEOUT_S_DEFAULT = 1800.0
 _R5_ROUTING_STARTED_MARKER = "Routing transit mode:"
 
+# Ceiling on the r5r JVM heap, in GB. This is the main wall-clock lever for a large city,
+# because it sets how many origins fit into one R5 call:
+#
+#   od_budget    = 0.35 * heap / 1.74e-5     (OD pairs that fit the heap)
+#   origin_chunk = od_budget // dest_chunk   (dest_chunk is pinned at 5000 by R5's
+#                                             breakdown=TRUE PathResult limit)
+#
+# Paris (23,046 origins x 136,744 destinations) needs ceil(136744/5000) = 28 destination
+# chunks whatever the heap, so the call count is ceil(23046 / origin_chunk) * 28 per mode:
+#
+#   heap 16 GB -> origin_chunk  64 -> 361 batches -> 10,108 calls per mode
+#   heap 24 GB -> origin_chunk  96 -> 241 batches ->  6,748 calls per mode
+#   heap 32 GB -> origin_chunk 128 -> 181 batches ->  5,068 calls per mode
+#   heap 40 GB -> origin_chunk 160 -> 145 batches ->  4,060 calls per mode
+#
+# A bigger heap also gives R5 more origins to spread across cores inside one call: R5
+# parallelises over origins, so at origin_chunk=64 a 26-core machine gets ~2.5 origins per
+# thread and much of the call is fixed overhead rather than routing.
+#
+# This was held at 16 deliberately: G1GC pause times scale with heap, and a heap big
+# enough for G1GC to grind just under the ceiling without ever throwing OutOfMemoryError
+# is exactly the hang _R5_STALL_TIMEOUT_S_DEFAULT above exists to kill. Raised to 24 as a
+# first step; go to 32 next if the per-chunk "[mem]" lines from utils/r5_routing.r stay
+# healthy. Bus and subway run sequentially (main.py), so only one JVM holds this at a
+# time. R5_JVM_MAX_HEAP_GB in the environment overrides the whole calculation.
+_R5_JVM_HEAP_CAP_GB = 24
+
 # The final combine (chunk CSVs -> one output matrix, utils/r5_routing.r) comes after the
 # routing phase, so it would otherwise stay on the tight per-chunk stall timeout above.
 # It streams one chunk at a time with progress every ~200 files, but under memory pressure
@@ -712,25 +739,24 @@ def _run_r5r_script(
     # do not overlap in time
     env["R5_TRANSIT_MODE"] = _resolve_transit_mode(cfg, transport_type)
     budget_gb = float(os.environ.get("CAP_MEM_BUDGET_GB", "0") or "0")
-    # JVM heap for r5r. Smaller than the raw budget so Python + R side-tables fit
-    # alongside the JVM; G1GC pause times scale with heap size, so keeping it
-    # bounded avoids multi-minute stop-the-world pauses between chunk calls.
+    # JVM heap for r5r, bounded by _R5_JVM_HEAP_CAP_GB -- see that knob for the
+    # origin_chunk arithmetic this drives and for why it is not simply maxed out.
     if "R5_JVM_MAX_HEAP_GB" not in env:
-        if budget_gb >= 40:
-            jvm_heap_gb = 16
+        if budget_gb > 0:
+            available_gb = budget_gb
         else:
-            # No cgroup budget — derive from machine RAM: leave ~15 GB for OS,
-            # Python, and R side-tables. Clamp to [8, 16].
+            # No cgroup budget — derive from machine RAM.
             try:
                 import psutil as _psutil
-                total_gb = int(_psutil.virtual_memory().total / (1024 ** 3))
+                available_gb = int(_psutil.virtual_memory().total / (1024 ** 3))
             except Exception:
-                total_gb = 32
-            jvm_heap_gb = max(8, min(16, total_gb - 15))
+                available_gb = 32
+        # Leave ~15 GB for the OS, Python and R side-tables alongside the JVM.
+        jvm_heap_gb = max(8, min(_R5_JVM_HEAP_CAP_GB, int(available_gb) - 15))
         env["R5_JVM_MAX_HEAP_GB"] = str(jvm_heap_gb)
         print(
-            f"[Bus Routing] R5_JVM_MAX_HEAP_GB={jvm_heap_gb} "
-            f"(budget={budget_gb:.0f}GB)",
+            f"[{transport_type.capitalize()} Routing] R5_JVM_MAX_HEAP_GB={jvm_heap_gb} "
+            f"(cap={_R5_JVM_HEAP_CAP_GB}GB, available={available_gb:.0f}GB)",
             flush=True,
         )
 
@@ -1173,6 +1199,19 @@ def _save_routing_cache(path: str, payload) -> None:
 _PT_DEST_CACHE_SCHEMA_VERSION = 1
 
 
+def _snap_sort_key(item):
+    """Order a (source_key, snap_info) pair by its actual coordinate data.
+
+    Sorting by source_coord (falling back to repr(source_key) only to break ties between
+    POIs sharing a coordinate) keeps this order -- and therefore the selection-cache hash
+    below -- stable across source_key format changes, since the key's own formatting is
+    incidental to the selection result.
+    """
+    source_key, snap_info = item
+    source_coord = snap_info.get("source_coord") if isinstance(snap_info, dict) else None
+    return (source_coord is None, source_coord, repr(source_key))
+
+
 def _hash_origins_and_snap(h, origins, poi_bus_snap_info_by_type) -> None:
     """Fold the origins and snapped candidate coordinates into hash `h`.
 
@@ -1186,8 +1225,7 @@ def _hash_origins_and_snap(h, origins, poi_bus_snap_info_by_type) -> None:
     h.update(b"|snap|")
     for poi_key in sorted(poi_bus_snap_info_by_type.keys(), key=repr):
         snap_info_for_key = poi_bus_snap_info_by_type[poi_key]
-        for source_key in sorted(snap_info_for_key.keys(), key=repr):
-            snap_info = snap_info_for_key[source_key]
+        for source_key, snap_info in sorted(snap_info_for_key.items(), key=_snap_sort_key):
             candidates = snap_info.get("candidates") if isinstance(snap_info, dict) else snap_info
             if not isinstance(candidates, (list, tuple)):
                 continue

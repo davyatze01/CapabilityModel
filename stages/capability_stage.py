@@ -44,8 +44,6 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
     ]
     capability_names = [name for name, _ in capabilities]
 
-    print(f"[Capability] ELECTRE TRI boundaries: {cap._BOUNDARIES}", flush=True)
-
     # Build a deduplicated ordered list of all services across all capabilities.
     all_services: list[str] = []
     seen_services: set[str] = set()
@@ -60,18 +58,25 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
     sums = {name: 0.0 for name in capability_names}
     counts = {name: 0 for name in capability_names}
 
-    # See PipelineConfig.capability_score_mode: "discrete" (default) keeps the current
-    # 5-band-midpoint score; "continuous" is a statistics-only knob for scenario testing.
-    score_fn = (
-        cap.electre_tri_continuous_score
-        if getattr(ctx.config, "capability_score_mode", "discrete") == "continuous"
-        else cap.electre_tri_integration
-    )
+    # Capability assignment and scenario evaluation are independent outputs.
+    score_functions = {
+        "discrete": cap.electre_tri_integration,
+        "continuous": cap.electre_tri_continuous_score,
+        "weighted_sum": cap.weighted_sum_integration,
+    }
+
+    mode = ctx.config.capability_score_mode
+    if mode not in score_functions:
+        raise ValueError(f"Unknown capability score mode: {mode!r}")
+
+    score_fn = score_functions[mode]
+    print(f"[Capability] Aggregation: {mode}", flush=True)
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         header = ["node_id", "lat", "lon"]
         header.extend(f"capability_{name}" for name in capability_names)
+        header.extend(f"service_mean_{name}" for name in capability_names)
         header.extend(f"service_{s}" for s in all_services)
         writer.writerow(header)
 
@@ -81,15 +86,18 @@ def run_capability_stage(ctx: PipelineContext, svc: ServiceStageResult) -> Capab
                 scores = node.service_scores
 
                 capability_values = []
+                service_means = []
                 for name, services in capabilities:
                     vals = [scores[s] for s in services]
                     value = score_fn(vals, name) if vals else 0.0
                     sums[name] += value
                     counts[name] += 1
                     capability_values.append(value)
+                    service_means.append(cap.service_mean_integration(vals, name))
 
                 row = [node.node_id, node.lat, node.lon]
                 row.extend(capability_values)
+                row.extend(service_means)
                 row.extend(scores.get(s, 0.0) for s in all_services)
                 writer.writerow(row)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any, Mapping
 
@@ -52,6 +53,12 @@ def _is_missing(value: Any) -> bool:
         return False  # arrays/geometries etc. — never "missing" by this check
 
 
+def _geom_fingerprint(geom: BaseGeometry) -> str:
+    wkb = getattr(geom, "wkb", None)
+    data = wkb if wkb is not None else str(geom).encode("utf-8")
+    return hashlib.sha1(data).hexdigest()
+
+
 def build_poi_source_key(row: Mapping[str, Any], geom: BaseGeometry) -> str:
     """Build a stable identifier for one POI source row.
 
@@ -97,6 +104,6 @@ def build_poi_source_key(row: Mapping[str, Any], geom: BaseGeometry) -> str:
             or row.get("locality")
         ),
         "cap": _normalize_scalar(row.get("addr:postcode") or row.get("postcode") or row.get("postal_code") or row.get("CAP")),
-        "geometry": getattr(geom, "wkb_hex", str(geom)),
+        "geometry": _geom_fingerprint(geom),
     }
     return json.dumps(signature, sort_keys=True, ensure_ascii=True, default=str)

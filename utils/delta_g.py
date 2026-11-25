@@ -802,7 +802,25 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
     if n == 0:
         return empty
 
-    source_coords = source_coords_all[kept_idx]  # (n, 2), routed coord == source_coord
+    # Where each POI is actually entered from this origin. For a POI with a single access
+    # point that is just its own coord; for a line or polygon POI it is the nearest of the
+    # access candidates the snapping stage sampled along it (every LINE_SNAP_SPACING_M),
+    # which is what stops a POI being routed to whichever end of it happened to come
+    # first -- for the Cagliari coastline that end is ~20 km from Poetto. Computed once
+    # here for every mode: walk/bike/drive used to route to source_coord while only
+    # bus/subway picked the nearest, so the modes disagreed about where a POI was.
+    # Candidates are indexed by the ORIGINAL src position, so index with kept_idx.
+    cand_coords = compact.get("cand_coords")
+    cand_dists = compact.get("cand_dists")
+    cand_ptr = compact.get("cand_ptr")
+    poi_coords = np.empty((n, 2), dtype=np.float64)
+    for pos, i in enumerate(kept_idx.tolist()):
+        sc = (float(source_coords_all[i, 0]), float(source_coords_all[i, 1]))
+        if cand_ptr is not None and cand_coords is not None:
+            a = int(cand_ptr[i]); b = int(cand_ptr[i + 1])
+            poi_coords[pos] = _best_snap_candidate_coord(origine, sc, cand_coords[a:b], cand_dists[a:b])
+        else:
+            poi_coords[pos] = sc
 
     # Bound Dijkstra exploration to a generous multiple of the POI radius. Sources are
     # already pre-filtered to haversine <= radius_m, so a detour factor above the urban
@@ -834,7 +852,7 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
             snap_indices = bundle["snap_indices"]
             m_per_deg_lon, m_per_deg_lat = bundle["scale"]
             query_xy = np.column_stack(
-                (source_coords[:, 1] * m_per_deg_lon, source_coords[:, 0] * m_per_deg_lat)
+                (poi_coords[:, 1] * m_per_deg_lon, poi_coords[:, 0] * m_per_deg_lat)
             )
             _, knn = tree.query(query_xy)
             poi_idxs = np.asarray(snap_indices)[np.asarray(knn, dtype=np.intp)].astype(np.intp, copy=False)
@@ -861,7 +879,7 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
             float(bundle["snap_y"][origin_idx]), float(bundle["snap_x"][origin_idx]),
         ) / 1000.0
         poi_gap_km = _haversine_m_np(
-            source_coords[:, 0], source_coords[:, 1],
+            poi_coords[:, 0], poi_coords[:, 1],
             bundle["snap_y"][poi_idxs], bundle["snap_x"][poi_idxs],
         ) / 1000.0
 
@@ -877,7 +895,10 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
         elif mode == "bike":
             imp = ((dist_km + origin_gap_km + poi_gap_km) / config.speed_bike_kmh) * 60.0
         else:  # drive
-            monetary_cost = config.cost_per_liter / config.distance_for_liter
+            # Fuel is paid per km driven: cost_per_liter / distance_for_liter is the cost
+            # of one km, times the driven network distance. The last-mile snap gaps are
+            # walked, so they add time but no fuel.
+            fuel_cost = (config.cost_per_liter / config.distance_for_liter) * dist_km
             # Last-mile gaps are walked (to/from the car), not driven -- speed_walk_kmh,
             # not speed_drive_kmh, for the snap-distance portion only.
             snap_gap_min = ((origin_gap_km + poi_gap_km) / config.speed_walk_kmh) * 60.0
@@ -885,7 +906,7 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
                 config.drive_access_time_min
                 + (dist_km / config.speed_drive_kmh) * 60.0
                 + snap_gap_min
-                + config.vot * monetary_cost
+                + config.vot * fuel_cost
             )
 
         imp_by_mode[mode][reachable] = imp[reachable].astype(np.float32)
@@ -893,22 +914,6 @@ def accessibility_non_bus_from_snap_map(config: PipelineConfig , poi_type, origi
     imp_walk = imp_by_mode["walk"]
     imp_bike = imp_by_mode["bike"]
     imp_drive = imp_by_mode["drive"]
-
-    # Origin-dependent best bus-snapped destination coord per POI, read straight from the
-    # compact CSR candidate arrays (bit-identical to the old
-    # _process_node -> select_best_snap_candidate_for_origin path). Candidates are indexed
-    # by the ORIGINAL src position, so use kept_idx, not the filtered position.
-    cand_coords = compact.get("cand_coords")
-    cand_dists = compact.get("cand_dists")
-    cand_ptr = compact.get("cand_ptr")
-    poi_coords = np.empty((n, 2), dtype=np.float64)
-    for pos, i in enumerate(kept_idx.tolist()):
-        sc = (float(source_coords_all[i, 0]), float(source_coords_all[i, 1]))
-        if cand_ptr is not None and cand_coords is not None:
-            a = int(cand_ptr[i]); b = int(cand_ptr[i + 1])
-            poi_coords[pos] = _best_snap_candidate_coord(origine, sc, cand_coords[a:b], cand_dists[a:b])
-        else:
-            poi_coords[pos] = sc
 
     # Resolve here what the accessibility stage used to re-derive from these coords on every
     # read: which bus/subway matrix column this POI reads, and whether its SNAPPED position

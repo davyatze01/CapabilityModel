@@ -14,10 +14,10 @@ from tqdm import tqdm
 from core.context import PipelineContext
 from core.pipeline_types import SnappingStageResult
 from utils import graphml, services as serv, delta_g
-from utils.line_merge import merge_connected_lines, sample_line_every
+from utils.line_merge import line_parts_from_item, merge_connected_lines, sample_line_every
 import numpy as np
 
-_SNAP_CACHE_SCHEMA_VERSION = 3
+_SNAP_CACHE_SCHEMA_VERSION = 4
 LINE_SNAP_SPACING_M = 500.0
 # Bump when the checkpoint payload layout or the set of inputs folded into its signature
 # changes, so old checkpoints are treated as stale instead of silently reused.
@@ -53,32 +53,6 @@ def _coord_key(coord):
     - tuple: rounded `(lat, lon)` key at 6-decimal precision.
     """
     return (round(coord[0], 6), round(coord[1], 6))
-
-
-def _line_geometry_from_item(geom):
-    """Return line-like parts (EPSG:4326 LineStrings) of this item's geometry, if any."""
-    if isinstance(geom, dict):
-        gtype = geom.get("geometry_type")
-        if gtype == "MultiLineString":
-            parts = geom.get("line_parts") or []
-            return [
-                LineString([(float(lon), float(lat)) for lat, lon in part])
-                for part in parts
-                if isinstance(part, list) and len(part) > 1
-            ]
-        if gtype != "LineString":
-            return []
-        vertices_raw = geom.get("snap_vertices")
-        if not isinstance(vertices_raw, list) or len(vertices_raw) < 2:
-            return []
-        return [LineString([(float(v[1]), float(v[0])) for v in vertices_raw])]
-    if not delta_g._is_geometry(geom):
-        return []
-    if geom.geom_type == "LineString":
-        return [geom]
-    if geom.geom_type == "MultiLineString":
-        return list(geom.geoms)
-    return []
 
 
 # Since POI can be geometries and each POI must be snapped to a node of the graph to compute routing, in this function we create a collection of candidate
@@ -372,7 +346,7 @@ def _build_poi_snap_map(mode, query_by_key, enable_progress, cache_dir, cache_ns
             )
         line_entries: list[tuple[int, object]] = []
         for item_idx, item in enumerate(geometries):
-            for line in _line_geometry_from_item(item[0]):
+            for line in line_parts_from_item(item[0]):
                 line_entries.append((item_idx, line))
 
         item_line_candidates: dict[int, list[tuple[float, float]]] = {}

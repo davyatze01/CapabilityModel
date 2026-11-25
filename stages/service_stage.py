@@ -25,7 +25,7 @@ def _service_run_signature(ctx: PipelineContext) -> str:
 
     payload = {
         "schema": int(ctx.config.service_matrix_schema_version),
-        "aggregation_version": "v2_normalized_service_choquet",
+        "aggregation_version": "v3_mobius_service_choquet",
         "access_signature": access_sig,
         "services": list(serv.SERVICE_KEYS),
         "poi_csv_path": str(serv.CONFIG_CSV_PATH),
@@ -181,11 +181,12 @@ def run_service_stage(ctx: PipelineContext, acc: AccessibilityStageResult) -> Se
                     empty_input_counts[service] += 1
                     score = 0.0
                 else:
-                    detail = serv.choquet_integral_details(values, service)
-                    score = float(detail["normalized"])
+                    score = float(serv.choquet_integral(values, service))
                     if score == 0.0 and max(values) > 0.0:
                         nonzero_input_zero_output_counts[service] += 1
                         if sampled_zero_services[service] < sample_limit:
+                            # Only build the full breakdown for the few sampled diagnostics.
+                            detail = serv.choquet_integral_details(values, service)
                             print(
                                 "[Service] Choquet collapse to 0: "
                                 f"node_id={node.node_id} service={service} "

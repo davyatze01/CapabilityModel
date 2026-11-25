@@ -113,6 +113,8 @@ class Profile:
       the non-bus subset gates routing and RRA fusion).
     - walk_speed_kmh: walking speed for non-bus routing (written onto cfg.speed_walk_kmh).
     - affordability: general per-POI utility u in [0,1] (economic access to opportunities).
+      None = the study city's default (main.py's PAID_POI_AFFORDABILITY_BY_CITY, resolved by
+      the accessibility stage via city_paid_poi_affordability).
     - canteen_utility: utility u for canteen instances (status-benefit override).
     - canteen_source_keys: canteen OSM ids the override applies to.
     - pt_accessible_stops_only: when True, public transport is routed against an
@@ -127,7 +129,7 @@ class Profile:
     key: str
     enabled_modes: frozenset[str]
     walk_speed_kmh: float
-    affordability: float
+    affordability: float | None
     canteen_utility: float
     canteen_source_keys: frozenset[str] = field(default_factory=frozenset)
     pt_accessible_stops_only: bool = False
@@ -154,28 +156,27 @@ class Profile:
         overrides.update(self.extra_config_overrides)
         return overrides
 
-    def utility_for(self, source_key: object, poi_type: str) -> float:
-        """Per-POI utility multiplier u(y): canteen override when applicable, else affordability
-        for market/paid poi_types (PAID_POI_TYPES), else 1.0 for free/public ones."""
-        osmid = osmid_from_source_key(source_key)
-        if osmid is not None and osmid in self.canteen_source_keys:
-            return self.canteen_utility
-        return self.affordability if poi_type in PAID_POI_TYPES else 1.0
+
+def city_paid_poi_affordability(study_city: str) -> float:
+    """main.py's PAID_POI_AFFORDABILITY_BY_CITY value for this city (1.0 when not listed)."""
+    from core.config import normalize_study_city
+    from main import PAID_POI_AFFORDABILITY_BY_CITY  # lazy: main imports core.profiles inside main()
+    return float(PAID_POI_AFFORDABILITY_BY_CITY.get(normalize_study_city(study_city), 1.0))
 
 
 # --- Named personas -------------------------------------------------------------------
 
 _CANTEENS = load_canteen_ids()
 
-# Baseline universal traveler: every mode, full walking speed, no affordability penalty, full
-# GTFS. Reproduces the default main.py run exactly (utility u = 1.0 everywhere, so the
-# accessibility stage's multiplier is a no-op), but in its own artifact namespace so the
+# Baseline universal traveler: every mode, full walking speed, full GTFS, and the study
+# city's own paid-POI affordability (affordability=None -> city_paid_poi_affordability), the
+# same value main.py's run of that city uses. Runs in its own artifact namespace so the
 # comparison never overwrites the user's main outputs.
 BASELINE = Profile(
     key="baseline",
     enabled_modes=frozenset({"walk", "bike", "drive", "bus"}),
     walk_speed_kmh=5.0,
-    affordability=1.0,
+    affordability=None,
     canteen_utility=1.0,
     canteen_source_keys=_CANTEENS,
     pt_accessible_stops_only=False,
@@ -225,7 +226,7 @@ NEW_METRO = Profile(
     key="new_metro",
     enabled_modes=frozenset({"walk", "bike", "drive", "bus"}),
     walk_speed_kmh=5.0,
-    affordability=1.0,
+    affordability=None,
     canteen_utility=1.0,
     canteen_source_keys=_CANTEENS,
     pt_accessible_stops_only=False,

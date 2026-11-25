@@ -15,6 +15,8 @@ from stages.service_stage import run_service_stage
 from stages.capability_stage import run_capability_stage
 from exports.artifact_bundle import load_impedance_bundle, write_impedance_bundle
 from exports.poi_exports import generate_poi_exports
+from exports.offline_basemap import write_offline_basemap
+from utils.graphml import _resolve_mode_graph_path
 from analysis.score_report import generate_score_report
 from plotting.plot_shapefile import plot_all_experiments
 from exports.generate_experiment_shapefiles import (
@@ -235,6 +237,7 @@ def _build_qgis_project(cfg: PipelineConfig, gpkg_path: Path, qgis_exe: str) -> 
     iso_table_names_literal = repr(ISOBANDS_TABLE_NAMES)
     iso_default_capability_literal = repr(str(cfg.default_capability).replace("capability_", ""))
     basemap_flag = "True" if cfg.show_basemap else "False"
+    offline_basemap_flag = "True" if cfg.qgis_offline_basemap else "False"
 
     # ── Per-service monochrome heatmap specs ────────────────────────────────────
     # Every service is colored using its *capability's* signature color, not a color
@@ -242,9 +245,9 @@ def _build_qgis_project(cfg: PipelineConfig, gpkg_path: Path, qgis_exe: str) -> 
     # services feeding "care" share the care color map, etc. This is computed once per
     # capability and reused for every service under it.
     from utils.capabilities import (
-        CAPABILITY_COLOR_STOPS,
         CAPABILITY_ENABLED,
         CAPABILITY_SERVICES,
+        CAPABILITY_COLOR_STOPS,
         ELECTRE_BOUNDS,
         ELECTRE_LABELS,
         ISO_BAND_WIDTHS_MM,
@@ -337,6 +340,7 @@ from qgis.core import (
     QgsApplication,
     QgsCoordinateReferenceSystem,
     QgsFillSymbol,
+    QgsLineSymbol,
     QgsCategorizedSymbolRenderer,
     QgsGraduatedSymbolRenderer,
     QgsNullSymbolRenderer,
@@ -700,11 +704,50 @@ for _pl_tbl, _pl_disp, _pl_col, _pl_size in _place_label_specs:
     # Embed as the layer's default gpkg style so a bare drag-in is labelled too.
     _pl.saveStyleToDatabase("default", "", True, "")
 
+# ── Offline basemap (exports/offline_basemap.py) ─────────────────────────────
+# Stored in the gpkg itself, so the map has a background without any tile server.
+# A pure background: every layer sits below the result grids and shows between
+# hexagons. Top -> bottom within it: main roads, water, study-area fill.
+if {offline_basemap_flag}:
+    _root = project.layerTreeRoot()
+    _bm_specs = [
+        ("basemap_roads", "Basemap: main roads", QgsCategorizedSymbolRenderer("road_class", [
+            QgsRendererCategory("major", QgsLineSymbol.createSimple({{"color": "#8c8c8c", "width": "0.6"}}), "Major roads"),
+            QgsRendererCategory("minor", QgsLineSymbol.createSimple({{"color": "#a8a8a8", "width": "0.3"}}), "Minor roads"),
+        ])),
+        ("basemap_water", "Basemap: water", QgsSingleSymbolRenderer(
+            QgsFillSymbol.createSimple({{"color": "#c9dbe6", "outline_style": "no"}}))),
+        ("basemap_area", "Basemap: study area", QgsSingleSymbolRenderer(
+            QgsFillSymbol.createSimple({{"color": "#f2f1ed", "outline_color": "#9a9a9a", "outline_width": "0.4"}}))),
+    ]
+    for _table, _name, _renderer in _bm_specs:
+        _bm = QgsVectorLayer({gpkg_literal} + "|layername=" + _table, _name, "ogr")
+        if not _bm.isValid():
+            continue
+        _bm.setRenderer(_renderer)
+        project.addMapLayer(_bm, False)
+        _root.addLayer(_bm)   # appended in spec order, so the area fill ends up lowest
+        _bm.saveStyleToDatabase("default", "", True, "")
+
+    # The online tiles don't load without network and would only sit under the
+    # offline fill anyway: keep the layer (one click to enable) but unchecked, at the bottom.
+    for _c in list(_root.children()):
+        if _c.name() == "CartoDB Positron":
+            _clone = _c.clone()
+            _clone.setItemVisibilityChecked(False)
+            _root.addChildNode(_clone)
+            _root.removeChildNode(_c)
+
 try:
     project.setFilePathStorage(QgsProject.Relative)
 except Exception:
     pass
 project.write({output_literal})
+# Also store the project inside the GeoPackage, so the single file opens with the
+# right layer order: QGIS Browser -> <city>.gpkg -> "capability" (double-click), or
+# Project > Open From > GeoPackage. Plain gpkg imports can't control stacking order.
+if not project.write("geopackage:" + {gpkg_literal} + "?projectName=capability"):
+    print("[QGIS] Warning: could not store the project inside the GeoPackage", flush=True)
 app.exitQgis()
 """
 
@@ -743,25 +786,34 @@ app.exitQgis()
     return output_path
 
 
-def _maybe_open_qgis(cfg: PipelineConfig, gpkg_path: Path | None) -> None:
-    if not cfg.open_qgis_after_run:
-        return
-
+def _embed_styles_and_maybe_open_qgis(cfg: PipelineConfig, gpkg_path: Path | None) -> None:
     qgis_exe = _resolve_qgis_executable(cfg)
     if not qgis_exe:
-        raise RuntimeError(
-            "[QGIS] Launch requested but no executable detected. "
-            "Set qgis_bin_path or QGIS_BIN_PATH, or add QGIS to PATH."
+        if cfg.open_qgis_after_run:
+            raise RuntimeError(
+                "[QGIS] Launch requested but no executable detected. "
+                "Set qgis_bin_path or QGIS_BIN_PATH, or add QGIS to PATH."
+            )
+        print(
+            f"[QGIS] WARNING: no QGIS executable found -- layer styles NOT embedded in "
+            f"{gpkg_path}; opening it will show default/random colors.",
+            flush=True,
         )
+        return
 
     project_path: str | None = None
-    
-    # First, try to build/generate the auto-styled project
+
+    # Building the auto-styled project is also what writes every layer's default style into
+    # the gpkg's layer_styles table -- a plain open of the gpkg depends on it, so it must run
+    # whether or not QGIS is launched afterwards.
     if gpkg_path is not None:
         generated_project = _build_qgis_project(cfg, gpkg_path, qgis_exe)
         if generated_project is not None:
             project_path = str(generated_project)
-    
+
+    if not cfg.open_qgis_after_run:
+        return
+
     # If no auto-generated project, check for a pre-existing auto-generated one
     if not project_path and gpkg_path is not None:
         auto_project_path = Path("outputs") / "qgis" / cfg.artifact_slug / "capability.qgz"
@@ -945,7 +997,17 @@ def generate_spatial_outputs(cfg, cap):
         print(f"[Output] Failed to write GeoPackage: {exc}", flush=True)
         gpkg_output_path = None
 
-    _maybe_open_qgis(cfg, gpkg_output_path)
+    if gpkg_output_path is not None and cfg.qgis_offline_basemap:
+        try:
+            write_offline_basemap(
+                gpkg_output_path,
+                _resolve_mode_graph_path("drive", cfg),
+                os.path.join(cfg.poi_export_dir, "water_mask.gpkg"),
+            )
+        except Exception as exc:
+            print(f"[Output] Failed to write offline basemap: {exc}", flush=True)
+
+    _embed_styles_and_maybe_open_qgis(cfg, gpkg_output_path)
 
     return {
         "shapefile_path": shapefile_output_path,

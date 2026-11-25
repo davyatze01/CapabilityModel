@@ -9,6 +9,7 @@ import hashlib
 import itertools
 import json
 import numpy as np
+from pyproj import Geod
 from shapely.geometry import shape
 from shapely.ops import unary_union
 import threading
@@ -661,9 +662,10 @@ def _build_city_query_batches() -> dict[str, list[TagValue]]:
     by_key: dict[str, set[TagValue]] = {}
     for q in serv.unique_query_keys():
         for clause in _iter_tag_clauses(q.tags):
-            primary = {k: v for k, v in clause.items() if str(k) not in _QUALIFIER_ONLY_KEYS}
+            positive = {k: v for k, v in clause.items() if not str(k).startswith("!")}
+            primary = {k: v for k, v in positive.items() if str(k) not in _QUALIFIER_ONLY_KEYS}
             # A clause made solely of qualifier keys still needs downloading via its own keys.
-            for key, value in (primary or clause).items():
+            for key, value in (primary or positive).items():
                 if isinstance(value, list):
                     for item in value:
                         by_key.setdefault(str(key), set()).add(str(item))
@@ -707,6 +709,17 @@ def _filter_by_clause(gdf: gpd.GeoDataFrame, tags: TagClause) -> gpd.GeoDataFram
         return gdf
     mask = pd.Series(True, index=gdf.index)
     for key, value in tags.items():
+        if key.startswith("!"):
+            # Exclusion: "this tag, EXCEPT when the qualifier matches" — how poi_types.csv
+            # expresses the Excel's inclusion criteria (e.g. an informal outdoor pitch is
+            # one WITHOUT access=private). A row whose column is absent, or whose value
+            # differs, passes: a missing qualifier is exactly the residual case the bare
+            # clause is meant to keep.
+            negated = key[1:]
+            if negated not in gdf.columns:
+                continue
+            mask = mask & ~_values_match(gdf[negated], value)
+            continue
         if key not in gdf.columns:
             # Empty result of the SAME type as the input. The city-universe can be a plain
             # DataFrame (loaded via _read_geojson_without_gdal, which avoids GDAL/GEOS), and
@@ -877,6 +890,8 @@ def _row_raw_tags(row, clause: dict) -> list[str]:
     """
     per_key_values: list[list[tuple[str, str]]] = []
     for key in sorted(clause):
+        if key.startswith("!"):
+            continue  # exclusion qualifier: narrows the match, never part of the raw tag
         wanted = clause[key]
         wanted_set = {str(v) for v in wanted} if isinstance(wanted, list) else (
             {str(wanted)} if wanted is not True else None
@@ -951,7 +966,114 @@ def _stamp_poi_raw_tag(poi, tags: TagQuery | None):
     return poi
 
 
-def merge_nearby_polygon_pois(poi, distance_m: float = 10.0):
+# --- Area-based land-cover reclassification ------------------------------------------
+# Some classes describe a land cover whose meaning depends on how much ground it covers:
+# a 150 m2 patch tagged natural=scrub is a lawn, not maquis. Edit these knobs here rather
+# than passing arguments.
+SCRUB_MIN_AREA_M2 = 2_000_000    # at or above this a scrub is genuine scrub
+GRASS_MAX_AREA_M2 = 200          # below this, any low-cover class is really grass
+FOREST_MERGE_DISTANCE_M = 20.0   # forest fragments closer than this are one forest
+
+# Forest fragments sit further apart than other classes, so they get their own threshold.
+# Keyed by raw tag as stamped: landuse=forest resolves to GI09 in both cities.
+FOREST_MERGE_DISTANCES = {"GI09": FOREST_MERGE_DISTANCE_M}
+
+# raw_tag -> ordered (min_area_m2, replacement) rules; first match wins, min_area None
+# means unconditional. Written once in OSM raw-tag terms; the Paris/MGP TYPEQU codes are
+# looked up from config/osm_raw_tag_codes.csv so the two spellings cannot drift apart.
+_RECLASSIFY_RULES: dict[str, list[tuple[float | None, str]]] = {
+    "natural=scrub":     [(SCRUB_MIN_AREA_M2, "natural=scrub"),
+                          (GRASS_MAX_AREA_M2, "natural=heath"),
+                          (None, "landuse=grass")],
+    "natural=heath":     [(GRASS_MAX_AREA_M2, "natural=heath"), (None, "landuse=grass")],
+    "natural=grassland": [(GRASS_MAX_AREA_M2, "natural=grassland"), (None, "landuse=grass")],
+    "landuse=meadow":    [(GRASS_MAX_AREA_M2, "landuse=meadow"), (None, "landuse=grass")],
+    "natural=wood":      [(None, "landuse=forest")],
+}
+
+
+def reclassify_by_area(poi, areas=None):
+    """Rewrite land-cover classes whose meaning depends on how much ground they cover.
+
+    Applies _RECLASSIFY_RULES to whichever spelling this frame uses: the OSM tag columns
+    for Cagliari, the MGP TYPEQU code in "poi_type" for Paris. Every mask is taken from the
+    frame's ORIGINAL state before anything is written, so a row cannot be reclassified
+    twice in one pass -- a scrub demoted to heath must not then be re-read by the heath
+    rule.
+
+    Rows whose area is unknown (points, lines, anything polygon_areas_m2 could not measure)
+    are left alone by the area-dependent rules; only unconditional ones (wood -> forest)
+    touch them.
+
+    "poi_raw_tag" is rewritten here too when present, rather than re-running
+    _stamp_poi_raw_tag afterwards: that would re-filter every clause, needs the original
+    `tags` threaded in, and duplicates rows whose tag value is semicolon multi-valued. It
+    matters that this stays in sync -- the raw tag is what merge_nearby_polygon_pois groups
+    by, so it is what makes ex-woods merge with forests instead of beside them.
+    """
+    if poi is None or len(poi) == 0:
+        return poi
+
+    codes = _load_osm_raw_tag_codes()
+    has_tag_cols = any(k in poi.columns for k in ("natural", "landuse"))
+    has_code_col = "poi_type" in poi.columns
+    if not has_tag_cols and not has_code_col:
+        return poi
+
+    if areas is None:
+        areas = polygon_areas_m2(poi)
+    area_vals = areas.to_numpy(dtype="float64", na_value=float("nan"))
+
+    def _mask_for(raw_tag):
+        key, value = raw_tag.split("=", 1)
+        if has_tag_cols and key in poi.columns:
+            return (poi[key].astype(str) == value).to_numpy()
+        if has_code_col and raw_tag in codes:
+            return (poi["poi_type"].astype(str) == codes[raw_tag]).to_numpy()
+        return None
+
+    plan = []  # (row_mask, new_raw_tag), all resolved before any write
+    for raw_tag, rules in _RECLASSIFY_RULES.items():
+        mask = _mask_for(raw_tag)
+        if mask is None or not mask.any():
+            continue
+        unconditional = all(min_area is None for min_area, _ in rules)
+        remaining = mask if unconditional else (mask & np.isfinite(area_vals))
+        for min_area, new_raw_tag in rules:
+            if not remaining.any():
+                break
+            hit = remaining if min_area is None else (remaining & (area_vals >= float(min_area)))
+            if hit.any() and new_raw_tag != raw_tag:
+                plan.append((hit, new_raw_tag))
+            remaining = remaining & ~hit
+    if not plan:
+        return poi
+
+    poi = poi.copy()
+    counts: dict[str, int] = {}
+    for mask, new_raw_tag in plan:
+        new_key, new_value = new_raw_tag.split("=", 1)
+        if has_tag_cols:
+            for key in ("natural", "landuse"):
+                if key in poi.columns and key != new_key:
+                    poi.loc[mask, key] = None
+            if new_key not in poi.columns:
+                poi[new_key] = None
+            poi.loc[mask, new_key] = new_value
+        if has_code_col and new_raw_tag in codes:
+            poi.loc[mask, "poi_type"] = codes[new_raw_tag]
+        if "poi_raw_tag" in poi.columns:
+            poi.loc[mask, "poi_raw_tag"] = codes.get(new_raw_tag, new_raw_tag)
+        counts[new_raw_tag] = counts.get(new_raw_tag, 0) + int(mask.sum())
+    print(
+        "[POI] Reclassified by area: "
+        + ", ".join(f"{n} -> {t}" for t, n in sorted(counts.items())),
+        flush=True,
+    )
+    return poi
+
+
+def merge_nearby_polygon_pois(poi, distance_m: float = 10.0, distance_by_raw_tag=None):
     """Merge polygon POIs sharing the same `poi_raw_tag` that lie within `distance_m`.
 
     Groups by the persisted raw OSM tag / TYPEQU identity (see _stamp_poi_raw_tag), not
@@ -961,6 +1083,10 @@ def merge_nearby_polygon_pois(poi, distance_m: float = 10.0):
     Inputs:
     - poi: GeoDataFrame with a "poi_raw_tag" column (or plain DataFrame, passed through).
     - distance_m: merge threshold in meters (default 10).
+    - distance_by_raw_tag: optional {raw_tag: meters} overriding `distance_m` per class,
+      for classes whose fragments sit further apart than the general case -- forest is
+      merged at FOREST_MERGE_DISTANCE_M. Keys are raw tags as stamped, i.e. the short code
+      where config/osm_raw_tag_codes.csv defines one ("GI09", not "landuse=forest").
 
     Outputs:
     - GeoDataFrame with nearby same-raw-tag polygons unioned into single rows.
@@ -970,8 +1096,12 @@ def merge_nearby_polygon_pois(poi, distance_m: float = 10.0):
     if not poi.geometry.geom_type.isin(["Polygon", "MultiPolygon"]).any():
         return poi
 
+    overrides = distance_by_raw_tag or {}
     raw_key = poi["poi_raw_tag"] if "poi_raw_tag" in poi.columns else pd.Series("__all__", index=poi.index)
-    merged_groups = [_merge_polygon_cluster(group, distance_m) for _, group in poi.groupby(raw_key)]
+    merged_groups = [
+        _merge_polygon_cluster(group, float(overrides.get(str(tag), distance_m)))
+        for tag, group in poi.groupby(raw_key)
+    ]
     return gpd.GeoDataFrame(pd.concat(merged_groups, ignore_index=True), crs=poi.crs)
 
 
@@ -980,10 +1110,12 @@ def _enumerate_clause_tag_strings(clause: dict) -> list[str] | None:
 
     Returns None if the clause contains a True-wildcard key (matches any value for
     that key) — those can't be enumerated without a real row to consult, and are
-    handled separately by _tag_to_poi_type_map() via key-only fallback matching.
+    handled separately by _tag_to_poi_types_map() via key-only fallback matching.
     """
     per_key_options = []
     for key in sorted(clause):
+        if key.startswith("!"):
+            continue  # exclusion qualifier: never part of an enumerated tag string
         wanted = clause[key]
         if wanted is True:
             return None
@@ -993,15 +1125,18 @@ def _enumerate_clause_tag_strings(clause: dict) -> list[str] | None:
     return ["&".join(f"{k}={v}" for k, v in combo) for combo in combos]
 
 
-def _tag_to_poi_type_map() -> tuple[dict[str, str], dict[str, str]]:
-    """Reverse of poi_types.csv's tag clauses: which poi_type a corrected tag belongs to.
+def _tag_to_poi_types_map() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Reverse of poi_types.csv's tag clauses: which poi_types a corrected tag belongs to.
 
-    Returns (tag_string -> poi_type, wildcard_key -> poi_type). First poi_type in
-    config/poi_types.csv row order wins a tag string, matching the "first match wins"
-    convention already used elsewhere (e.g. poi_dedup.py's ownership resolution).
+    Returns (tag_string -> {poi_type}, wildcard_key -> {poi_type}). A tag legitimately
+    belongs to SEVERAL poi_types -- the aggregative architecture has landuse=forest feeding
+    natural_aesthetic, deep_quietness and high_nature_immersion at once -- so every owner is
+    kept, not just the first in row order. Resolving to a single owner silently deleted a
+    relabeled POI from every other poi_type that legitimately wanted it. The invariant that
+    matters is that co-owners sit in different services (config/services.csv).
     """
-    tag_to_poi_type: dict[str, str] = {}
-    wildcard_key_to_poi_type: dict[str, str] = {}
+    tag_to_poi_type: dict[str, set[str]] = {}
+    wildcard_key_to_poi_type: dict[str, set[str]] = {}
     path = os.path.join("config", "poi_types.csv")
     with open(path, encoding="utf-8") as f:
         for row in csv.DictReader(f):
@@ -1018,12 +1153,11 @@ def _tag_to_poi_type_map() -> tuple[dict[str, str], dict[str, str]]:
                 strings = _enumerate_clause_tag_strings(clause)
                 if strings is None:
                     for key, wanted in clause.items():
-                        if wanted is True and key not in wildcard_key_to_poi_type:
-                            wildcard_key_to_poi_type[key] = poi_type
+                        if wanted is True:
+                            wildcard_key_to_poi_type.setdefault(key, set()).add(poi_type)
                     continue
                 for s in strings:
-                    if s not in tag_to_poi_type:
-                        tag_to_poi_type[s] = poi_type
+                    tag_to_poi_type.setdefault(s, set()).add(poi_type)
 
             # Shapefile mode (Paris): poi_raw_tag is the raw TYPEQU code directly, and
             # poi_from_shp() already uses this same "labels" column to decide which
@@ -1034,8 +1168,8 @@ def _tag_to_poi_type_map() -> tuple[dict[str, str], dict[str, str]]:
             except Exception:
                 labels = []
             for label in labels:
-                if isinstance(label, str) and label not in tag_to_poi_type:
-                    tag_to_poi_type[label] = poi_type
+                if isinstance(label, str):
+                    tag_to_poi_type.setdefault(label, set()).add(poi_type)
     return tag_to_poi_type, wildcard_key_to_poi_type
 
 
@@ -1147,17 +1281,34 @@ def _load_relabels() -> dict:
     return data
 
 
-def _resolve_tag_poi_type(tag: str, tag_map: dict[str, str], wildcard_map: dict[str, str]) -> str | None:
-    """poi_type owning a tag string: exact match first, then wildcard-key fallback."""
+_MANUAL_MERGES_CACHE: dict[str, dict] = {}
+MANUAL_MERGES_PATH = os.path.join("tools", "gi_bi_relabeling", "manual_merges.json")
+
+
+def _load_manual_merges() -> dict:
+    """Cached read of the manual-relabeling tool's manual_merges.json artifact."""
+    if "data" in _MANUAL_MERGES_CACHE:
+        return _MANUAL_MERGES_CACHE["data"]
+    data = {}
+    if os.path.exists(MANUAL_MERGES_PATH):
+        try:
+            with open(MANUAL_MERGES_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            print(f"[POI] Could not read {MANUAL_MERGES_PATH}: {exc}")
+    _MANUAL_MERGES_CACHE["data"] = data
+    return data
+
+
+def _resolve_tag_poi_types(tag: str, tag_map: dict[str, set[str]], wildcard_map: dict[str, set[str]]) -> set[str]:
+    """Every poi_type owning a tag string: exact match first, then wildcard-key fallback."""
     if tag in tag_map:
         return tag_map[tag]
+    out: set[str] = set()
     for part in tag.split("&"):
-        if "=" not in part:
-            continue
-        key = part.split("=", 1)[0]
-        if key in wildcard_map:
-            return wildcard_map[key]
-    return None
+        if "=" in part:
+            out |= wildcard_map.get(part.split("=", 1)[0], set())
+    return out
 
 
 def apply_relabels(poi, poi_type: str, cache_slug: str, city_poi_dir: str, buffer_m: float):
@@ -1173,7 +1324,7 @@ def apply_relabels(poi, poi_type: str, cache_slug: str, city_poi_dir: str, buffe
     if not relabels or "geometry" not in poi.columns:
         return poi
 
-    tag_map, wildcard_map = _tag_to_poi_type_map()
+    tag_map, wildcard_map = _tag_to_poi_types_map()
     from utils.poi_identity import SOURCE_KEY_COLUMNS
 
     def row_source_key(frame, i, geoms):
@@ -1184,7 +1335,8 @@ def apply_relabels(poi, poi_type: str, cache_slug: str, city_poi_dir: str, buffe
     current_keys = [row_source_key(poi, i, geoms) for i in range(len(poi))]
 
     keep_mask = []
-    for key in current_keys:
+    kept_overrides = {}  # position -> corrected raw tag, for rows staying in this frame
+    for i, key in enumerate(current_keys):
         entry = relabels.get(key)
         if entry is None:
             keep_mask.append(True)
@@ -1193,8 +1345,19 @@ def apply_relabels(poi, poi_type: str, cache_slug: str, city_poi_dir: str, buffe
         if new_tag == "removed":
             keep_mask.append(False)
             continue
-        target = _resolve_tag_poi_type(new_tag, tag_map, wildcard_map)
-        keep_mask.append(target is None or target == poi_type)
+        owners = _resolve_tag_poi_types(new_tag, tag_map, wildcard_map)
+        # Membership, not ownership: keep the row wherever the corrected tag is one of THIS
+        # poi_type's own clauses. A tag with no known owner is kept everywhere it already is.
+        keep = not owners or poi_type in owners
+        keep_mask.append(keep)
+        if keep:
+            kept_overrides[i] = new_tag
+
+    if kept_overrides and "poi_raw_tag" in poi.columns:
+        poi = poi.copy()
+        col = poi.columns.get_loc("poi_raw_tag")
+        for i, new_tag in kept_overrides.items():
+            poi.iloc[i, col] = new_tag
 
     present_keys = {k for k, keep in zip(current_keys, keep_mask) if keep}
     if not all(keep_mask):
@@ -1203,7 +1366,7 @@ def apply_relabels(poi, poi_type: str, cache_slug: str, city_poi_dir: str, buffe
     pull_in_keys = [
         key for key, entry in relabels.items()
         if entry.get("new_tag") not in (None, "removed")
-        and _resolve_tag_poi_type(entry["new_tag"], tag_map, wildcard_map) == poi_type
+        and poi_type in _resolve_tag_poi_types(entry["new_tag"], tag_map, wildcard_map)
         and key not in present_keys
     ]
     if pull_in_keys:
@@ -1225,6 +1388,71 @@ def apply_relabels(poi, poi_type: str, cache_slug: str, city_poi_dir: str, buffe
     return poi
 
 
+def apply_manual_merges(poi, poi_type: str, cache_slug: str, city_poi_dir: str, buffer_m: float):
+    """Apply saved manual merges (tools/gi_bi_relabeling/manual_merges.json) to poi_type's result.
+
+    Each group's fragment_keys list is authoritative and overwrites whatever the
+    distance-based automatic merge (merge_nearby_polygon_pois) already did: any row
+    whose geometry contains a fragment listed in ANY group's fragment_keys (its own or
+    another's) is dropped, then one row per group is added back — resolved to this
+    poi_type via its tag, same as apply_relabels — unioning exactly the fragments the
+    group currently lists, fetched fresh from the city-wide universe. A group left with
+    no fragments is a removed POI: its own key still gets dropped, nothing is added
+    back for it. A fragment removed from a group with no replacement group recorded
+    anywhere in the file is untouched by this function — the file only records current
+    state, not history, so it's indistinguishable from a fragment nobody ever reviewed.
+    """
+    merges = _load_manual_merges()
+    if not merges or "geometry" not in poi.columns:
+        return poi
+
+    tag_map, wildcard_map = _tag_to_poi_types_map()
+
+    def belongs_here(entry) -> bool:
+        """Same membership rule as apply_relabels: a merged forest feeds every nature
+        poi_type listing landuse=forest, not just the first one in row order."""
+        owners = _resolve_tag_poi_types(entry["tag"], tag_map, wildcard_map)
+        return poi_type in owners if owners else entry.get("poi_type") == poi_type
+
+    touched_keys = {
+        k for entry in merges.values() for k in entry.get("fragment_keys", [])
+    } | {
+        group_id for group_id, entry in merges.items() if not entry.get("fragment_keys")
+    }
+    if not touched_keys:
+        return poi
+
+    index = _universe_source_key_index(cache_slug, city_poi_dir, buffer_m)
+    touched_centroids = [index[k]["geometry"].centroid for k in touched_keys if k in index]
+
+    geoms = poi.geometry.to_numpy()
+    drop_mask = [any(g.buffer(1e-7).contains(c) for c in touched_centroids) for g in geoms]
+    if any(drop_mask):
+        poi = poi[~pd.Series(drop_mask, index=poi.index)].reset_index(drop=True)
+
+    new_rows = []
+    for entry in merges.values():
+        fragment_keys = entry.get("fragment_keys")
+        if not fragment_keys or not belongs_here(entry):
+            continue
+        found = [index[k] for k in fragment_keys if k in index]
+        if not found:
+            continue
+        row = found[0]["row"].copy()
+        row["geometry"] = unary_union([f["geometry"] for f in found])
+        row["poi_raw_tag"] = entry["tag"]
+        if "name" in row.index:
+            names = sorted({f["row"].get("name") for f in found if f["row"].get("name")})
+            row["name"] = "; ".join(names) if names else row.get("name")
+        new_rows.append(row)
+
+    if new_rows:
+        added = gpd.GeoDataFrame(new_rows, geometry="geometry", crs=poi.crs)
+        poi = gpd.GeoDataFrame(pd.concat([poi, added], ignore_index=True), crs=poi.crs)
+
+    return poi
+
+
 def _flatten_osm_index(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """Promote OSMnx's default (element_type, osmid) index into real columns.
 
@@ -1239,6 +1467,9 @@ def _flatten_osm_index(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
 def _download_poi_for_place(place_name: str, query_tags: TagClause, buffer_m: float = 0.0):
     """Download POIs for one place, optionally expanding the query area by buffer_m metres."""
+    # OSMnx has no exclusion syntax: download the positive tags, then _filter_by_clause
+    # applies the "!" exclusions locally on the result.
+    query_tags = {k: v for k, v in query_tags.items() if not str(k).startswith("!")}
     if buffer_m > 0:
         place_gdf = ox.geocode_to_gdf(place_name)
         if place_gdf.empty:
@@ -1298,6 +1529,93 @@ def _coord_pair_from_lon_lat(pair):
     if not math.isfinite(float(lon)) or not math.isfinite(float(lat)):
         return None
     return (float(lat), float(lon))
+
+
+# Polygon POIs count as several POIs in the accessibility aggregation once they get
+# large enough, so every read path needs the surface in m^2. Measured here, next to the
+# raw GeoJSON rings, because the flattened __snap_vertices list _read_geojson_without_gdal
+# builds below concatenates holes and multipolygon parts into one undifferentiated
+# sequence and cannot be turned back into an area.
+_GEOD = Geod(ellps="WGS84")
+
+
+def _ring_area_m2(ring) -> float:
+    """Absolute geodesic area of one lon/lat ring; 0.0 if it isn't a usable ring."""
+    lons, lats = [], []
+    for pair in ring or []:
+        coord = _coord_pair_from_lon_lat(pair)
+        if coord is None:
+            return 0.0
+        lats.append(coord[0])
+        lons.append(coord[1])
+    if len(lons) < 3:
+        return 0.0
+    return abs(_GEOD.polygon_area_perimeter(lons, lats)[0])
+
+
+def _geojson_polygon_area_m2(geometry_obj) -> float | None:
+    """Surface of a (Multi)Polygon GeoJSON geometry in m^2; None for any other type.
+
+    Holes are subtracted, so a polygon with a courtyard reports the surface it actually
+    covers. Geodesic on WGS84 rather than a projected `.area`: it needs no CRS estimate,
+    never straddles a UTM zone, and measured ~0.08% closer to truth than the UTM round
+    trip on Cagliari- and Paris-sized test polygons. Plain lon/lat lists keep this clear
+    of GDAL/GEOS, like the rest of this reader.
+    """
+    if not isinstance(geometry_obj, dict):
+        return None
+    gtype = geometry_obj.get("type")
+    coords = geometry_obj.get("coordinates")
+    if gtype == "Polygon":
+        polygons = [coords]
+    elif gtype == "MultiPolygon":
+        polygons = list(coords or [])
+    else:
+        return None
+
+    total = 0.0
+    for rings in polygons:
+        rings = list(rings or [])
+        if not rings:
+            continue
+        total += _ring_area_m2(rings[0]) - sum(_ring_area_m2(r) for r in rings[1:])
+    return max(total, 0.0)
+
+
+def polygon_areas_m2(poi) -> pd.Series:
+    """Per-row polygon surface in m^2, NaN for non-polygon rows, for either POI frame form.
+
+    Cached-GeoJSON frames already carry "__poly_area_m2", stamped by
+    _read_geojson_without_gdal against the raw rings. Real-geometry frames -- a fresh OSM
+    download, and every shapefile-sourced POI, i.e. all of Paris -- are measured here
+    instead, routed through the same _geojson_polygon_area_m2 via __geo_interface__ so both
+    cities share one definition of "surface".
+
+    Do NOT be tempted to call pyproj's Geod.geometry_area_perimeter on the geometry
+    directly: it does not normalize ring orientation, so it ADDS interior rings instead of
+    subtracting them (a 1 km square with a 25% courtyard measures 1.25 km^2, not 0.75), and
+    it returns a nonzero area for a LineString. Going through __geo_interface__ keeps the
+    ring-by-ring handling that gets both cases right.
+
+    Costs ~5.5s for the 90k polygons of the Paris POI shapefile, so no progress bar.
+    """
+    if poi is None or len(poi) == 0:
+        return pd.Series(dtype="float64")
+    if "__poly_area_m2" in poi.columns:
+        return pd.to_numeric(poi["__poly_area_m2"], errors="coerce")
+    if "geometry" not in poi.columns:
+        return pd.Series(float("nan"), index=poi.index, dtype="float64")
+
+    out = []
+    for geom in poi["geometry"].to_numpy():
+        value = None
+        if geom is not None:
+            try:
+                value = _geojson_polygon_area_m2(geom.__geo_interface__)
+            except Exception:
+                value = None
+        out.append(float("nan") if value is None else float(value))
+    return pd.Series(out, index=poi.index, dtype="float64")
 
 
 def _geojson_vertices(geometry_obj) -> list[tuple[float, float]]:
@@ -1371,6 +1689,9 @@ def _read_geojson_without_gdal(path: str) -> pd.DataFrame:
     construction. On the Paris workload, several apparently harmless GEOS/Shapely
     property calls hard-crash the interpreter. Snapping only needs stable source keys
     and candidate coordinates, so cached GeoJSON stays as plain Python data here.
+
+    Polygon rows also carry "__poly_area_m2": the surface must be read off the real
+    rings here, since "__snap_vertices" below flattens them beyond recovery.
     """
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -1389,6 +1710,7 @@ def _read_geojson_without_gdal(path: str) -> pd.DataFrame:
         row["__snap_vertices"] = vertices if len(vertices) > 1 else None
         gtype = geometry_obj.get("type", "") if isinstance(geometry_obj, dict) else ""
         row["__geometry_type"] = gtype
+        row["__poly_area_m2"] = _geojson_polygon_area_m2(geometry_obj)
         row["__snap_line_parts"] = _geojson_line_parts(geometry_obj)
         row["__geometry_token"] = _compact_geometry_token(gtype, vertices)
         rows.append(row)
@@ -1490,8 +1812,11 @@ def get_poi(
                     if poi is not None and not poi.empty:
                         poi = _stamp_poi_raw_tag(poi, tags)
                         poi = merge_nearby_polygon_pois(poi)
+                        poi = reclassify_by_area(poi)
+                        poi = merge_nearby_polygon_pois(poi, distance_by_raw_tag=FOREST_MERGE_DISTANCES)
                         if poi_type:
                             poi = apply_relabels(poi, poi_type, poi_cache_slug, city_poi_dir, buffer_m)
+                            poi = apply_manual_merges(poi, poi_type, poi_cache_slug, city_poi_dir, buffer_m)
                         # Persist the per-query result as a fast-path cache, but treat this as
                         # best-effort: when the universe was loaded from the on-disk GeoJSON cache
                         # it comes back as a plain DataFrame (see _read_geojson_without_gdal, which
@@ -1533,8 +1858,11 @@ def get_poi(
                 poi = feature_from_shapefile(cfg.name_shapefile, query_tags={}, poi_type=poi_type)
                 poi = _stamp_poi_raw_tag(poi, None)
                 poi = merge_nearby_polygon_pois(poi)
+                poi = reclassify_by_area(poi)
+                poi = merge_nearby_polygon_pois(poi, distance_by_raw_tag=FOREST_MERGE_DISTANCES)
                 if poi_type:
                     poi = apply_relabels(poi, poi_type, poi_cache_slug, city_poi_dir, buffer_m)
+                    poi = apply_manual_merges(poi, poi_type, poi_cache_slug, city_poi_dir, buffer_m)
             else:
                 if tags:
                     if not isinstance(tags, dict):
@@ -1550,8 +1878,11 @@ def get_poi(
                 poi = _download_poi_for_place(place_name, query_tags, buffer_m=buffer_m)
                 poi = _stamp_poi_raw_tag(poi, query_tags)
                 poi = merge_nearby_polygon_pois(poi)
+                poi = reclassify_by_area(poi)
+                poi = merge_nearby_polygon_pois(poi, distance_by_raw_tag=FOREST_MERGE_DISTANCES)
                 if poi_type:
                     poi = apply_relabels(poi, poi_type, poi_cache_slug, city_poi_dir, buffer_m)
+                    poi = apply_manual_merges(poi, poi_type, poi_cache_slug, city_poi_dir, buffer_m)
         except Exception as e:
             print(
                 f"[POI] No POIs found for city={place_name}, poi_type={poi_type}, feature={feature}, value={value}, tags={tags}: {e}",

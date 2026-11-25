@@ -1499,3 +1499,995 @@ nothing currently maps "a corrected tag string" back to which query owns it).
     `raw_fragments.geojson` tag vocabularies now 19/19 matching, and a spot-checked
     POI's `member_keys` now correctly lists multiple real fragments instead of just
     itself.
+
+## 2026-09-17
+
+- Push to origin failed with `HTTP 408` because the pending commit included ~430MB of
+  generated interface data (`data.geojson`/`raw_fragments.geojson` for both cities,
+  plus the two delivery `.zip` files — Paris's `data.geojson` alone was 223MB).
+  Untracked those (they stay on disk, gitignored — `poi_type_order.json`/
+  `relabels.json`/`manual_merges.json` too, matching the project's existing
+  convention of not committing generated/`outputs/`-style data) and amended the
+  commit. Hit local git corruption while doing this (`refs/heads/main` pointing at a
+  0-byte commit object, `bad object HEAD`) — traced to an interrupted write from the
+  previous session's abrupt termination, not anything in this session; repaired by
+  removing the empty loose objects and repointing `main` back at the last intact
+  commit before redoing the amend. On push, found `origin/main` already had a
+  content-identical commit (same tree, same parent) from before that crash — the
+  earlier session's push had actually completed even though its local write hadn't —
+  so no merge was needed, just aligned local `main` to it directly.
+- Added a "mark approved" feature to the relabeling interface (`tools/gi_bi_relabeling/`
+  and `tools/gi_bi_relabeling_paris/`, kept byte-identical as always) so a colleague
+  can track review progress across a large POI set: selecting a POI now auto-approves
+  it (`setApproved(props, true)`, skipped if already approved, to avoid redundant
+  saves); a new yellow "To approve" button in the detail panel removes it from the
+  approved set (`setApproved(props, false)`) — since selection already approves,
+  this button functions as "send back for re-check"; a new "Show approved" checkbox
+  toggle renders approved POIs gray with a green tick marker (reusing the existing
+  pencil/⛓ marker mechanism) when on, otherwise POIs render in their normal category
+  color regardless of approval state. Persisted to a new `approvals.json` via a new
+  `/save_approval` endpoint in `server.py` (both copies) — required adding generic
+  `remove` support to the existing single endpoint handler (previously write-only,
+  every payload just overwrote a key; a `{"remove": true}` payload now deletes it
+  instead), reused as-is for this endpoint rather than writing a second handler.
+  Deliberately did *not* route approve/unapprove/toggle through the existing
+  `loadAndRender()` full-reload path used by relabel/merge saves: auto-approve fires
+  on every single click, and a full reload (re-fetch every JSON file, rebuild every
+  Leaflet layer) per click would be painfully slow on Paris's 50k+ shapes — instead
+  added `restyleApproved()`/`refreshApprovedMarker()` to update just the one affected
+  layer's style and marker in place; `layersBySourceKey` entries gained a `group`
+  field so a marker can be added to the right parent layer without a full rebuild.
+  Verified with a real Playwright session against the live Cagliari server (bypassing
+  fragile click-simulation via direct `showDetail()` invocation, per this file's own
+  prior notes on that): auto-approve persists correctly server-side, the "To approve"
+  button removes it (both server-side and via re-fetch), the tick marker renders once
+  its parent group layer is visible on the map, and a non-selected approved POI
+  renders gray (`#9e9e9e`) while a selected one correctly keeps the blue selection
+  highlight — matching existing precedent for merged/relabeled POIs losing their
+  dashed-border cue while selected.
+- Added `tools/gi_bi_relabeling(_paris)/approvals.json` to `.gitignore`, matching
+  `relabels.json`/`manual_merges.json`'s existing per-colleague-working-state
+  treatment.
+
+## 2026-09-21
+
+- Added a "Show OSM basemap" checkbox to the relabeling interface (`tools/gi_bi_relabeling/index.html`
+  and `tools/gi_bi_relabeling_paris/index.html`, kept identical), under "Show approved" in the
+  filters panel. Problem: the OSM tile overlay was always on and couldn't be disabled. Fix: the
+  tile layer is now kept in `osmLayer`, and a `change` handler on `#show-osm-toggle` does
+  `osmLayer.addTo(map)` / `map.removeLayer(osmLayer)` (checked by default). Removing the layer
+  rather than hiding it with CSS also stops the browser fetching tiles while it is off.
+- Changed the zoom-on-category-check behavior in the same two files: `zoomToNearest(group)`
+  (zoomed to the shape closest to the map center) became `zoomToFirstUnapproved(group)`, which
+  zooms to the first shape in the category (file order) with no entry in `approvals`. It reads
+  `approvals` directly, so it works whether or not "Show approved" is on, skips icon markers
+  (no `feature`), and leaves the map untouched if every POI in the category is approved. The
+  checkbox handler was updated to call the new name.
+- Enforced "a fragment belongs to one POI only" in the relabeling tool's server
+  (`tools/gi_bi_relabeling/server.py` and `_paris/`, identical apart from the port).
+  Problem: `manual_merges.json` from a colleague had 25 fragments claimed by several
+  groups (saved once from each starting shape, plus partial overlaps), because
+  `/save_manual_merge` just overwrote one key. Fix: new `_release_fragments()` strips the
+  fragments a saved group now claims from every other group, and deletes any other group
+  left with no fragments (a POI with no fragments is a removed POI). `do_POST` calls it
+  for merge saves only, stamps a global progressive `seq` inside every saved record
+  (`_next_seq()`: 1 + highest `seq` across relabels/merges/approvals, so the order of
+  interface operations can be reconstructed), and the merge reply now returns the updated
+  `merges` dict. Tested on a scratch copy of the server with the cleaned Cagliari merges:
+  10 moves of one fragment between 10 different pairs of multi-fragment POIs — each time
+  the fragment ended up only in the new POI, the original kept the rest, the reply matched
+  the file and `seq` increased; plus a check that a group losing its last fragment is
+  deleted.
+- Split/Merge saving is now explicit (`index.html`, both copies): clicking fragments only
+  changes the on-screen selection (`toggleFragment` no longer POSTs); a new green
+  "Confirm Merge / Split" button (`confirmSplitMerge`) sends one save, adopts the server's
+  `merges`, and reloads; the old exit button is now "Cancel" and saves nothing. Problem:
+  saving on every click meant a misclick already stripped fragments from other POIs, gave
+  every click its own `seq`, and "Exit Split/Merge" gave no sign that it saved.
+- New one-off `tools/gi_bi_relabeling/clean_manual_merges.py` (knobs at the top, refuses
+  to overwrite its output) cleans the colleague's existing `manual_merges.json`: biggest
+  group claims shared fragments first, fully-covered duplicates and empty groups are
+  dropped, groups with a partial overlap are flagged and removed from `approvals.json`.
+  Ran it: 52 groups -> 42; 2 flagged (`859310867`, `859310868`); none were in our local
+  approvals. Deliberately not the "non-original POI wins" rule, which swaps the two
+  fragments of every mutually-merged pair. The colleague's `relabels 1.json` (94
+  relabels, all keys present in our data) was copied in as `relabels.json`.
+- Added an "Include points" toggle to the Cagliari relabeling page only. Problem: point
+  POIs (e.g. Mercato di San Benedetto, a `amenity=marketplace` node) are in the pipeline's
+  POI cache but were dropped from the interface export, which kept only shapes.
+  `exports/generate_gi_bi_relabeling_export.py`: new `_load_all_points()` and a
+  Cagliari-only write of `tools/gi_bi_relabeling/points.geojson`. `index.html`: when the
+  toggle is on, `loadAndRender` fetches that file and adds the points to the features
+  (same groups/colours as shapes of the same poi_type+tag, drawn as circle markers via
+  `layerCenter()` where bounds were used); relabel/remove/approve work through the same
+  `source_key`-keyed files, and the Split/Merge button is not drawn for points. Not yet
+  run: the export must be re-run with `CITY = "cagliari"` to produce `points.geojson`.
+
+## 2026-09-25
+
+- Wired `manual_merges.json` into the pipeline (`utils/graphml.py`): new `_load_manual_merges()`
+  (mirrors `_load_relabels`) and `apply_manual_merges()`, called right after `apply_relabels()`
+  at all three `get_poi()` call sites so the merged result is baked into the per-query
+  `tags_<hash>.geojson` cache and paid for once. Chosen over resolving merges earlier inside
+  `merge_nearby_polygon_pois()` because the automatic merge is already cached, so the manual
+  pass is the only new work; the earlier option would have touched the caching path every
+  poi_type and city goes through. Each group's `fragment_keys` is authoritative: any row whose
+  geometry contains a referenced fragment's centroid is dropped (bounded, ~150 fragments, the
+  same containment test the interface exporter already uses), then one row per group is added
+  back unioning exactly the listed fragments pulled from the city-wide universe. A group left
+  with no fragments is treated as a removed POI. Verified against the real Cagliari data: a
+  6-fragment group collapses to exactly one row with no fragment leaking through as its own POI,
+  and a relabelled-away POI disappears from its stale poi_type while appearing under the one its
+  corrected tag resolves to.
+- Fixed a pre-existing gap in `apply_relabels()` found while verifying the above: the keep path
+  decided drop-vs-keep but never wrote the corrected tag onto rows it kept, so a POI already
+  present in its target poi_type by natural query match stayed stamped with its old
+  `poi_raw_tag` (only pulled-in rows got the correction). Now `kept_overrides` stamps it before
+  the drop filter. Only the relabeling interface's exporter reads `poi_raw_tag`; no scoring
+  stage does, so the impact was confined to what the tool displayed.
+- Audited `config/poi_types.csv` against the `Aggregative architecture` sheet of
+  `parametrisation_capabilities_mgp.xlsx` after noticing forests never appear under
+  `high_nature_immersion` in the interface. That display behaviour is not a bug: the exporter
+  dedups each POI to the first poi_type claiming its tag in CSV order, so `natural_aesthetic`
+  takes all 91 forests and `deep_quietness` shows 0 rows, while the pipeline itself still counts
+  forests for all three. The audit did surface a real invariant to enforce -- a POI may feed
+  several poi_types only when they sit in different services -- which the Excel respects (all 25
+  multi-assigned codes span different services) but the config violated in 89 places.
+  Fixed the 7 green/blue discrepancies so all 21 GI/BI tags now match the sheet exactly: dropped
+  `pond` (BI02 is `accessible_nature` only, 29 of the violations), `grassland` and `meadow` from
+  `perceived_nature`; added `natural=tree` (GI12) there; added `grassland`/`meadow` to
+  `high_nature_immersion` (GI06/GI07 list k15); added `reflecting_pool` to `designed_aesthetic`
+  (BI06 lists k5); dropped `leisure=common` from `relative_quietness` (GI03 is k6+k16 only).
+  Note `natural=tree` changes the universe tag set, so its cache hash changed and forced a fresh
+  120s Overpass download; the old 71MB `all_tags_*.geojson` is now orphaned and can be deleted.
+- Added exclusion syntax to tag clauses (`utils/graphml.py`) so the Excel's `Inclusion criteria`
+  column can be expressed in config: a `"!key"` entry in a clause means "match this tag EXCEPT
+  where the qualifier matches", with an absent column passing (the residual case the bare clause
+  is meant to keep). `_filter_by_clause` applies it; `_row_raw_tags`,
+  `_enumerate_clause_tag_strings` and `_build_city_query_batches` skip `!` keys so exclusions
+  never become part of a POI's tag identity nor of the download query, and
+  `_download_poi_for_place` strips them since OSMnx has no exclusion syntax. Unit-tested:
+  a clause and its negation partition the rows exactly, an absent column excludes nothing,
+  `"!key": true` means the key must be absent, and semicolon multi-values still match.
+- Used it to settle the 6 remaining config-level same-service conflicts, each motivated by the
+  sheet's two orthogonal axes (access: mediated/controlled vs free; setting: indoor vs outdoor),
+  with the qualified poi_type winning and the bare clause narrowed to the residual:
+  `organised_sport_indoor`'s bare `leisure=sports_centre` now excludes k2's outdoor disciplines;
+  `informal_sport_outdoor`'s `leisure=pitch` excludes `access=private/customers/members`
+  (k4 is "accesso libero"); `informal_sport_indoor`'s `sport=fitness` excludes
+  `leisure=fitness_station` (all 21 overlapping POIs were outdoor calisthenics parks, k4's F109);
+  `informal_sport_outdoor`'s `swimming_pool` excludes indoor/building pools; its `sport=climbing`
+  excludes `sports_centre`/`fitness_centre` (k1's F127 artificial wall); and
+  `residential_social_care`'s catch-all excludes `workshop`/`shelter` (k33 requires "alloggio").
+  Same-service overlaps went 89 -> 13. The 13 left are data-level, not config: single POIs
+  carrying two different OSM tags (e.g. "Foresta Demaniale del Campidano" tagged both
+  `leisure=park` and `landuse=forest`), which is exactly what the relabeling interface exists
+  to resolve. Watch out when editing `config/poi_types.csv` with a script: the file is CRLF and
+  a naive Python rewrite silently converts it to LF.
+- Replaced single-owner tag resolution with a membership test (`utils/graphml.py`), the fix the
+  whole poi_type audit was leading to. `_tag_to_poi_type_map()`/`_resolve_tag_poi_type()` became
+  `_tag_to_poi_types_map()`/`_resolve_tag_poi_types()`, returning the SET of poi_types owning a
+  tag instead of the first one in CSV row order; `apply_relabels()` now keeps a row wherever the
+  corrected tag is among this poi_type's own clauses (`not owners or poi_type in owners`) and
+  pulls a POI into every poi_type its corrected tag belongs to, and `apply_manual_merges()` uses
+  the same rule via `belongs_here()`. Problem this fixes: resolving to a single owner meant
+  relabelling a POI to a tag shared across services silently deleted it from every poi_type
+  except the first -- relabelling a scrub POI to `landuse=forest` dropped it from
+  `deep_quietness` and `high_nature_immersion` even though both list that tag. Verified on real
+  Cagliari data: that same relabel now lands the POI in natural_aesthetic + deep_quietness +
+  high_nature_immersion and stays out of accessible_nature, exactly as the Excel prescribes.
+  The rule is strictly more permissive than before, which is safe only because the same-service
+  overlaps were eliminated first -- co-owners now always sit in different services. Re-measured
+  after clearing all 44 per-query caches so every poi_type is built by the same code (the first
+  measurement mixed caches written before and after the change): same-service overlaps settled
+  at 12, the 6-fragment merge group still collapses to one row, and all 64 "removed" relabels
+  stay absent from every poi_type. The 12 remaining are the data-level ones -- single POIs
+  carrying two OSM tags that belong to different poi_types -- not config.
+- Fixed "Remove POI" being unusably slow in the Paris relabeling interface (both
+  `tools/gi_bi_relabeling*/index.html`). Problem: `saveRelabel()` ended with
+  `return loadAndRender()`, so every removal or tag change re-fetched `data.geojson`
+  (222MB) plus `raw_fragments.geojson` (122MB), re-parsed both and rebuilt all 50,594
+  Leaflet layers and the whole filter list -- ~344MB per click. Unnoticeable on Cagliari
+  (10MB / 5,598 features), which is why it was never caught. The same problem had already
+  been solved for approvals via `restyleApproved()`; relabel/remove never got the same
+  treatment. Fix: new `applyRelabelInPlace()` updates ONE POI -- moves its layer between
+  group layers, restyles it, swaps its edited/removed icon and adjusts both groups' filter
+  counts -- and returns false when the corrected tag's group isn't rendered yet so
+  `saveRelabel()` falls back to the full rebuild and correctness never rides on the fast
+  path. Supporting state added: `editedMarkerBySourceKey` (mirrors the existing
+  `approvedMarkerBySourceKey` so the icon can be swapped without a rebuild), a global
+  `tagToPoiTypeMap`, plus `countByGroup`/`labelTextByGroup` to update counts in place.
+  Also fixed a latent bug this would have exposed: the per-feature `mouseout` handler
+  captured its group's colour at build time, so a POI moved to another group snapped back
+  to the old colour on hover -- it now reads the live colour from `layersBySourceKey`.
+  Porting to Paris needed `layerCenter()` copied across too: it arrived with the
+  Cagliari-only points work, and the ported `refreshEditedMarker()` calls it, so Paris
+  would have thrown ReferenceError on the first removal. Both files verified to parse
+  (esprima); not yet exercised in a browser.
+
+## 2026-09-29
+
+- Coastline split into independent 500 m point POIs (`utils/graphml.py`: new
+  `split_coastline_into_samples()` + `COASTLINE_SAMPLE_SPACING_M`; `get_poi()` is now a thin
+  wrapper over the renamed `_get_poi_unsplit()`). Problem: `high_nature_immersion` was lowest
+  right on the Cagliari coast (Poetto strip median 0.896 vs city median 0.924). Three causes found:
+  (1) the type aggregation saturates by POI *count* (contribution coefficient 30 → one POI is
+  worth ~8% of the maximum), and the sea side of a coastal hex holds no features, while inland
+  hexes collect hundreds of small grassland/scrub/stream fragments; (2) all 37 connected
+  coastline ways shared the same first sample point, so `geom_vertex_map` in
+  `_build_poi_snap_map` overwrote their source keys and the whole coast collapsed into one POI;
+  (3) walk/bike/drive route to each POI's `source_coord` (first point), never to the nearest of
+  the 500 m snap candidates (only bus picks the nearest) — for the 103.5 km coastline that point
+  is near Sarroch, ~20 km away, so a hex 21 m from Poetto got the same coastline value (0.41) as
+  one 4.8 km inland (0.45). Fix (chosen over emitting per-sample POIs inside the snapping stage,
+  which the POI export and dedup would never have seen): every `get_poi()` read now merges the
+  connected `natural=coastline` ways and replaces them with one point row every 500 m (Cagliari:
+  38 ways → 213 points), ids `coastline_500m_NNNN` (`osmid` cleared so `build_poi_source_key`
+  keys them by `id`), tags copied so dedup still sees `natural=coastline`. Applies to both
+  `high_nature_immersion` and `natural_aesthetic` (same ids, so the export merges them into one
+  record with both types). Works on both the real-geometry GeoDataFrame and the no-GDAL token
+  DataFrame; the on-disk per-query caches stay unsplit, so the relabeling tool still sees the
+  original lines. To reuse it here, `_line_geometry_from_item` moved from
+  `stages/snapping_stage.py` to `utils/line_merge.py` as `line_parts_from_item` (identical
+  body; `delta_g._is_geometry` replaced by the same `isinstance(geom, BaseGeometry)` check).
+  Verified on the cached Cagliari data: 213 unique sample keys, every non-coastline source key
+  unchanged, `accessible_nature` unaffected. Offline estimate: Poetto 0.857 → ~0.898, Giorgino
+  0.578 → ~0.925. Not yet run end to end. Caveat: `impedances.npz`, the non-bus per-node caches
+  and the snap caches never check POI content, so they must be deleted by hand for the split to
+  take effect (the bundle ignores every `poi_types.csv` change too — pre-existing gap, not fixed
+  here). Cause (3) is also still open for every other line/polygon POI.
+  **Reverted the same day**: the 500 m samples are *access points*, not POIs
+  (`split_coastline_into_samples()`, `COASTLINE_SAMPLE_SPACING_M` and `_COASTLINE_RAW_TAG`
+  deleted, the `get_poi()` wrapper dropped and `_get_poi_unsplit()` renamed back to
+  `get_poi()`, 67 lines out; the now-unused `utils.line_merge` import removed —
+  `line_merge.py` itself stays, `stages/snapping_stage.py` still uses all three helpers).
+  Cause (1) above is void: the contribution/saturation coefficients it reasoned from are
+  themselves wrong and are being reworked separately, so "one POI is worth ~8% of the
+  maximum" is not a fact to design against. That leaves cause (3) as the real defect, now
+  fixed at its source instead of worked around: in
+  `utils/delta_g.accessibility_non_bus_from_snap_map`, the per-POI nearest-access-point
+  selection (`_best_snap_candidate_coord` over the compact CSR `cand_coords`/`cand_ptr`)
+  moved from below the per-mode routing loop to above it, and walk/bike/drive now snap to
+  that `poi_coords` array instead of `source_coords` — the filtered `source_coords` is gone
+  entirely, `source_coords_all` stays for the radius pre-filter and the no-candidate
+  fallback. Bus/subway read the same array as before, so `in_radius`/`dest_col` are
+  bit-identical. Nothing had to be added to keep the coast's 500 m access points: the
+  snapping stage already samples every line POI at `LINE_SNAP_SPACING_M = 500.0` into
+  candidates — they were simply never used by the non-bus modes. This fixes cause (3) for
+  *every* line and polygon POI (rivers, parks, forests), not just the coast, so all non-bus
+  impedances change and the same caches as above must be deleted by hand. Verified:
+  `graphml`/`delta_g` import clean, no dangling references, and on a Poetto-shaped case the
+  selector returns an access point 0.070 km away where the first sample is 25.4 km. Still
+  open: the coast collapses to one POI through a `geom_vertex_map` key collision
+  (`(poi_key, first_candidate_coord)`, last writer wins) rather than deliberately — the
+  desired result here, but it silently drops source keys for any multi-way line POI.
+
+- `config/poi_types.csv`: dropped `waterway=stream` from `natural_aesthetic` and
+  `high_nature_immersion` — the `{"waterway": "stream"}` clause plus the `waterway_stream`
+  and `BI08` labels (`BI08` *is* `waterway=stream`, per `config/osm_raw_tag_codes.csv`). No
+  code references streams. Note this is the repo's only CRLF file: a naive text rewrite
+  flattens all 37 lines to LF and buries the real diff (hit and restored while making this
+  edit). Pre-existing and untouched: the `cultural_production` row's `tags` column does not
+  parse as a Python literal.
+
+- `utils/graphml.py`: new `_geojson_polygon_area_m2()` / `_ring_area_m2()`, and
+  `_read_geojson_without_gdal()` now stamps `__poly_area_m2` on polygon rows. The surface
+  must be measured there, off the raw GeoJSON rings, because the `__snap_vertices` list that
+  same reader builds concatenates holes and multipolygon parts into one undifferentiated
+  sequence from which no area is recoverable. Geodesic on WGS84 via
+  `pyproj.Geod.polygon_area_perimeter` (plain lon/lat lists, so no GDAL/GEOS — the entire
+  point of that reader), holes subtracted: ~0.08% closer to truth than a UTM `.area` round
+  trip, and 0.3% closer than an equirectangular shoelace at Paris latitude. Written for a
+  polygon-counts-as-n-POIs rule that was then dropped (it depended on the same wrong
+  coefficients); kept because the scrub/heath/grass area thresholds need the same column.
+  On the cached Cagliari universe: 5 739 polygons all get an area, 4 614 non-polygons all
+  get `None`, median 979 m², max 405 km² (Monti dei Sette Fratelli).
+
+- Area-based land-cover reclassification (`utils/graphml.py`): new `polygon_areas_m2()`,
+  `_RECLASSIFY_RULES` + `reclassify_by_area()`, knobs `SCRUB_MIN_AREA_M2 = 2_000_000` /
+  `GRASS_MAX_AREA_M2 = 200` / `FOREST_MERGE_DISTANCE_M = 20.0`, and a
+  `distance_by_raw_tag` parameter on `merge_nearby_polygon_pois()`. Rules: scrub >= 2 km2
+  stays scrub, 200 m2-2 km2 becomes heath, < 200 m2 becomes grass; heath / grassland /
+  meadow < 200 m2 become grass; wood becomes forest unconditionally. Written once in OSM
+  raw-tag terms and applied to either spelling — the `natural`/`landuse` columns for
+  Cagliari, the MGP `TYPEQU` code in `poi_type` for Paris — with the codes read from
+  `config/osm_raw_tag_codes.csv` so the two can't drift. Sequencing at all three
+  `_get_poi_unsplit` call sites is merge -> reclassify -> re-merge (forest at 20 m, rest at
+  10 m), *not* reclassify-first: measured on raw fragments the thresholds demote 2 275
+  Paris and 17 Cagliari polygons to grass purely because the source drew one feature as
+  several pieces (53% of Paris scrub demotions, 87% of its heath ones). `reclassify_by_area`
+  rewrites `poi_raw_tag` in place rather than re-running `_stamp_poi_raw_tag` (which would
+  re-filter every clause, need `tags` threaded in, and duplicate semicolon multi-valued
+  rows); that is what puts ex-woods in the forest merge group, so the re-merge actually
+  unions them — Cagliari forest 153 -> 138 rows, heath 353 -> 336. Areas come from
+  `polygon_areas_m2()`, which reads `__poly_area_m2` on cached frames and measures real
+  geometry via `__geo_interface__` otherwise; note `pyproj.Geod.geometry_area_perimeter`
+  is unusable directly, it ADDS interior rings instead of subtracting (1 km2 square with a
+  25% courtyard measures 1.25 km2) and returns a nonzero area for a LineString. Counts,
+  Cagliari: scrub 480 -> 8, heath 76 -> 540, grassland 485 -> 474, meadow 340 -> 333, grass
+  927 -> 953, wood 70 -> 0, forest 110 -> 179. Paris: scrub 7 132 -> 0 (nothing reaches
+  2 km2), heath 188 -> 3 460, grassland 547 -> 410, meadow 2 329 -> 2 075, grass 43 825 ->
+  48 076, wood 4 552 -> 0, forest 9 348 -> 13 900; all 9 non-land-cover TYPEQU codes
+  untouched. Caveat: `_get_poi_unsplit` returns the per-query cache before reaching any of
+  this, so the 36 `poi/Cagliari/tags_*.geojson` and 120 `poi/mgp_boundary/tags_*.geojson`
+  files must be deleted for it to take effect (keep `all_tags_*.geojson`, the universe).
+  Also still open: on the no-GDAL token-DataFrame fallback both merges no-op (no `geometry`
+  column), so thresholds there run on unmerged fragment areas. Not yet run end to end.
+
+- `config/poi_types.csv` quietness ladder retuned alongside the above: `moderate_quietness`
+  loses wood (which no longer exists) and gains lakes -> grassland + lakes;
+  `relative_quietness` loses lakes to moderate and gains `leisure=common` -> parks, gardens,
+  common; `deep_quietness` unchanged, its existing `{"landuse": "forest"}` clause now
+  collects every ex-wood for free. `deep_quietness` still lists a dead `natural_wood` label
+  (harmless: nothing carries that raw tag now).
+
+- Audited `config/poi_types.csv` against the capability/TYPEQU reference sheet (k9-k17) by
+  resolving each poi_type's tag clauses back through `config/osm_raw_tag_codes.csv` and
+  diffing the resulting code sets, rather than reading the rows by eye. k9/k10/k11 already
+  matched; five gaps found and closed. `high_nature_immersion`: dropped `{"waterway":
+  "river"}` and `wood` from the natural list (wood is dead after the reclassification
+  anyway, but the clause was still there), and widened `{"boundary": "national_park"}` to
+  `["national_park", "protected_area"]` — the sheet asks for protected areas *and* nature
+  reserves, and only the reserve half was configured. `accessible_nature`: reduced to park
+  / garden / common / river — canal, pond and playground were sitting here but belong in
+  `perceived_nature` per the sheet, and `natural=beach` was in the config but not on the sheet
+  at all (removed on request). `perceived_nature`: dropped `{"natural": "tree"}`, gained
+  pond, canal and playground. Labels updated to match in each case; also added the missing
+  `leisure_nature_reserve` / `boundary_national_park` labels to `high_nature_immersion`,
+  whose tag clauses existed with no label, so in shapefile mode (Paris) those two clauses
+  had been selecting nothing. Left alone as pre-existing and unrelated:
+  `leisure_recreation_ground` on `accessible_nature` and `natural_grassland` /
+  `landuse_meadow` on `perceived_nature`, labels with no matching tag clause. All six rows
+  now verify MATCH against the sheet; 36 rows still parse and the file's CRLF endings are
+  intact.
+
+- Interface styles and legend generated from the pipeline palette instead of shipped with
+  the template (`SCRIPT/main.py`: new `load_palette()`, `write_capability_styles()`,
+  `write_service_styles()`, `write_legend_swatches()`, `write_service_legend_panels()`,
+  called from `main()` right after `copy_template`). The template was rendering a
+  superseded scheme -- per-capability white->hue ramps (care pink, nutrition orange,
+  restorativeness blue) -- because those values had been transcribed by hand once and
+  `utils/capabilities.py` moved on to the shared red->green scales afterwards. Now
+  `CAPABILITY_COLOR_STOPS` / `SERVICE_COLOR_STOPS` / `ELECTRE_BOUNDS` /
+  `ELECTRE_SHORT_LABELS` / `ISO_BAND_WIDTHS_MM` are imported at build time (sys.path insert
+  to the repo root) and the JS + PNGs are written from them; a failed import raises
+  SystemExit with an explanation rather than falling back to a baked-in copy, since a
+  silent fallback would reintroduce exactly the drift being removed. The class *breaks*
+  were already right (ELECTRE is [0.2,0.4,0.6,0.8] for both cities) -- only the colours,
+  and the service ramp's shape, were stale: services move from a continuous white->hue
+  gradient to the gpkg's 10 discrete buckets, verified to match `service_step_color` on
+  201 sample values across [0,1]. The generated service styles file defines its own step
+  function, so `resources/functions.js` needs no edit -- `city_config.js` already loads
+  `cagliari6_service_gradient_styles.js` after the per-service style files, so those
+  assignments win. Fixed while regenerating: the hand-written capability styles assigned
+  `style` with no `var` and had no final `else`, so a NaN or out-of-range value leaked a
+  global and rendered undefined. Separately, the legend was already broken before any of
+  this: 42 of the 46 images `new_layers.js` references did not exist (the template ships a
+  `Cagliari3*` set while the layers were renamed `Cagliari6*`), so every layer-switcher
+  swatch was a 404 while 31 stale files sat unused. All 42 are now generated at 16x16 RGBA
+  -- 15 capability class swatches, 11 service mini-ramps (no single colour represents a
+  layer spanning the whole scale any more), 1 grid outline, 15 iso-band outlines. Iso-band
+  widths are rescaled rather than converted: mm->px at 96 dpi gives a 7px border on a 16px
+  tile (a near-solid square), so they are normalised to the 3px the old set topped out at,
+  reproducing its exact 1,1,2,2,3 progression pixel-for-pixel. The three
+  `service_legend_*.png` colourbars are redrawn as the same 10-bucket scale differing only
+  by title. Not touched: `capability_hatch_legend.png` and `styles/qgis/` (hatch density,
+  no colour, and dead code per the user), and the 31 unused `Cagliari3*` files, which
+  `copy_template` still carries into every output. Verified by a full
+  `python main.py --input-dir INPUT_DATA --out-dir ... --template-dir template` run: 46/46
+  legend images resolve, 45/45 `city_config.js` scripts exist, all generated JS parses
+  (esprima).
+
+- Audited `config/services.csv`'s `contribution_coefficient` against the
+  `Contribution function` sheet of `parametrisation_capabilities_mgp.xlsx` (the 2026-09-29
+  download), whose `n0.9` column is the saturation parameter: the number of reachable POIs
+  at which a type reaches 90% of its maximum contribution. The sheet's k1..k36 are in the
+  same order as `config/poi_types.csv`'s rows, so the two line up positionally. 35 of 36
+  matched their tier exactly; `high_nature_immersion` (k15) was configured at 30 while the
+  sheet specifies 5 (V1 "very low" internal variability) -- corrected in the
+  `nature_contact` row, `[30, 50, 80]` -> `[5, 50, 80]`, positional over
+  `['high_nature_immersion', 'accessible_nature', 'perceived_nature']`. Large effect: one
+  reachable nature POI goes from 0.077 to 0.369 of the maximum, and saturation moves from
+  ~30 POIs to 5. This is the coefficient behind the coastline's apparent under-service and
+  the reason the polygon-counts-as-n-POIs rule was dropped -- at n0.9=5 a single large
+  nature polygon saturates the type on its own. Note the contribution coefficient lives in
+  `services.csv`, not `poi_types.csv`; the latter's `decay_coefficient` is the distance
+  decay and uses a different value set ({8,12,20,30,45} vs the {5,10,30,50,80} tiers).
+  `CONTRIBUTION_TIER_REMAP` in `utils/services.py` is None, so CSV values are used as-is.
+  Re-verified: all 36 types now match, and `get_contribution_coefficient` returns 5.0.
+
+- Diagnosed why `nature_contact` stayed low along the Cagliari coast after
+  `high_nature_immersion`'s contribution coefficient was corrected to n0.9=5, and restored
+  `{"natural": "beach"}` to `accessible_nature` in `config/poi_types.csv` (plus a
+  `natural_beach` label for shapefile-mode parity). The coefficient fix worked --
+  `high_nature_immersion` went to mean 0.954 -- but it cannot change the *pattern*, because
+  at n0.9=5 with 986 routed nature POIs every hex reaches saturation: min 0.740, p10 0.877,
+  p90 0.990, a p10-p90 spread of 0.112 city-wide. A component that is ~0.95 everywhere
+  raises the floor uniformly and contributes almost no spatial information. Measured by
+  distance to the coastline, the deficit is entirely elsewhere: within 250 m,
+  `high_nature_immersion` is 0.948 vs 0.959 at 2-5 km (-0.011, i.e. none), while
+  `accessible_nature` is 0.510 vs 0.720 (-0.210) and `perceived_nature` 0.404 vs 0.590
+  (-0.186). `nature_contact`'s Choquet capacities are [0.35, 0.40, 0.25], and its
+  correlation with the three components is 0.746 / 0.996 / 0.985 -- `accessible_nature`
+  both weighs most and carries the spatial variation. Cause: `natural=beach` had been
+  dropped from `accessible_nature` earlier the same day during the reference-sheet audit.
+  All 35 Cagliari beach features sit a median 11 m from the coastline and every one is
+  within 250 m, whereas parks (570) and gardens (195) sit a median 4.8 km and 3.6 km
+  inland -- beach was the only accessible-nature feature type serving coastal hexes. It was
+  absent from the sheet not because it was rejected but because the sheet is the Paris/MGP
+  taxonomy, which has no coastline and therefore no code for it; treating that absence as a
+  deletion imported a Paris blind spot into Cagliari. Note this is now a deliberate
+  divergence from the sheet: a code-set comparison will report `natural=beach` as an extra
+  on k16, since it has no GI/BI code at all. Considered and rejected: re-splitting the
+  coastline into per-500 m POIs (reverted earlier today). That was the right fix at
+  n0.9=30, when `high_nature_immersion` still discriminated; at n0.9=5 it targets a
+  component with ~0.05 of headroom and 0.35 weight, worth at most ~+0.018 on the service,
+  against a 0.21 gap in a component weighted 0.40. Still open: whether n0.9=5 is acceptable
+  given how flat it makes the layer, and whether the MGP sheet should govern Cagliari's tag
+  membership at all (beach, coastline, and 2 km2 scrub have no Paris counterpart).
+
+- Investigated parallelising Paris's bus/subway impedance calculation (~1 day) and found
+  the routing is *already* fully parallel: r5r's `expanded_travel_time_matrix` defaults to
+  `n_threads = Inf` ("use all available threads") and nothing in the repo overrides it, so
+  R5 already saturates all 26 cores. Adding Python-level parallelism would start a second
+  JVM holding the whole Paris network and contend for the same cores. The cost is
+  structural instead. Paris routes 23,046 origins x 136,744 destinations x 2 modes;
+  `breakdown = TRUE` is mandatory (the impedance is
+  `access + wait + gamma*ride + transfer + egress + vot*ticket`, with gamma != 1, plus
+  `routes` to detect walk-only trips), and R5's PathResult caps detailed-path destinations
+  at 5,000 per call -- so 28 destination chunks are unavoidable and each origin's transit
+  search runs 28 times (645,288 searches instead of 23,046). Checked and rejected two other
+  levers: destinations are already unique (0 duplicates at 1e-6), and r5r's `output_dir`
+  writes *pre-reduction* rows, while the `which.min` per (from_id, to_id) in
+  utils/r5_routing.r is what collapses ~60 departure-minute rows per OD pair into one --
+  the bus CSV is already 17.4 GB after that reduction, so streaming raw to disk is not
+  viable. What was left is the heap: `origin_chunk = (0.35 * heap / 1.74e-5) // 5000`, and
+  the heap was hard-coded to 16 GB on a 62 GB machine, giving origin_chunk=64 -- only ~2.5
+  origins per thread on 26 cores, so most of each call was fixed overhead, paid 10,108
+  times per mode. Extracted the ceiling as `_R5_JVM_HEAP_CAP_GB` (routing/
+  public_transport_routing_stage.py) with the full origin_chunk arithmetic documented at
+  the knob, and raised it 16 -> 24: origin_chunk 64 -> 96, calls per mode 10,108 -> 6,748
+  (-33%). Also unified the two heap branches, which disagreed -- the `budget_gb >= 40` path
+  returned a flat 16 however large the cgroup budget was, while only the no-budget path
+  reserved headroom; both now compute `max(8, min(cap, available - 15))`, which at cap=16
+  is byte-identical to the old behaviour. Rejected the alternative of running bus and
+  subway concurrently (they are sequential in main.py): it only recovers the single-threaded
+  R-side `which.min`/`fwrite` stretches, and splitting the heap between two JVMs doubles
+  the origin batches in both, cancelling most of the gain. Not yet measured on a real run;
+  the next step is 32 if the per-chunk `[mem]` lines stay healthy at 24.
+
+## 2026-09-30
+
+- `utils/services.py` (`_build_runtime_structures`, `cap`, `choquet_integral`,
+  `choquet_integral_details`) + `stages/service_stage.py`: reworked the service-level
+  Choquet aggregation after a question about whether the weights are normalized to 1
+  turned up a silent bug. **Pair-key mismatch:** `cap()` looked up a pairwise interaction
+  under an *alphabetically* sorted key (`pair = (poi_i, poi_j) if poi_i < poi_j else ...`)
+  while the builder stored it in *CSV column order* (`(poi_types[i], poi_types[j])`), so
+  every pair whose CSV order wasn't alphabetical missed the dict and `.get(pair, 0.0)`
+  silently returned 0 -- **15 of 39 interaction terms were being dropped**, including all
+  four cross-terms in `sport_and_movement` and both in `care_services`, leaving the model
+  running much closer to a plain weighted mean than the config described. Fixed by keying
+  with `tuple(sorted(...))` in the builder so stored and lookup keys agree.
+  **Shapley -> Mobius conversion:** the CSVs hold Shapley quantities (`choquet_capacity` in
+  `config/services.csv` = importances phi_i, `choquet_interactions` in
+  `config/poi_types.csv` = interaction indices I_ij), but the Choquet integral consumes the
+  Mobius form. Added a load-time conversion `a_ij = I_ij` (identity, for a 2-additive
+  capacity) and `a_i = phi_i - 0.5 * sum_{j!=i} I_ij`, exposed as a new `SERVICE_MOBIUS_M`
+  alongside the untouched `SERVICE_SINGLETON_M` -- the latter stays Shapley because
+  `exports/poi_exports.py` and `analysis/score_report.py` use it as a plain importance
+  weight, where phi is the semantically correct number. Since mu(N) = sum(phi_i), and the
+  phi already sum to 1 in every service, this makes **mu(N) == 1 exactly** (verified to 12
+  decimals on all 12 services), so the old post-hoc `total / mu_full` normalization was
+  removed rather than kept: it is now provably an identity, not a correction. Guarded with
+  a fail-fast check that each service's phi sum to 1.0 within 1e-9, since that is the single
+  assumption the whole result rests on. **Mobius rewrite:** replaced the level-set walk
+  (sort ascending, `(x_(j) - x_(j-1)) * cap(tail)` per level) with the equivalent Mobius
+  form `sum_i a_i*x_i + sum_{i<j} I_ij*min(x_i,x_j)` in both `choquet_integral` and
+  `choquet_integral_details`, the latter now emitting per-term rows instead of tail/capacity
+  steps. **Hot-path fix:** `service_stage.py` was calling `choquet_integral_details`
+  unconditionally for every node x service and reading only `detail["normalized"]`,
+  allocating a dict + step lists per call; switched it to `choquet_integral` and now builds
+  the breakdown only for the <=5 sampled "collapse to 0" diagnostics per service
+  (7.41 -> 2.12 us/call, 3.5x). Bumped `aggregation_version` to `v3_mobius_service_choquet`
+  because the cache signature chain tracks CSV content (via `serv.config_signature()`) but
+  nothing tracked changes to the aggregation code itself, so pre-existing service caches in
+  other namespaces would have been silently reused with the old math. Verified throughout by
+  cross-checking the two representations against each other over 36,432 random and corner
+  inputs (max diff 3.3e-16), confirming C(0)=0 / C(1)=1 exactly, round-tripping the Mobius
+  coefficients back through the Shapley definition, and re-parsing `config/poi_types.csv`
+  independently to confirm all 39 runtime pairs match the CSV, that every interaction matrix
+  is symmetric (the loader averages the two directional entries, so a half-finished edit
+  would otherwise pass silently), and that no poi_type belongs to two services. Not done,
+  deliberately: monotonicity of the capacity is still unvalidated (current numbers pass with
+  min slack +0.14, but nothing enforces it on a future CSV edit).
+- `utils/poi_identity.py` (`build_poi_source_key`): a `mgp_boundary` run crashed in
+  `exports/artifact_bundle.py`'s `write_impedance_bundle` with
+  `numpy.core._exceptions._ArrayMemoryError: Unable to allocate 75.7 GiB for an array with
+  shape (214071,) and data type |S379504` -- one POI's source key was ~370 KB long, and
+  because `np.concatenate` on fixed-width byte-string arrays pads every element to the
+  widest one, that single POI blew up the whole 214k-row catalog array. Root cause: the
+  fallback branch of `build_poi_source_key` (for POIs with no `osmid`/`id`/`fid`/etc.)
+  embedded `getattr(geom, "wkb_hex", str(geom))` -- the full WKB-hex of the POI's geometry --
+  directly into the JSON key, and for a large-polygon POI (area, not point) that string is
+  huge. Confirmed nothing downstream ever parses the `"geometry"` field back out of the key
+  (unlike `osmid`, which `core/profiles.py` does decode), so it's safe as an opaque
+  uniqueness token. Fixed by replacing it with a bounded `_geom_fingerprint(geom)` helper
+  (`hashlib.sha1` of `geom.wkb`, falling back to `str(geom).encode()`), keeping the key
+  stable/deterministic/unique per distinct geometry at a fixed 40 hex chars instead of an
+  unbounded size.
+- `stages/snapping_stage.py`: the same OOM crash recurred on the next run even after the
+  `build_poi_source_key` fix, because the failing keys came from an on-disk snapping
+  cache/checkpoint built *before* that fix, so the stale giant keys were reused verbatim
+  instead of being recomputed. Bumped `_SNAP_CACHE_SCHEMA_VERSION` 3 -> 4, which feeds both
+  the per-poi_key snap cache path and the whole-stage checkpoint signature, forcing both to
+  rebuild with the corrected (bounded) source keys.
+- `routing/public_transport_routing_stage.py` (`_hash_origins_and_snap`): the schema bump
+  above then busted the expensive radius-independent bus/subway destination-selection cache
+  (`_pt_selection_signature`) too, even though the selected destinations themselves were
+  unchanged -- its hash sorted each POI's candidates by `repr(source_key)`, so switching
+  `source_key`'s format reordered the fold and changed the digest for no semantic reason.
+  Added `_snap_sort_key`, sorting by `source_coord` instead (falling back to
+  `repr(source_key)` only to break ties between POIs sharing a coordinate), so this cache's
+  signature now depends solely on actual snap data and is immune to future source_key
+  format changes.
+
+## 2026-10-01
+
+- `analysis/scenarios.py` (per-scenario capability grid styling, in the `.qgz`-builder
+  loop around what's now `create_profile_comparison_project`'s embedded script): all 3
+  capabilities per scenario were loaded off the same shared `GRID_TABLE_NAME` table, but a
+  GeoPackage can only carry one default style per table, so only the scenario's configured
+  `default_capability` kept its `CAPABILITY_COLOR_STOPS` color map on a plain open -- the
+  other two fell back to QGIS's auto-assigned rainbow coloring, which read as "the old color
+  scheme" even though the code was already pulling the live shared color constants. Fixed by
+  pointing each capability at its own `capability_<cap>` sidecar view instead of the shared
+  table (views already created per-scenario by `_create_service_grid_views` in
+  `exports/generate_experiment_shapefiles.py`, same mechanism the iso-band tables use), so
+  each capability gets its own table/view and can be embedded as its own default style with
+  no collision. Diff grid colors (`_DIFF_COLORS`, the 9-step red/yellow/green ramp) were
+  confirmed unrelated and left unchanged. Also confirmed the fix doesn't reintroduce the
+  2026-08-20 older-QGIS incompatibility (`color_mix()` silently no-op'ing on pre-3.24 QGIS)
+  -- `style_diff`/`style_electre`/`embed_style` all use plain `QgsGraduatedSymbolRenderer` +
+  static `QColor(...)` per range, not a data-defined expression, so there's nothing
+  version-dependent here. Getting the corrected colors requires rerunning
+  `python scenarios.py` (`PROFILE_SCENARIO` set) -- the styling only gets embedded by the
+  `.qgz`-builder step at the end of `run_profile_comparison`, which always runs after a full
+  per-persona pipeline pass; there's no standalone "rebuild just the qgz" entry point.
+- `scripts/rebuild_scenario_grids.py`: `SCENARIO_KEYS` only covered `underservice_is_mirrionis`
+  and `public_strike`; extended to all six conditions (same list as
+  `analysis/merge_scenario_differences.py`'s `CONDITION_KEYS`). The script also failed with
+  `ModuleNotFoundError: core` when run as `python scripts/rebuild_scenario_grids.py`, since
+  Python puts `scripts/` (not the repo root) on `sys.path`; added the same project-root
+  `sys.path` bootstrap the other `scripts/*.py` use.
+- `scripts/rebuild_pois_used.py` (new): Paris's `pois_used.gpkg` predated the shapefile POI
+  source, so its `source_key`s no longer matched anything. `generate_poi_exports()` writes
+  the gpkg from `_collect_poi_records()` alone (snap/non_bus/acc are only needed for the
+  optional hexagon/accessibility exports), so the script calls it with none of them to
+  rebuild just `pois_used.gpkg`, without rerunning routing.
+- `SCRIPT/main.py` (`patch_legend_panel_colors`, new) + `SCRIPT/AVVIA_INTERFACCIA.{bat,sh}`
+  (new): the interface's top-right "Capability rating"/"Service score" legend kept the old
+  per-capability white->hue colors because they're hardcoded in the template's
+  `resources/qgis2web.js` (`capabilityLegendDefinitions`), which `copy_template()` copies
+  verbatim and `load_palette()` never touched. After the copy, the three `colors: [...]`
+  arrays are now regex-replaced with `CAPABILITY_COLOR_STOPS`, reversed because the JS lists
+  Very High first. The two launchers serve `SCRIPT/OUTPUT/` on `localhost:8768` (8766/8767 are
+  the GI-BI relabeling servers); they live in `SCRIPT/`, not `OUTPUT/`, because
+  `copy_template()` wipes `OUTPUT/` on every rebuild.
+
+## 2026-10-05
+
+- `analysis/scenarios.py` (`__main__`): `scenarios/all_scenarios_differences.gpkg` only got
+  rebuilt when `python -m analysis.merge_scenario_differences` was run by hand, so a stale
+  copy was shared once. `merge_all()` is now called after the scenario run(s) succeed (a
+  failed batch still exits before merging).
+- `core/profiles.py` (`BASELINE`): the persona baseline hardcoded `affordability=1.0` with
+  a comment claiming it "reproduces the default main.py run exactly", which stopped being
+  true once `main.py` got `PAID_POI_AFFORDABILITY`. It now imports that knob from `main.py`
+  (`None` -> 1.0). Safe from circular imports because `main.py` only imports `core.profiles`
+  inside `main()`.
+- `utils/services.py` + `analysis/sensitivity_upstream.py` (`run_configs`): scenario results
+  for Cagliari disagreed with a fresh `main.py` run (scenarios ~0.06-0.09 higher on
+  care/restorativeness; disruption scenarios even scored above a clean baseline). All routing
+  inputs were byte-identical between the two runs (bus/subway matrices, 337,608 walk/bike/
+  drive impedance arrays, POI catalog), and recomputing accessibility for 40 nodes with the
+  real worker code matched the Oct-1 scenario matrices to 3e-8 only with every
+  `decay_coefficient` x0.8. Root cause: a Paris `main.py` run with `SENSITIVITY_REPORT` was
+  running its upstream sweep at the same time, and the sweep rewrote the shared
+  `config/poi_types.csv` in place per variant (`decay_x0.8` on disk 09:33-09:42); the
+  scenario batch (started ~09:40) loaded it at import (`utils/services.py` reads the CSVs
+  once). `shutil.copy2` restored the original mtime afterwards, hiding the edit. Fixed by
+  never writing `config/` during a sweep: `CONFIG_CSV_PATH`/`SERVICES_CSV_PATH` can be
+  overridden per process via `CAP_POI_TYPES_CSV`/`CAP_SERVICES_CSV` (default unchanged), and
+  each config now gets a private `<workspace>/<config>/_config/` copy passed to its worker
+  through those env vars (unmutated CSV = byte copy, so worker config signatures are the
+  same as before). The backup/restore machinery and the now-unused `_sha1()` were removed.
+  Verified: a worker reads 6.4 for a coefficient whose shared value stays 8.0, and
+  `config/` hashes are unchanged. All Oct-1 scenario outputs (and the
+  `_capability_grids.zip`/`all_scenarios_differences.gpkg` built from them) are affected
+  and need regenerating; delete the persona `accessibility/` and `service/` caches first.
+- `analysis/scenarios.py` (`CAPABILITY_SCORE_MODE`): set to `"discrete"` so persona and
+  disruption grids use the same band-midpoint scores as `main.py`'s maps and can be checked
+  against `Cagliari.gpkg` directly. `analysis/significance_analysis.R`'s `SCORE_MODE` is
+  still `"continuous"`, which is meaningless on discrete output -- switch it to `"level"`
+  before running significance again.
+- Scenario lists (`analysis/scenarios.py` `ALL_SCENARIO_KEYS` + `SCENARIO` default,
+  `analysis/merge_scenario_differences.py`, `scripts/rebuild_scenario_grids.py`,
+  `analysis/significance_analysis.R`, `analysis/generate_scenario_report.py`): removed the
+  `new-metro` scenario. After the clean rerun its results were bit-for-bit identical to
+  baseline because `artifacts/Cagliari_new_metro/subway/r5r_expanded_travel_time_matrix.csv`
+  (routed 2026-09-30 18:39 and reused ever since) is byte-identical to the baseline's -- the
+  metro extension never reached routing (feed override not applied, or the routing cache not
+  noticing the feed change; not investigated). The report's new-metro reading presented that
+  zero effect as a real finding, so it was dropped and "5.4" renumbered to "5.3". The
+  `NEW_METRO` profile, `gtfs/make_new_metro_gtfs.py` and the input
+  `scenarios/new-metro/metro_cagliari.gpkg` were kept so the scenario can be repaired and
+  re-enabled. `all_scenarios_differences.gpkg` was rebuilt without the metro layers.
+
+## 2026-10-06
+
+- `core/pipeline_runner.py` (`_maybe_open_qgis` -> `_embed_styles_and_maybe_open_qgis`): a
+  colleague opening the underservice scenario gpkg saw random colors on every grid and the
+  place labels drawn as plain points. Only 3 of its 21 layers had a stored style (the
+  `capability_*` grids `scenarios.py` styles itself); public_strike was the same, while the
+  persona gpkgs had all 21. `_build_qgis_project` -- the step that writes every layer's
+  default style into the gpkg's `layer_styles` -- was only called from inside the
+  open-QGIS-after-run path, which returned immediately when `open_qgis_after_run` was False,
+  and `_run_reused_bundle_pass` turns that off for the disruption passes. Styles are now
+  always embedded when a QGIS executable is available; only the launch depends on
+  `open_qgis_after_run`. With no QGIS executable it still raises if a launch was requested,
+  otherwise prints a warning that the gpkg is unstyled instead of skipping silently. The two
+  existing gpkgs were repaired with `scripts/rebuild_scenario_grids.py`'s `rebuild()` from
+  the same capability CSVs (values unchanged, 21/21 layers styled) and
+  `scenarios/_capability_grids.zip` rebuilt. Side effect of that script: it embeds via the
+  plain `Cagliari` namespace, so it overwrites `outputs/qgis/Cagliari/capability.qgz`
+  (main.py's project) with one pointing at the last rebuilt scenario gpkg.
+- `exports/sensitivity_bundle.py` (new, `write_raw_data_zip`) + `main.py` (end of `main()`): the
+  robustness/sensitivity raw-data zips in `outputs/debug/<slug>/` were made by hand, so the
+  Cagliari ones were all stale (robustness/OAT/weights from before the 2026-10-05 run). `main.py`
+  now writes `outputs/debug/<slug>/sensitivity_robustness_raw_data.zip` after the reports,
+  overwriting it each run so the file with that name is always current. It only bundles the
+  parts this run regenerated (robustness and/or sensitivity, including
+  `capability_stability.gpkg`/`.qml`), writes via a temp file + `os.replace` so a crash never
+  leaves a half-written zip, and its README records the build time and the capability CSV the
+  reports read (`default_experiment_csv`, the same lookup the stages use).
+- `main.py` (`PAID_POI_AFFORDABILITY_BY_CITY`), `core/profiles.py` (`city_paid_poi_affordability`),
+  `stages/accessibility_stage.py`, `core/pipeline_types.py`, `analysis/sensitivity_upstream.py`
+  (`_config_hash`): the paid-POI affordability was a single `main.py` knob that only `main()`
+  itself applied (via a hand-built profile). Every other path that recomputes accessibility --
+  the upstream sensitivity sweep's workers, the strike/underservice disruption passes, the
+  legacy `pipeline_runner` entry points -- built a context with no profile and silently used
+  1.0. Found because the Paris sensitivity report mixed OAT/weights/robustness at 0.7 (from the
+  main run's CSV) with an upstream sweep at 1.0 (paid-POI services up to ~0.29 higher in its
+  baseline). The knob is now a per-city dict (`{"cagliari": 1.0, "paris": 0.7}`, unlisted -> 1.0).
+  `Profile.affordability` may be `None` = "the city's default", resolved in one place, the
+  accessibility stage, for both `None` and profile-less contexts, which now logs the value it
+  uses (`[Accessibility] paid-POI affordability u = ...`). `BASELINE`/`NEW_METRO` use `None`;
+  student/elderly keep 0.2/0.5. Removed `main.py`'s hand-built profile block and the unused
+  `Profile.utility_for()`. The sweep's cache hash now includes the city's affordability, so
+  both cached sweeps are invalidated and recompute on their next run (Paris at 0.7).
+- `tools/debug_pipeline.py` (`_HTML_TEMPLATE` map): the debug report's map showed only
+  "Access blocked" tiles. It used OpenStreetMap's own tile server, whose usage policy rejects
+  requests without a `Referer` header, and browsers send none for a report opened straight from
+  disk (`file://`). CARTO was tried first but now serves "API KEY REQUIRED" tiles. Switched to Esri
+  World Light Gray Base (no key, no Referer needed; verified rendering over both Cagliari and
+  Paris), `maxNativeZoom: 16` so Leaflet upscales past its last detailed zoom, with the
+  required Esri attribution. `tools/inspect_hex_pois.py` (f-string template, braces doubled)
+  switched the same way.
+- `tools/debug_pipeline.py` (`_HTML_TEMPLATE`, step-3 Choquet panel): clicking a hexagon in the
+  debug report never showed the computation chain. Reproduced headlessly (Playwright on the Paris
+  report): every `selectHex()` threw `TypeError: Cannot read properties of undefined (reading
+  'map')` on `sc.steps`. The panel still rendered the old sorted-step Choquet breakdown
+  (`steps` with delta/capacity/tail), but `utils.services.choquet_integral_details` now returns
+  the 2-additive Mobius form (`singleton_terms`: a_i*x_i, `pair_terms`: I_ij*min(x_i,x_j), with
+  subtotals), so the exception aborted `renderChain` before anything was shown. The panel now
+  renders those two term lists with their subtotals. Verified on a patched copy of the Paris
+  report: chain panel shown for sampled hexagons through step 4, no JS errors. Existing reports
+  need regenerating (`DEBUG_REPORT_ONLY = True`).
+
+## 2026-10-07
+
+- `scripts/rebuild_pois_used.py`: `outputs/poi_exports/mgp_boundary/pois_used.gpkg` (written by
+  this script on 2026-10-01) held Cagliari's 6,224 POIs, not Paris's. The script built
+  `PipelineConfig(study_city="paris")`, so the output path was Paris's, but never set
+  `CAP_STUDY_CITY`, which `core.config` reads at import and `utils.graphml` uses for the
+  `PipelineConfig()` it builds internally when loading POIs -- so the POIs came from the default
+  city (Cagliari). It now sets `CAP_STUDY_CITY` before any project import (as `main.py` and
+  `scenarios.py` do), and after writing checks that >= 95% of the POIs lie within the study area's
+  origin-node bounding box (padded ~25 km), failing with an error otherwise. Check verified: the
+  wrong file is rejected (0% inside Paris), a genuine Cagliari export passes (100%).
+- `SCRIPT/main.py` (`patch_min_zoom_to_poi_extent`, new): the provenance interface could not zoom
+  out far enough to show POIs extracted in the buffer outside the study area -- the template's
+  `qgis2web.js` hardcodes `minZoom: 12.5`, which frames only the ~21x18 km study area, while
+  Cagliari's exported POIs span ~71x71 km. The generator now computes the EPSG:3857 bounding box
+  of all exported POIs plus the hex grid and patches the OUTPUT copy of `qgis2web.js` (template
+  untouched): the fixed minZoom is removed and, on load and on window resize, the min zoom is set
+  to the level that fits that box, rounded down to a whole level because the view snaps zoom
+  (`constrainResolution`). Fails loudly if the template's minZoom line changes. Verified headless:
+  min zoom 10 (1280x800) / 11 (1920x1080), all POIs visible at full zoom-out, no JS errors.
+- `SCRIPT/main.py` (`patch_inspector_degree_symbol`, new): the hexagon inspector printed a literal
+  `&deg;` in its coordinate line. `formatDegreeCoordinate()` in the template's `qgis2web.js` builds
+  the text with the HTML entity `&deg;`, and the inspector then runs it through `escapeHtml()`,
+  which turns `&` into `&amp;`. The generator now replaces the entity with the plain `°`
+  character in the OUTPUT copy (template untouched; fails loudly if the line changes). Verified
+  headless by clicking a real hexagon: `39.242662° N, 9.142986° E`, no JS errors.
+
+## 2026-10-08
+
+- `SCRIPT/overrides/right_panels.css` (new) + `SCRIPT/main.py` (`apply_right_panel_layout`, new):
+  the provenance interface's right-hand panels had different widths -- the legend panel used
+  `width: max-content` and laid its sections (capability rating, service score, POI power) out as
+  side-by-side columns, so it narrowed whenever a section was hidden (156 px vs the inspector's
+  350 px in the hexagon view). An override stylesheet, copied into `OUTPUT/styles/` and linked last
+  in the generated `index.html` (template untouched), gives all right-hand panels the shared
+  `--panel-width` (350 px) and stacks the legend sections as full-width horizontal strips:
+  capability symbols in one row (Very Low -> Very High, via `row-reverse`, no JS change), service
+  score and POI power as horizontal bars. The template's `.legend-images-row` `align-items:
+  flex-start` had to be overridden to `stretch` so the strips fill the width. The service-score
+  gradient direction is set in JS, so the generated `qgis2web.js` is patched `to top` -> `to right`.
+  Fails loudly if `</head>` or that JS line change. Verified headless in the capability, service and
+  hexagon views: every panel 350 px wide, no JS errors.
+- `SCRIPT/overrides/right_panels.css`: follow-up -- the panels' borders looked misaligned. The
+  right-hand column is 350 px but reserves a 7 px scrollbar gutter (`scrollbar-gutter: stable`), so
+  only 343 px are usable; fixed 350 px panels overflowed it in opposite directions (the legend is
+  right-aligned by the template's `align-self: flex-end`, so it overflowed left and its left border
+  was clipped by `overflow-x: hidden`; the inspector overflowed right into the gutter), 7 px apart.
+  Panels now use `width: 100%` + `align-self: stretch`, filling the column's usable width exactly
+  regardless of scrollbar width. Verified: both panels at left 1558 / right 1901, borders intact.
+- `SCRIPT/main.py` (`patch_map_caption`, new): the interface's bottom-left caption card still showed
+  developer placeholders ("Layer 0 (default): terrain", "Layer 2a: results ... the isobands show the
+  capability", "(I can always change capability)", ...). The generated `qgis2web.js` now gets the final
+  per-view texts (bold title + description) for all five states: overview (nothing selected),
+  capability ratings, service scores, and the hexagon detail view -- with the "highlight them by
+  type" clause only when a service is selected, since the type-highlight toggle only exists then
+  (`qgis2web.js:590`). The redundant fixed "Caption" label is removed from the generated
+  `index.html`, whose initial text is set to the overview caption. Template untouched; fails loudly if
+  the caption code/markup changes. Verified headless in all five states, no JS errors.
+- `main.py` (before the accessibility stage): a Cagliari run with `LIGHT_OUTPUT = False` crashed in
+  `generate_score_report` ("Neither the per-node directory ... poi_by_node nor the legacy JSON
+  found"). The accessibility stage only writes the per-node POI files the score report needs when
+  `pois_used.gpkg` already exists (`accessibility_stage.py:919`), but the pre-routing POI export that
+  creates it sits inside the no-cached-impedance-bundle branch -- so a run that reuses the cached
+  bundle and starts without `pois_used.gpkg` (first run after a `LIGHT_OUTPUT` run or after clearing
+  `outputs/poi_exports/`) writes no per-node files and then crashes. (The immediate rerun worked only
+  because the crashed run had created the gpkg in its post-routing export.) Now, when POI exports are
+  wanted and the gpkg is missing, it is created on the cached path too (`generate_poi_exports(ctx)`,
+  gpkg only) before accessibility runs.
+- `SCRIPT/main.py` (`write_distribution_zip`, new): the interface had to be zipped by hand to hand it
+  to a colleague. Each generation now also writes `SCRIPT/provenance_interface.zip` (overwritten, so
+  it always matches the current interface): `provenance_interface/` with `OUTPUT/` plus double-click
+  launchers -- `AVVIA_INTERFACCIA.bat` (stored with CRLF line endings), `.sh`, and a new macOS
+  `.command` copy of the `.sh` (macOS opens a `.sh` in a text editor but runs a `.command`), both
+  stored executable. `resources/hexagon_service_pois.json` (108 MB, Aug 25, the pre-shard POI store)
+  is left out: nothing in the interface references it anymore (POIs load from `resources/hex_pois/`
+  via `city_config.js`), so the package is 85 MB. Written via temp file + `os.replace`. Verified by
+  unzipping into a clean folder: the bundled `.command` launcher served the interface (HTTP 200), and
+  the full headless walkthrough against the unzipped copy (all five views, hexagon click, 263 POIs
+  with power values) ran with no JS errors.
+- `SCRIPT/template/` (`resources/capability.csv`, `resources/city_config.js`, `layers/new_layers.js`,
+  `resources/cagliari6_layer_setup.js`) + `SCRIPT/main.py` (`SERVICE_STYLE_LAYERS`, `process_gpkg`):
+  the interface's healthcare capability showed only 4 of its 5 services -- "Inpatient care and
+  rehabilitation" (`impatient_and_rehabilitation`) was missing. Not a label mismatch (its label was
+  already in `service_labels.json`): the template predates the service, so it was absent from the
+  template's `capability.csv` and had no map layer anywhere, although `database.gpkg` carries
+  `grid_mean_service_impatient_and_rehabilitation`. It now gets a full layer,
+  `Cagliari6service_impatient_and_rehabilitation_21`: exported from the gpkg and styled with the shared
+  service gradient by `main.py`, loaded/mapped in `city_config.js`, built and added to `layersList` in
+  `new_layers.js`, hidden at startup in the layer setup. `capability.csv` lists the services in the
+  paper's order (healthcare: medical products, inpatient care, diagnosis, emergency, social care;
+  the other two capabilities already matched). The template is now edited directly -- the colleague
+  who owned it has finished, and the user maintains the interface.
+- `SCRIPT/template/index.html`: the capability buttons read "Care / Nutrition / Restorativeness" (code
+  keys) in that order; they now use the display names from `config/capability_labels.json` -- "To be
+  restored", "To be nourished", "To have access to healthcare" -- with restored first. The legend
+  `title`s in `qgis2web.js` and the per-capability service-legend PNG titles still carry the old names
+  but are never displayed, so they were left as is. Verified headless after regenerating `OUTPUT/`:
+  button names/order and all three service lists in the requested order, the new layer shows its 1568
+  hexes when selected, no JS errors.
+
+## 2026-10-09
+
+- `exports/poi_exports.py` (`_collect_poi_records`): the Paris interface POI store referenced only
+  187 distinct POIs (of 143k) across 22,766 hexagons (~11 per hexagon vs ~4,900 in Cagliari).
+  Root cause: a source-key mismatch for POIs without an OSM id (all of Paris's shapefile POIs).
+  Snapping/accessibility key them by their `__geometry_token` (`graphml.get_poi_geometries`), but
+  the export -- given the same plain-DataFrame rows -- rebuilt a Point from `__snap_coord` and keyed
+  it by `sha1(point.wkb)`, so `pois_used.gpkg`'s ids never matched the accessibility catalog and
+  `_write_poi_by_node_sparse` silently dropped every such POI (only the 370 osmid-keyed ones
+  survived). Cagliari was unaffected (OSM POIs, osmid keys). The export now passes the geometry
+  token when the rows carry one, exactly as snapping does; the catalog's own keys are unchanged, so
+  the cached impedance bundle stays valid. (The earlier Aug-24 Paris store was simply stale: half
+  its ids no longer existed and it carried no powers -- the last Paris run had been `LIGHT_OUTPUT`,
+  so `poi_by_node/` was empty.) Verified: on 3 POI types the new keys hit the catalog 2694/2694,
+  2701/2703, 3912/3912 (0% before); after deleting `pois_used.gpkg` + `poi_by_node/` and rerunning
+  Paris non-light, the store has 117,235 distinct POIs (median 6,065 per hexagon), all present in
+  `pois_used.gpkg`. Copied into `SCRIPT/INPUT_DATA_PARIS/` for the interface.
+- `SCRIPT/main.py` + `SCRIPT/template/` (`index.html`, `resources/qgis2web.js`) +
+  `SCRIPT/AVVIA_SCRIPT.bat`: the provenance interface could only show Cagliari. It now builds one
+  interface per city into `OUTPUT/<city>/` and adds a "City" card (Cagliari | Paris) at the top of
+  the left panel; the inactive button opens `../<city>/` (a page reload -- each city's layers are
+  page globals, so an in-place swap isn't possible). Generator: the CLI flags became in-script
+  knobs (`CITIES` = city key -> input folder, `TEMPLATE_DIR`, `OUT_DIR`, `WRITE_ZIP`); the old
+  `main()` body is `build_city()`, run once per city; `OUTPUT/index.html` forwards to the first
+  city so the launchers need no change; the `.bat` is now just `python main.py`. City-specific
+  bits that were Cagliari-only: place labels (`zzzz_place_comuni`/`_quartieri`) are now exported
+  from each city's own gpkg instead of copied from the template (fails if missing rather than
+  silently showing Cagliari's), and the starting view -- a hardcoded Cagliari box in
+  `qgis2web.js` -- now fits `cityDataConfig.initialExtent` (hex-grid bounds, written into each
+  city's `city_config.js` by the new `patch_city_config`, along with `key`/`name`) with padding
+  for the two side panels. Paris inputs live in `SCRIPT/INPUT_DATA_PARIS/`. The distribution zip
+  is off (`WRITE_ZIP = False`) until it is reworked for Paris's 2.5 GB of shards. Verified
+  headless: root redirects to Cagliari, the switch highlights the current city and opens Paris,
+  both cities framed on their grid, Paris healthcare/inpatient view renders, no JS errors. Open
+  issues: Paris loads 278 MB of layer JS (25 s, ~1.8 GB JS heap), and its 1,143 place labels
+  clutter the map.
+- `SCRIPT/template/layers/new_layers.js` + `resources/cagliari6_layer_setup.js`: with a capability
+  selected, Paris drew all 1,143 place labels at once (337 communes + 806 "quartieri", many of them
+  housing estates), burying the map. The two place layers now share an OpenLayers declutter group
+  (`declutter: 'places'`, OL 10.7: layers with the same value declutter together), so overlapping
+  labels are hidden and reappear on zoom-in; communes get z-index 51 (districts stay at 50) because
+  the top layer wins collisions, so a commune label is never hidden by a district label. Verified
+  headless on the Paris healthcare/inpatient view: labels readable (communes plus arrondissements and
+  a few districts), no JS errors.
+- `SCRIPT/main.py` (`write_distribution_zip`, `copy_template`, `WRITE_ZIP`): the distribution zip
+  was switched off after the multi-city change -- it still assumed the single-city `OUTPUT/`
+  layout (its exclusion list no longer matched), and with Paris it is ~2 GB, a silent multi-minute
+  write. It now packs the whole `OUTPUT/` (both cities + root redirect) plus the three launchers,
+  with a `tqdm` byte-progress bar; `PACKAGE_EXCLUDE` is gone because `copy_template` no longer
+  copies the unread 108 MB `hexagon_service_pois.json` at all (it had landed in both city folders).
+  Shrinking Paris was considered and rejected: its shards are already deflated (zip saves ~24%),
+  and dropping low-power records would save little (2.3% have max power < 0.05, because powers are
+  quantile-rescaled) -- only a per-hexagon top-N cap would, at the cost of content. `WRITE_ZIP` is
+  back on. Verified: 2.1 GB zip in ~1m45s; unzipped into a clean folder, served the way the
+  launcher does, root -> Cagliari, switch -> Paris, and a Paris hexagon (13e) loads 8,092 POIs, all
+  with power values, no JS errors.
+
+## 2026-10-12
+
+- `SCRIPT/template/resources/qgis2web.js` + `SCRIPT/main.py` (`process_gpkg`): clicking a hexagon
+  wiped the map down to that one hexagon -- the capability and service layer styles returned `null`
+  for every other hex, and the isobands and static hatch were switched off -- so the selected cell
+  could not be compared with its neighbours. Selecting a hexagon now leaves the map exactly as it
+  was (style filters and the three `selectedHexId` visibility conditions removed;
+  `addVisibleHexBorder` lost its now-dead "empty black outline" branch), and the capability legend
+  no longer switches to hexagon outlines. The selection is marked by a new overlay layer
+  (`selectedHexOverlay`, z 45: above POIs, below place labels, non-interactive): the hex outline
+  (black on a white halo) plus a dot at the hexagon's origin node, filled with the original
+  per-capability scale (blue/orange/pink, the capability buttons' hover colours -- kept as
+  `capabilityNodeColors` because the generator repaints `capabilityLegendDefinitions` red-green)
+  in the shade of the hexagon's level. Node positions come from the gpkg's `capability_points`,
+  joined on `node_id` (text in the grid, int64 in the points -> joined as strings) into the grid
+  layer as `node_lon`/`node_lat`. Verified headless: Cagliari (healthcare, and restored + a
+  service) and Paris (nourished) -- full grid stays visible, outline + node dot drawn in the
+  level's shade (Medium care #f394e0, High nourished #ffb533), POIs load (274 / 1,482 / 11,076),
+  overlay clears on "back", no JS errors.
+- `SCRIPT/main.py` (`export_layer`, `process_gpkg`, `handle_pois`) + `SCRIPT/template/`
+  (`layers/new_layers.js`, `resources/city_config.js`, `resources/qgis2web.js`): the Paris page
+  failed to load on the user's machine -- it loaded 278 MB of layer JS (~26 s and ~1.8 GB of JS heap
+  headless). 180 MB of that was the 3 capability + 12 service layers: 15 copies of the same 23k
+  hexagons, one value column each, parsed into 15 feature sets. Those files are gone: in
+  `new_layers.js` all 15 layers share one source (`jsonSource_hexagonsWithData`), built from the grid
+  layer's features (parsed once) filtered to `has_data == 1`; each layer keeps its own style, which
+  already reads its own `grid_mean_*` column, so rendering and hit-testing are unchanged.
+  `export_layer` rounds coordinates to 6 decimals (~10 cm; values are left exact so no hexagon can
+  cross an ELECTRE class boundary) and writes compact JSON. The POI layer keeps only `id`,
+  `poi_types`, `svc_map` -- `source_key` (never read), `lon`/`lat` and `angular_coords` are dropped;
+  `qgis2web.js` gets them from the point geometry (`getPoiLonLat`, formatted with the inspector's
+  `formatObjectInspectorCoordinate`) in the reverse-geocode call, the inspector POI summary and the
+  POI popup. Result: Paris layers 278 -> 65 MB (grid 32, POIs 35), Cagliari 18 -> 4 MB; Paris loads
+  in 2.9 s with a 553 MB heap (was ~26 s / 1.83 GB); zip 2.12 -> 2.09 GB (dominated by the 2.5 GB
+  of hex shards, untouched). Verified headless: shared source holds 23,077 hexagons and the
+  capability layers use it, POI coordinates render ("48.492711° N, 2.355340° E"), hexagon
+  selection/overlay/POI loading unchanged in both cities, no JS errors.
+- `exports/offline_basemap.py` (new) + `core/pipeline_runner.py` (`generate_spatial_outputs`,
+  `_build_qgis_project`) + `core/config.py` (`qgis_offline_basemap`): the GeoPackage/QGIS output had
+  no usable background -- the project's only basemap is the online CartoDB XYZ layer, which does
+  not load for the user, and a bare `.gpkg` has none at all. An offline background is now written
+  into each city's gpkg, clipped to the hex grid's footprint (union of all cells): `basemap_area`
+  (study-area fill + outline), `basemap_water` (the existing per-city `water_mask.gpkg`) and
+  `basemap_roads` (motorway/trunk/primary = "major", secondary/tertiary = "minor", incl. `_link`).
+  Roads are read by streaming the drive graph's GraphML (`_read_main_roads`, same pattern as the
+  CSR builder: node coords + filtered edges, processed elements removed from the tree, byte tqdm
+  bar) and dissolved/line-merged to one multi-line per class. Measured: Cagliari 4 s, Paris 29 s at
+  ~400 MB peak RSS (161k segments -> 2 rows). Written after the gpkg in `generate_spatial_outputs`
+  (print-and-continue on failure, like the neighbouring steps). In the QGIS project the three layers
+  sit below every result grid -- a pure background showing between hexagons (user's call: roads
+  were first proposed as an overlay above the grids and rejected) -- with Positron-like styles also
+  saved as the gpkg default styles; the online CartoDB layer stays in the project but unchecked at
+  the bottom. Applied to the existing Cagliari and Paris outputs (gpkg + `capability.qgz`) without
+  rerunning the pipeline. Verified: project layer order (labels, results, roads, water, area,
+  CartoDB unchecked) and a headless QGIS render of both projects showing the background in the
+  gaps and margins.
+- `core/pipeline_runner.py` (`_build_qgis_project`): importing layers straight from the gpkg put
+  the new basemap layers on top of the hexagons -- a plain gpkg import stacks layers by the file's
+  table order (the basemap tables were written last), which can't be controlled reliably. The
+  generated project is now also stored inside the GeoPackage (`project.write("geopackage:<gpkg>
+  ?projectName=capability")`, after the `.qgz` write; warns on failure), so the single file opens
+  with the correct stacking via Browser -> gpkg -> "capability" or Project > Open From > GeoPackage.
+  Reordering `gpkg_contents` was considered and rejected as dependent on QGIS version and dialog
+  sorting. Re-saved for Cagliari and Paris. Verified: both gpkgs carry a `qgis_projects` row; the
+  Cagliari project loaded from inside the gpkg has every layer valid, the expected order (labels,
+  results, roads, water, area, CartoDB unchecked) and renders with the background.
+
+## 2026-10-14
+
+- `exports/generate_experiment_shapefiles.py` (`_hide_gpkg_layer`) + `SCRIPT/main.py`
+  (`process_gpkg`) + `analysis/scenarios.py`: QGIS's gpkg import dialog listed `capability_points`
+  (a no-geometry table) although `_hide_gpkg_layer` had removed it from `gpkg_contents` /
+  `gpkg_geometry_columns`. Cause: GDAL's GPKG driver lists unregistered tables too
+  (`LIST_ALL_TABLES=AUTO`) unless the file has a registered `attributes` table or GDAL's
+  `gdal_aspatial` extension marker -- and these gpkgs have neither. `_hide_gpkg_layer` now also
+  writes the `gdal_aspatial` row into `gpkg_extensions` (created if missing, inserted once), so only
+  the 24 registered layers are listed. Hidden tables are then also invisible to GDAL lookups by
+  name, so the three GDAL readers opt in with `LIST_ALL_TABLES=YES` (`SCRIPT/main.py` node join,
+  `scenarios.py` baseline check via pyogrio, and the legacy-scenario QGIS layer via
+  `|option:LIST_ALL_TABLES=YES`); sqlite3-based debug readers are unaffected. Registering
+  `layer_styles` as `attributes` was tested too but just lists that table instead. The marker was
+  added to the existing Cagliari and Paris outputs by hand. Verified: both gpkgs list 24 layers
+  without `capability_points`, the opt-in read returns all rows (1,563 / 23,046), and the projects
+  embedded in both gpkgs open with all 25 layers valid.
+- `SCRIPT/template/resources/qgis2web.js` (`updateSelectedHexOverlay`): the selected hexagon's
+  outline is now a single 4 px white line instead of black on a 6 px white halo (user's request; the
+  faint result over "Medium" pale-yellow hexagons was accepted). Verified headless in Cagliari and
+  Paris after a rebuild (interface + zip): white outline and node dot drawn, no JS errors.
+- `SCRIPT/template/resources/qgis2web.js` (`renderCapabilityScaleLegend`): the capability-rating
+  legend did not match the isoband outlines on the map. The isoband strokes have fixed screen
+  widths per level (1.14 / 2.28 / 3.42 / 4.94 / 6.84 px, in the isoband style files -- constant at
+  every zoom; only their size relative to the hexagons changes), while the legend squares used
+  1-5 px borders. The legend now uses exactly the stroke widths. A zoom-dependent legend (strokes in
+  ground units, legend redrawn on zoom) was considered and rejected: lower levels would drop below
+  1 px when zoomed out. Noted while checking: the template's hatch PNGs (`styles/qgis/`) are an
+  August Cagliari bake and would be wrong for Paris, but the user confirmed the hatch is dead code.
+  Verified headless after a rebuild: legend borders 6.84 / 4.94 / 3.42 / 2.28 / 1.14 px, no JS
+  errors.
+- `SCRIPT/template/resources/cagliari6_layer_setup.js` + `qgis2web.js`: the Paris interface froze
+  while showing POIs. Measured headless: the data loads in ~1 s, but drawing tens of thousands of
+  POIs on a 2D canvas blocked the page for seconds on every pan/zoom (44,280 POIs in the global
+  "all healthcare POIs" view: 3.7 s on show, 6.8 s per pan; ~80% drawing, ~20% the per-frame style
+  logic; `ol.layer.VectorImage` only ~25% better). After a throwaway WebGL prototype that the user
+  confirmed was smoother on their machine, the POI layer is now an `ol.layer.WebGLVector`. WebGL
+  layers can't run a style function, so each POI's look is precomputed into four properties the
+  layer's rule-based style reads (`poiVisible`, `poiFill`, `poiRadius`, `poiStroke`):
+  `computePoiDisplay` runs the unchanged canvas style logic once per POI (the filtering wrapper of
+  `setupDynamicPoiFiltering` is now stored in `poiStyleFunction` instead of installed with
+  `setStyle`), and `refreshPoiLayer` sets them silently and redraws once via `source.changed()`
+  (verified: silent sets + `source.changed()` redraw; a top-level `filter` is ignored by WebGL,
+  the `[{filter, style}]` rule form works). The 16 `poiLayer.changed()` "style inputs changed"
+  signals now call `refreshPoiLayer()`; hover recomputes only the two POIs whose hover state changed;
+  `setPoiLayerFeatures` no longer re-sets the source. GPU hit detection is disabled
+  (`disableHitDetection`): it re-rendered every POI into a hidden buffer each frame, ~9x slower
+  panning. POIs under the mouse are instead found on the CPU through the source's spatial index
+  (`getPoiAtPixel`), behind `forEachFeatureAtPixelWithPois`, a drop-in for
+  `map.forEachFeatureAtPixel` (same callback/"first truthy wins" contract, POI layer answered first,
+  OpenLayers' own hit test kept away from it) used by the five hover/highlight/click call sites; the
+  yellow hover highlight takes `poiStyleFunction` (WebGL layers have no `getStyle`). Headless
+  Chromium only has a CPU-emulated GPU (SwiftShader), so it can measure the CPU side (showing the
+  44,280 POIs: 3.7 s -> 1.2 s blocked) but not GPU drawing -- the user's own comparison is the
+  reference there. Verified headless in both cities: power greys (141 distinct shades), service
+  filtering (every visible POI has the service), colour by type, hover (radius 5.5 -> 6.5 + yellow
+  highlight) and the POI click popup (coordinates, address, type/service), no JS errors.
+
+## 2026-10-19
+
+- `utils/delta_g.py` `accessibility_non_bus_from_snap_map` (drive branch): the fuel term was
+  `vot * cost_per_liter / distance_for_liter`, i.e. the cost of one km of fuel charged as a flat
+  ~0.024 min on every car trip regardless of length (found while checking the authority document
+  against the code). It is now multiplied by the driven network distance `dist_km`; the last-mile
+  snap gaps are walked, so they add time but no fuel. To keep stale drive impedances from being
+  reused, `core/config.py` bumps `non_bus_cache_schema_version` 12 -> 13 (invalidates the per-node
+  non-bus caches and, via its run signature, the accessibility and service matrices), and
+  `exports/artifact_bundle.py` `load_impedance_bundle` now rejects a bundle whose manifest
+  `non_bus_cache_schema_version` differs from the config's -- previously only
+  `ARTIFACT_SCHEMA_VERSION` was checked, so an old `impedances.npz` would have been loaded and
+  routing skipped. The unused twin formula in `utils/get_impedance.py` is not changed yet.
+
+## 2026-11-03
+
+- `utils/services.py` `_build_runtime_structures`: the 2-additive Choquet capacity built from
+  the Shapley importances (`services.csv`) and interactions (`poi_types.csv`) was never checked
+  for monotonicity, and the final `max(0, min(1, total))` clamp in `choquet_integral` would
+  have silently masked a violation. Added a fail-fast load-time check: for each POI type,
+  `a_i + sum of its negative I_ij` must be >= 0 (the necessary and sufficient condition for a
+  2-additive capacity), otherwise a `choquet_interactions` config error names the service and
+  POI type. Current config passes (brute-forced over all subsets: min marginal gain
+  mu(S+i) - mu(S) = +0.12, mu(N) = 1 for all 12 services).

@@ -23,7 +23,7 @@ from utils import graphml
 from utils.poi_identity import SOURCE_KEY_COLUMNS, build_poi_source_key
 from utils.services import get_global_radius_m, unique_query_keys
 
-CITY = "paris"  # "cagliari" or "paris"
+CITY = "cagliari"  # "cagliari" or "paris"
 
 # Mirrors main.py: some helpers (e.g. utils.load_shapefile.feature_from_shapefile)
 # build their own bare PipelineConfig() rather than taking the caller's, and that
@@ -271,6 +271,48 @@ def _load_all_shapes(used_keys: set[str] | None, raw_rows: list[dict]) -> list[d
     return records
 
 
+def _load_all_points(used_keys) -> list[dict]:
+    """Point POIs as GeoJSON features: same properties as _load_all_shapes, minus
+    member_keys (a point has no fragments, so it is never merged). Reads the per-query
+    caches that _load_all_shapes' get_poi() calls already wrote, so run it after."""
+    code_to_raw_tag = _load_code_to_raw_tag()
+    records = []
+    seen_keys = set()
+    for query in unique_query_keys():
+        cache_path = _cached_geojson_path(query)
+        if not os.path.exists(cache_path):
+            continue
+        poi = gpd.read_file(cache_path)
+        if poi is None or poi.empty or "geometry" not in poi.columns:
+            continue
+        poi = poi[poi.geometry.geom_type == "Point"]
+        if poi.empty:
+            continue
+
+        col_vals = {col: poi[col].to_numpy() for col in SOURCE_KEY_COLUMNS if col in poi.columns}
+        raw_tags = poi["poi_raw_tag"].to_numpy() if "poi_raw_tag" in poi.columns else None
+        geoms = poi.geometry.to_numpy()
+
+        for i in range(len(poi)):
+            row_dict = {col: vals[i] for col, vals in col_vals.items()}
+            key = build_poi_source_key(row_dict, geoms[i])
+            if (used_keys is not None and key not in used_keys) or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            tag_value = code_to_raw_tag.get(str(raw_tags[i]), str(raw_tags[i])) if raw_tags is not None else "unknown"
+            records.append({
+                "type": "Feature",
+                "geometry": shapely.geometry.mapping(geoms[i]),
+                "properties": {
+                    "source_key": key,
+                    "poi_type": query.poi_type,
+                    "tag": tag_value,
+                    "name": row_dict.get("name"),
+                },
+            })
+    return records
+
+
 def _poi_type_order() -> list[str]:
     """poi_type values in the order they first appear in config/poi_types.csv."""
     order = []
@@ -288,6 +330,7 @@ OUTPUT_DIR = "tools/gi_bi_relabeling" if CITY == "cagliari" else "tools/gi_bi_re
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, "data.geojson")
 POI_TYPE_ORDER_PATH = os.path.join(OUTPUT_DIR, "poi_type_order.json")
 RAW_FRAGMENTS_PATH = os.path.join(OUTPUT_DIR, "raw_fragments.geojson")
+POINTS_PATH = os.path.join(OUTPUT_DIR, "points.geojson")
 
 
 def main() -> None:
@@ -309,6 +352,12 @@ def main() -> None:
     raw_fragments = _load_raw_fragments(raw_rows)
     with open(RAW_FRAGMENTS_PATH, "w", encoding="utf-8") as f:
         json.dump({"type": "FeatureCollection", "features": raw_fragments}, f, ensure_ascii=False, separators=(",", ":"))
+
+    if CITY == "cagliari":
+        points = _load_all_points(used_keys)
+        with open(POINTS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"type": "FeatureCollection", "features": points}, f, ensure_ascii=False, separators=(",", ":"))
+        print(f"Wrote {POINTS_PATH} ({len(points)} points)")
 
     used_desc = "all (no used-filter)" if used_keys is None else str(len(used_keys))
     print(f"Wrote {OUTPUT_PATH} ({len(features)} shapes, {used_desc} used POIs total)")

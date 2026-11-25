@@ -1,19 +1,12 @@
 #!/usr/bin/env Rscript
 #
-# Significance analysis of scenario capability ratings.
-#
-# For each scenario comparison folder under scenarios/<key>/, reads the
-# comparison_per_hexagon.csv that analysis/scenarios.py's export_comparison_csv() writes
-# (one row per hexagon, columns level_<capability>_<scenario_key>) and, for every non-baseline
-# arm, runs a paired Wilcoxon signed-rank test between that arm's ELECTRE level (1-5, ordered
-# categorical) and baseline's level at the same hexagon, plus a percentile bootstrap confidence
-# interval on the median level shift. Hexagons are matched by hex_id (same grid, so pairing is
-# exact); rows where either side is NA (no-data cell) are dropped before testing.
-#
-# The naive Wilcoxon p-value treats every hexagon as an independent trial, but adjacent hexagons
-# are spatially autocorrelated -- with ~1500 correlated hexagons this collapses to
-# machine-precision-zero p-values regardless of true effect size (see SPATIAL_BLOCK_TEST below
-# for the fix used for reporting/publication).
+# Significance analysis of scenario service averages.
+# Reads service_mean_<capability>_<arm> from comparison_per_hexagon.csv.
+# Capability assignment remains ELECTRE TRI; evaluation uses the equal-weight
+# arithmetic mean of constituent services, aggregated to the shared hexagon grid.
+# Paired differences are arm minus baseline on the 0-1 service-average scale.
+# Spatial block bootstrap intervals and block sign-flip tests retain within-block
+# dependence; block-size sensitivity remains necessary.
 #
 # Run with: Rscript analysis/significance_analysis.R
 # (no command-line arguments -- edit the knobs below instead, per project convention)
@@ -22,7 +15,7 @@
 # Which scenario folders (under scenarios/<key>/comparison_per_hexagon.csv) to include. A
 # scenario not yet run (e.g. new-metro before it's implemented) is skipped with a warning,
 # not a hard failure, so this list can stay ahead of what's actually been generated.
-SCENARIO_KEYS <- c("public-strike", "elder-student", "underservice-is-mirrionis", "new-metro")
+SCENARIO_KEYS <- c("public-strike", "elder-student", "underservice-is-mirrionis")
 
 # Capabilities scored by the pipeline (utils.capabilities / core.profiles.CAPABILITIES).
 CAPABILITIES <- c("restorativeness", "nutrition", "care")
@@ -32,18 +25,12 @@ N_BOOT <- 2000
 CONF_LEVEL <- 0.95
 BOOT_SEED <- 1
 
-# SCORE_MODE: which score column each test runs on.
-# "level"      -- the ELECTRE class (1-5, level_<capability>_<arm>). Always available, but
-#                 every node is one of 5 band midpoints, so ties (diff == 0) eat most of the
-#                 sample -- see n_changed in the output.
-# "continuous" -- the raw <capability>_<arm> score. Only carries real sub-band resolution when
-#                 the comparison_per_hexagon.csv was generated with analysis/scenarios.py's
-#                 CAPABILITY_SCORE_MODE = "continuous" knob (utils.capabilities.
-#                 electre_tri_continuous_score -- averaged outranking credibility, before the
-#                 lambda-cut classification). If that run used the default "discrete" mode
-#                 instead, this column is just the same 5-value score again and testing it here
-#                 gains nothing over "level".
-SCORE_MODE <- "continuous"
+# SCORE_MODE selects the measure, independently of capability assignment:
+# "service_mean"       -- arithmetic service averages (primary evaluation).
+# "service_mean_level" -- their ten display bands (secondary comparison).
+# "continuous"         -- stored ELECTRE capability scores (legacy comparison).
+# "level"              -- five ELECTRE display classes (legacy comparison).
+SCORE_MODE <- "service_mean"
 
 # SPATIAL_BLOCK_TEST: when TRUE, also run a spatial block sign-flip permutation test (Nichols &
 # Holmes 2002-style "randomise" approach) alongside the naive paired Wilcoxon, and add its
@@ -78,10 +65,29 @@ OUT_CSV <- file.path("scenarios", "significance_results.csv")
 # ── Implementation ──────────────────────────────────────────────────────────────────────
 
 #' Percentile bootstrap CI for the median of x (paired differences).
-bootstrap_median_ci <- function(x, n_boot = N_BOOT, conf_level = CONF_LEVEL) {
-  boot_medians <- replicate(n_boot, median(sample(x, length(x), replace = TRUE)))
+bootstrap_median_ci <- function(
+    x, block_id, n_boot = N_BOOT, conf_level = CONF_LEVEL) {
+
+  stopifnot(length(x) == length(block_id))
+
+  blocks <- split(x, block_id)
+  n_blocks <- length(blocks)
+
+  if (n_blocks < 2L) {
+    return(c(NA_real_, NA_real_))
+  }
+
+  boot_medians <- replicate(n_boot, {
+    selected <- sample.int(n_blocks, n_blocks, replace = TRUE)
+    values <- unlist(blocks[selected], use.names = FALSE)
+    median(values)
+  })
+
   alpha <- 1 - conf_level
-  unname(quantile(boot_medians, probs = c(alpha / 2, 1 - alpha / 2)))
+  unname(quantile(
+    boot_medians,
+    probs = c(alpha / 2, 1 - alpha / 2)
+  ))
 }
 
 #' Assign each hexagon to a spatial block via its centroid, by snapping (lon, lat) to a local
@@ -121,7 +127,7 @@ block_permutation_test <- function(diff, block_id, n_perm = N_PERM, seed = PERM_
   set.seed(seed)
   eps <- matrix(sample(c(-1, 1), n_perm * n_blocks, replace = TRUE), nrow = n_perm, ncol = n_blocks)
   eps_per_hex <- eps[, block_idx, drop = FALSE]  # n_perm x n_hexagons, block sign broadcast out
-  w_perm <- as.numeric(eps_per_hex %*% r)        # n_perm x 1
+  w_perm <- as.numeric(eps_per_hex %*% (r * s0))
 
   p_value <- (1 + sum(abs(w_perm) >= abs(w_obs))) / (n_perm + 1)
   list(p_value = p_value, n_blocks = n_blocks)
@@ -132,7 +138,7 @@ block_permutation_test <- function(diff, block_id, n_perm = N_PERM, seed = PERM_
 #' baseline-vs-arm and, for elder-student, the extra student-vs-elderly comparison.
 test_one <- function(scenario_key, capability, group_a, group_b, level_a, level_b,
                       centroid_lon = NULL, centroid_lat = NULL) {
-  keep <- !is.na(level_a) & !is.na(level_b)
+  keep <- is.finite(level_a) & is.finite(level_b)
   a_v <- level_a[keep]
   b_v <- level_b[keep]
   diff <- b_v - a_v
@@ -152,23 +158,42 @@ test_one <- function(scenario_key, capability, group_a, group_b, level_a, level_
 
   wt <- suppressWarnings(wilcox.test(b_v, a_v, paired = TRUE, exact = FALSE))
 
-  set.seed(BOOT_SEED)
-  ci <- bootstrap_median_ci(diff)
-
+  ci <- c(NA_real_, NA_real_)
   p_value_block_perm <- NA_real_
   n_blocks <- NA_integer_
-  if (SPATIAL_BLOCK_TEST && !is.null(centroid_lon) && !is.null(centroid_lat)) {
+
+  has_coordinates <- (
+    !is.null(centroid_lon) &&
+    !is.null(centroid_lat)
+  )
+
+  if (has_coordinates) {
     lon_k <- centroid_lon[keep]
     lat_k <- centroid_lat[keep]
-    # Only nonzero-diff hexagons carry information for the signed-rank statistic; ties (diff==0)
-    # would just contribute rank-weight to neither sign and slow down the permutation for nothing.
-    nz <- diff != 0
-    block_id <- assign_spatial_blocks(lon_k[nz], lat_k[nz], BLOCK_SIZE_M)
-    perm <- block_permutation_test(diff[nz], block_id)
-    p_value_block_perm <- perm$p_value
-    n_blocks <- perm$n_blocks
+
+    has_coordinates <- (
+      all(is.finite(lon_k)) &&
+      all(is.finite(lat_k))
+    )
   }
 
+  if (has_coordinates) {
+    # All paired differences, including zeros, enter the bootstrap.
+    block_id <- assign_spatial_blocks(lon_k, lat_k, BLOCK_SIZE_M)
+
+    set.seed(BOOT_SEED)
+    ci <- bootstrap_median_ci(diff, block_id)
+
+    if (SPATIAL_BLOCK_TEST) {
+      # The signed-rank test excludes zero differences.
+      nz <- diff != 0
+      perm <- block_permutation_test(diff[nz], block_id[nz])
+      p_value_block_perm <- perm$p_value
+      n_blocks <- perm$n_blocks
+    }
+  } else {
+    warning("Missing or invalid centroids: spatial confidence interval unavailable.")
+  }
   data.frame(
     scenario = scenario_key, capability = capability, group_a = group_a, group_b = group_b,
     n_hexagons = n, n_changed = n_changed, pct_changed = 100 * n_changed / n,
@@ -179,10 +204,15 @@ test_one <- function(scenario_key, capability, group_a, group_b, level_a, level_
   )
 }
 
-# Column prefix for the chosen SCORE_MODE. "level" columns are named level_<cap>_<arm>;
-# "continuous" columns are bare <cap>_<arm> (no prefix) -- see export_comparison_csv() in
-# analysis/scenarios.py.
-.score_col_prefix <- if (SCORE_MODE == "continuous") "" else "level_"
+# Explicit prefixes prevent service-average tests from consuming ELECTRE scores.
+.score_col_prefix <- switch(
+  SCORE_MODE,
+  service_mean = "service_mean_",
+  service_mean_level = "service_mean_level_",
+  continuous = "",
+  level = "level_",
+  stop(sprintf("Unknown SCORE_MODE: %s", SCORE_MODE))
+)
 
 #' Run every capability x non-baseline-arm test found in one scenario's comparison CSV.
 process_scenario <- function(scenario_key) {
@@ -194,6 +224,17 @@ process_scenario <- function(scenario_key) {
   }
 
   df <- read.csv(csv_path, stringsAsFactors = FALSE)
+  if (SCORE_MODE %in% c("service_mean", "service_mean_level")) {
+    if (!"evaluation_method" %in% names(df) ||
+        anyNA(df$evaluation_method) ||
+        !all(df$evaluation_method == "service_mean")) {
+      stop(sprintf("[%s] regenerate comparison CSVs with separate service-average outputs", scenario_key))
+    }
+    required <- paste0(.score_col_prefix, CAPABILITIES, "_baseline")
+    if (!all(required %in% names(df))) {
+      stop(sprintf("[%s] missing service-average baseline columns; regenerate scenario exports", scenario_key))
+    }
+  }
   has_centroids <- all(c("centroid_lon", "centroid_lat") %in% names(df))
   if (SPATIAL_BLOCK_TEST && !has_centroids) {
     warning(sprintf("[%s] centroid_lon/centroid_lat not found; skipping spatial block test for this scenario",
@@ -251,6 +292,9 @@ if (is.null(all_results) || nrow(all_results) == 0) {
 all_results$p_adj_bh <- p.adjust(all_results$p_value, method = "BH")
 all_results$p_adj_bh_block_perm <- p.adjust(all_results$p_value_block_perm, method = "BH")
 all_results$score_mode <- SCORE_MODE
+all_results$aggregation_method <- if (SCORE_MODE %in% c("service_mean", "service_mean_level")) "arithmetic_service_mean" else "electre_tri"
+all_results$ci_method <- "spatial_block_bootstrap"
+all_results$ci_block_size_m <- BLOCK_SIZE_M
 all_results$block_size_m <- if (SPATIAL_BLOCK_TEST) BLOCK_SIZE_M else NA
 
 all_results <- all_results[order(all_results$scenario, all_results$capability, all_results$group_a, all_results$group_b), ]
@@ -261,9 +305,8 @@ write.csv(all_results, OUT_CSV, row.names = FALSE)
 cat("\n=== Significance analysis: baseline vs. each scenario arm ===\n")
 cat(sprintf("SCORE_MODE = %s.  Paired Wilcoxon signed-rank test, %d%% bootstrap CI on median shift.\n",
             SCORE_MODE, as.integer(100 * CONF_LEVEL)))
-if (SCORE_MODE == "continuous") {
-  cat("NOTE: continuous columns only carry real sub-band resolution if comparison_per_hexagon.csv\n")
-  cat("was generated with analysis/scenarios.py's CAPABILITY_SCORE_MODE = \"continuous\" knob.\n")
+if (SCORE_MODE == "service_mean") {
+  cat("Effect sizes are scenario-minus-reference arithmetic service averages on the 0-1 scale.\n")
 }
 if (SPATIAL_BLOCK_TEST) {
   cat(sprintf("Spatial block sign-flip permutation test: BLOCK_SIZE_M=%d, N_PERM=%d.\n",

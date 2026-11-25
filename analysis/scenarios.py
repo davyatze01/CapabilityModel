@@ -23,6 +23,11 @@ from types import SimpleNamespace
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from utils.capabilities import (
+    SCORE_BOUNDS,
+)
+
+
 # Allow running directly (python analysis/scenarios.py): put the project root on sys.path and
 # make it the cwd, since config paths and the outputs/scenarios/experiments dirs are relative
 # to the project root. Mirrors the bootstrap in ops/*.py.
@@ -73,7 +78,7 @@ STUDY_CITY: str = "cagliari"
 #                                    in the Is Mirrionis neighbourhood (Cagliari) from the POI set
 #
 #   Ignored when RUN_ALL_SCENARIOS is True (below) — use ALL_SCENARIO_KEYS instead.
-SCENARIO: str = "new-metro"
+SCENARIO: str = "public-strike"
 
 # RUN_ALL_SCENARIOS: when True, `python scenarios.py` runs every key in ALL_SCENARIO_KEYS in
 # one process instead of just SCENARIO — no need to edit SCENARIO and rerun per comparison.
@@ -93,7 +98,6 @@ ALL_SCENARIO_KEYS: tuple[str, ...] = (
     "public-strike",
     "elder-student",
     "underservice-is-mirrionis",
-    "new-metro",
 )
 
 # When the comparison QGIS project auto-opens (cfg.open_qgis_after_run), whether the
@@ -110,16 +114,9 @@ QGIS_SHOW_PER_SCENARIO_GRIDS_BY_DEFAULT: bool = False
 # RUN_ALL_SCENARIOS so a multi-scenario batch doesn't pop up a QGIS window per comparison.
 SKIP_QGIS_OPEN: bool = False
 
-# CAPABILITY_SCORE_MODE: which capability-score formula this comparison run computes with
-# (PipelineConfig.capability_score_mode). "discrete" (default) reproduces the exact production
-# behavior -- every node's score is one of 5 ELECTRE band midpoints (0.1/0.3/0.5/0.7/0.9), so
-# comparison_per_hexagon.csv's continuous columns (<cap>_<key>) carry no more information than
-# the level columns. "continuous" instead writes utils.capabilities.
-# electre_tri_continuous_score() -- the averaged outranking credibility, before the lambda-cut
-# classification step -- giving the continuous columns real sub-band resolution to test
-# significance against (see analysis/significance_analysis.R's SCORE_MODE knob). Statistics-only:
-# does not change the level_<cap>_<key> columns or the per-scenario grid map's legend classes.
-CAPABILITY_SCORE_MODE: str = "continuous"
+# Capability maps retain ELECTRE TRI. Scenario evaluation uses the separate
+# arithmetic service_mean_* outputs, irrespective of this capability-score mode.
+CAPABILITY_SCORE_MODE: str = "discrete"
 
 # Routing-disruption scenarios (reuse the bundle) vs. persona scenarios (re-route from scratch).
 # A name here dispatches to its own run_*_comparison; anything else must be a profiles.SCENARIOS key.
@@ -556,11 +553,13 @@ class ScenarioRunner:
         if not dfs:
             return None
         
-        # Merge all capability CSVs on node_id
-        merged = dfs[list(dfs.keys())[0]][["node_id", "lat", "lon"]].copy()
-        for cap_type, df in dfs.items():
-            merged[f"capability_{cap_type}"] = df["capability_" + cap_type]
-        
+        # Combined and legacy per-capability CSVs are both joined by node identity.
+        merged = next(iter(dfs.values()))[["node_id", "lat", "lon"]].copy()
+        for df in dfs.values():
+            columns = [c for c in df.columns if c.startswith(("capability_", "service_mean_"))
+                       and c not in merged.columns]
+            merged = merged.merge(df[["node_id"] + columns], on="node_id", how="left", validate="one_to_one")
+
         return merged
     
     def compare_scenarios(
@@ -584,15 +583,16 @@ class ScenarioRunner:
             columns={
                 col: f"{col}_{list(scenario_dfs.keys())[0]}"
                 for col in comparison.columns
-                if col.startswith("capability_")
+                if col.startswith(("capability_", "service_mean_"))
             }
         )
         
         for scenario_name in list(scenario_dfs.keys())[1:]:
             df = scenario_dfs[scenario_name]
             for col in df.columns:
-                if col.startswith("capability_"):
-                    comparison[f"{col}_{scenario_name}"] = df[col]
+                if col.startswith(("capability_", "service_mean_")):
+                    aligned = df.set_index("node_id")[col]
+                    comparison[f"{col}_{scenario_name}"] = comparison["node_id"].map(aligned)
         
         # Compute differences from baseline
         baseline_name = list(scenario_dfs.keys())[0]
@@ -600,8 +600,8 @@ class ScenarioRunner:
         
         for scenario_name in scenario_names_for_diff:
             for cap_type in ["restorativeness", "nutrition", "care"]:
-                baseline_col = f"capability_{cap_type}_{baseline_name}"
-                scenario_col = f"capability_{cap_type}_{scenario_name}"
+                baseline_col = f"service_mean_{cap_type}_{baseline_name}"
+                scenario_col = f"service_mean_{cap_type}_{scenario_name}"
                 diff_col = f"diff_{cap_type}_{scenario_name}"
                 
                 if baseline_col in comparison.columns and scenario_col in comparison.columns:
@@ -622,8 +622,13 @@ class ScenarioRunner:
         os.makedirs(output_dir, exist_ok=True)
         
         # Get all capability columns
-        capability_cols = [col for col in comparison_df.columns if col.startswith("capability_")]
-        scenario_names = list(set([col.rsplit("_", 1)[-1] for col in capability_cols]))
+        capability_cols = [col for col in comparison_df.columns if col.startswith("service_mean_")]
+        scenario_names = list(dict.fromkeys(
+            col[len(f"service_mean_{cap}_"):]
+            for col in capability_cols
+            for cap in ("restorativeness", "nutrition", "care")
+            if col.startswith(f"service_mean_{cap}_")
+        ))
         capability_types = ["restorativeness", "nutrition", "care"]
         
         for cap_type in capability_types:
@@ -632,7 +637,7 @@ class ScenarioRunner:
             # Plot 1: Distribution comparison
             ax = axes[0]
             for scen_name in scenario_names:
-                col = f"capability_{cap_type}_{scen_name}"
+                col = f"service_mean_{cap_type}_{scen_name}"
                 if col in comparison_df.columns:
                     ax.hist(
                         comparison_df[col].dropna(),
@@ -640,7 +645,7 @@ class ScenarioRunner:
                         label=scen_name,
                         bins=30
                     )
-            ax.set_xlabel("Capability Score")
+            ax.set_xlabel("Mean service score")
             ax.set_ylabel("Frequency")
             ax.set_title(f"Distribution: Capability {cap_type}")
             ax.legend()
@@ -658,7 +663,7 @@ class ScenarioRunner:
                             label=f"vs {scen_name}",
                             bins=30
                         )
-                ax.set_xlabel("Capability Difference")
+                ax.set_xlabel("Mean service score difference")
                 ax.set_ylabel("Frequency")
                 ax.set_title(f"Impact on Capability {cap_type}")
                 ax.legend()
@@ -679,7 +684,7 @@ class ScenarioRunner:
             
             for scen_name in scenario_names:
                 for cap_type in capability_types:
-                    col = f"capability_{cap_type}_{scen_name}"
+                    col = f"service_mean_{cap_type}_{scen_name}"
                     if col in comparison_df.columns:
                         data = comparison_df[col].dropna()
                         writer.writerow([
@@ -811,7 +816,7 @@ if {basemap_flag}:
         project.addMapLayer(osm_layer)
 
 def load_layer(gpkg_path, layer_name):
-    layer = QgsVectorLayer(gpkg_path + "|layername=capability_points", layer_name, "ogr")
+    layer = QgsVectorLayer(gpkg_path + "|layername=capability_points|option:LIST_ALL_TABLES=YES", layer_name, "ogr")
     if not layer.isValid():
         layer = QgsVectorLayer(gpkg_path, layer_name, "ogr")
     return layer
@@ -971,23 +976,28 @@ class ProfileRunner:
         }
 
 
-# ELECTRE class bands: a capability score in [0,1] maps to an integer level 1..5
-# (Very Low .. Very High). Sourced from utils.capabilities so this never drifts from the
-# bounds/colors main.py's own QGIS export uses for the same capability grids.
-_ELECTRE_UPPER_BOUNDS = tuple(ELECTRE_BOUNDS[1:-1])       # internal band edges: (0.2,0.4,0.6,0.8)
+# ELECTRE classes for capabilities; ten 0.1-wide service-mean bands for evaluation.
+_ELECTRE_UPPER_BOUNDS = tuple(ELECTRE_BOUNDS[1:-1])
+_SCORE_UPPER_BOUNDS = tuple(SCORE_BOUNDS[1:-1])
 
-# Red–Yellow–Green diverging palette for level differences −4..+4 (ColorBrewer RdYlGn-9).
-# Index 0 == −4 (deepest red, second scenario 4 levels lower), 4 == 0 (yellow, same),
-# 8 == +4 (deepest green, second scenario 4 levels higher).
-_DIFF_LEVELS = (-4, -3, -2, -1, 0, 1, 2, 3, 4)
+# Signed changes in service-mean bands: -9 .. +9.
+_DIFF_LEVELS = tuple(range(-9, 10))
+
 _DIFF_COLORS = (
-    "#a50026", "#d73027", "#f46d43", "#fdae61", "#ffffbf",
-    "#a6d96a", "#66bd63", "#1a9850", "#006837",
+    "#a50026", "#bd1826", "#d73027",
+    "#e64b35", "#f46d43", "#f99153",
+    "#fdae61", "#fed081", "#ffedab",
+    "#ffffbf",
+    "#ebf7ad", "#d2ec91", "#b5df74",
+    "#96d265", "#75c45a", "#58b453",
+    "#3aa247", "#198c46", "#006837",
 )
 
 
+
+
 def _capability_level(series):
-    """Map continuous capability scores in [0,1] to integer ELECTRE levels 1..5.
+    """Map ELECTRE capability scores to the five display classes.
 
     NaN scores stay NaN (so no-data cells are skipped downstream).
     """
@@ -995,10 +1005,30 @@ def _capability_level(series):
     import pandas as pd
 
     values = pd.to_numeric(series, errors="coerce")
-    levels = np.digitize(values.to_numpy(dtype=float), _ELECTRE_UPPER_BOUNDS) + 1
+    levels = np.digitize(
+        values.to_numpy(dtype=float), _ELECTRE_UPPER_BOUNDS
+    ) + 1
     out = pd.Series(levels, index=series.index, dtype="float64")
     out[values.isna()] = np.nan
     return out
+
+
+def _service_mean_level(series):
+    """Ten display bands for service averages; NaN remains no-data."""
+    values = pd.to_numeric(series, errors="coerce")
+    levels = np.digitize(values.to_numpy(dtype=float), _SCORE_UPPER_BOUNDS) + 1
+    return pd.Series(levels, index=series.index, dtype="float64").where(values.notna())
+
+
+def _service_mean_scores(grid, capability):
+    """Require explicit service means: never substitute ELECTRE scores or stale grids."""
+    column = f"grid_mean_service_mean_{capability}"
+    if column not in grid.columns:
+        raise ValueError(
+            f"Missing {column!r}; regenerate baseline and scenario capability CSVs and grids "
+            "to export separate service-average evaluation scores."
+        )
+    return pd.to_numeric(grid[column], errors="coerce")
 
 
 def _load_grid_layer(gpkg_path):
@@ -1010,10 +1040,10 @@ def _load_grid_layer(gpkg_path):
 
 
 def build_profile_difference_gpkg(results: List[Dict], out_gpkg: str) -> Dict[tuple, Dict[str, str]]:
-    """Build a gpkg of pairwise per-capability level-difference grids.
+    """Build a gpkg of pairwise service-mean band-difference grids.
 
     For every scenario pair (A, B) in listing order and every capability, each hexagon gets
-    ``d_<capability> = level_B − level_A`` (negative = B lower → red, positive = B higher →
+    ``d_<capability> = service_mean_band_B − service_mean_band_A`` (negative = B lower → red, positive = B higher →
     green, 0 = same → yellow). Cells lacking data in either scenario are left NULL.
 
     Each (pair, capability) gets its own layer/table (``diff_<A>_to_<B>__<capability>``), one
@@ -1045,8 +1075,7 @@ def build_profile_difference_gpkg(results: List[Dict], out_gpkg: str) -> Dict[tu
         has_data = g["has_data"].astype(bool) if "has_data" in g.columns else True
         frame = g[["hex_id"]].copy()
         for cap in CAPABILITIES:
-            col = f"grid_mean_{cap}"
-            lvl = _capability_level(g[col]) if col in g.columns else None
+            lvl = _service_mean_level(_service_mean_scores(g, cap))
             if lvl is not None:
                 # blank out no-data cells so they don't read as level 1
                 lvl = lvl.where(has_data)
@@ -1095,6 +1124,9 @@ def export_comparison_csv(results: List[Dict], out_csv: str) -> "str | None":
     differences (``dcont_<capability>_<a>_to_<b>`` = B − A, ``dlevel_<capability>_<a>_to_<b>``).
     Hexagons are aligned by ``hex_id`` (the grid geometry is shared across scenarios), so each
     row pairs the same location across scenarios — ready for a paired test (Wilcoxon/paired-t).
+    Separate ``service_mean_<capability>_<key>`` and ``service_mean_level_*`` columns
+    carry arithmetic service means and their ten display bands for scenario evaluation.
+    ``dmean_*`` and ``dmeanlevel_*`` are their B-minus-A differences.
     No-data cells are left blank.
     """
     import itertools
@@ -1115,6 +1147,8 @@ def export_comparison_csv(results: List[Dict], out_csv: str) -> "str | None":
     # Continuous scores + ELECTRE levels per scenario, indexed by hex_id.
     cont_by_key: Dict[str, object] = {}
     level_by_key: Dict[str, object] = {}
+    means_by_key: Dict[str, object] = {}
+    mean_levels_by_key: Dict[str, object] = {}
     base_frame = None
     for k in keys:
         g = grids[k].copy()
@@ -1135,6 +1169,14 @@ def export_comparison_csv(results: List[Dict], out_csv: str) -> "str | None":
                 lvl = lvl.where(has_data)
             lvl_frame[cap] = lvl
         level_by_key[k] = lvl_frame.set_index("hex_id")
+        mean_frame = g[["hex_id"]].copy()
+        mean_level_frame = g[["hex_id"]].copy()
+        for cap in CAPABILITIES:
+            means = _service_mean_scores(g, cap).where(has_data)
+            mean_frame[cap] = means
+            mean_level_frame[cap] = _service_mean_level(means)
+        means_by_key[k] = mean_frame.set_index("hex_id")
+        mean_levels_by_key[k] = mean_level_frame.set_index("hex_id")
         if base_frame is None:
             # Centroid in the grid's own (projected) CRS, then reprojected to lon/lat — accurate
             # and warning-free vs. taking a centroid directly on geographic coordinates.
@@ -1156,13 +1198,19 @@ def export_comparison_csv(results: List[Dict], out_csv: str) -> "str | None":
         for cap in CAPABILITIES:
             out[f"{cap}_{k}"] = cont_by_key[k][cap]
             out[f"level_{cap}_{k}"] = level_by_key[k][cap]
+            out[f"service_mean_{cap}_{k}"] = means_by_key[k][cap]
+            out[f"service_mean_level_{cap}_{k}"] = mean_levels_by_key[k][cap]
 
     for i, j in itertools.combinations(range(len(keys)), 2):
         a, b = keys[i], keys[j]
         for cap in CAPABILITIES:
             out[f"dcont_{cap}_{a}_to_{b}"] = cont_by_key[b][cap] - cont_by_key[a][cap]
             out[f"dlevel_{cap}_{a}_to_{b}"] = level_by_key[b][cap] - level_by_key[a][cap]
+            out[f"dmean_{cap}_{a}_to_{b}"] = means_by_key[b][cap] - means_by_key[a][cap]
+            out[f"dmeanlevel_{cap}_{a}_to_{b}"] = mean_levels_by_key[b][cap] - mean_levels_by_key[a][cap]
 
+    out["evaluation_method"] = "service_mean"
+    out["capability_score_mode"] = CAPABILITY_SCORE_MODE
     out_path = Path(out_csv)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out.reset_index().to_csv(out_path, index=False)
@@ -1264,7 +1312,7 @@ def style_diff(layer, field, levels, colors):
             continue
         sym.setColor(QColor(col))
         if lvl == 0:
-            lbl = "0 (same level)"
+            lbl = "0 (same service-mean band)"
         elif lvl < 0:
             lbl = "%d (second %d lower)" % (lvl, -lvl)
         else:
@@ -1316,12 +1364,12 @@ def add_grid(gpkg, table, name, group):
 # (rendered on top). Diff grids first (so they draw on top of the scenario grids beneath
 # them), then per-scenario capability grids, then the OSM basemap forced to the very bottom.
 
-# --- Pairwise difference grids (red/yellow/green by level difference), on top -----------
+# --- Pairwise difference grids (red/yellow/green by service-mean band change), on top -----------
 diff_groups = {{}}
 for a, b, cap, layer_name in P["pair_layers"]:
     group = diff_groups.get((a, b))
     if group is None:
-        group = root.addGroup("Δ " + a + " → " + b)
+        group = root.addGroup("Δ service mean " + a + " → " + b)
         group.setExpanded(False)
         diff_groups[(a, b)] = group
     layer = add_grid(P["diff_gpkg"], layer_name, a + "→" + b + " — " + cap, group)
@@ -1336,20 +1384,18 @@ for key in P["scenario_order"]:
     group.setExpanded(False)
     group.setItemVisibilityChecked(bool(P["show_per_scenario_grids_by_default"]))
     for cap in P["capabilities"]:
-        layer = add_grid(gpkg, P["grid_table"], key + " — " + cap, group)
+        # Each capability gets its own sidecar view (capability_<cap>, created by
+        # _create_service_grid_views in generate_experiment_shapefiles.py) instead of the
+        # shared grid table -- a GeoPackage can only mark one style default per table, so
+        # loading all 3 capabilities off the same table left two of them unstyled on a
+        # plain open. One view per capability means one default style each, with no
+        # collision.
+        layer = add_grid(gpkg, "capability_" + cap, key + " — " + cap, group)
         if layer is not None:
             shades = P["capability_shades"].get(cap)
             if shades:
                 style_electre(layer, "grid_mean_" + cap, shades, P["cap_labels"])
-                # Scenario runs set open_qgis_after_run=False (SKIP_QGIS_OPEN), which skips
-                # pipeline_runner.py's own style-embedding pass -- so these per-scenario grid
-                # gpkgs would otherwise carry no default style at all when opened standalone.
-                # This table is shared across all 3 capabilities (no per-capability sidecar
-                # views here, unlike pipeline_runner's own main output), so a GeoPackage can
-                # only mark one style default per table: give that slot to the scenario's
-                # configured default capability; the others are saved as named, non-default
-                # styles reachable via QGIS's "Load Style from Database".
-                embed_style(layer, cap, is_default=(cap == P["default_capability"]))
+                embed_style(layer, cap)
 
 # --- OSM basemap last, forced to the bottom of the layer tree (rendered first/behind) ----
 if P["basemap"]:
@@ -1781,7 +1827,8 @@ def run_all_scenarios():
         if baseline_gpkg.exists():
             try:
                 import geopandas as gpd
-                baseline_test_df = gpd.read_file(baseline_gpkg, layer="capability_points")
+                baseline_test_df = gpd.read_file(baseline_gpkg, layer="capability_points",
+                                                 engine="pyogrio", LIST_ALL_TABLES="YES")
                 baseline_care_mean = baseline_test_df['capability_care'].mean()
                 print(f"[QGIS] Baseline geopackage care mean: {baseline_care_mean:.4f}", flush=True)
                 
@@ -1874,3 +1921,7 @@ if __name__ == "__main__":
     else:
         # The SCENARIO knob at the top of this file selects the comparison to run.
         _dispatch_scenario(SCENARIO)
+
+    from analysis.merge_scenario_differences import merge_all
+    print("\n[Merge] Rebuilding scenarios/all_scenarios_differences.gpkg...", flush=True)
+    merge_all()

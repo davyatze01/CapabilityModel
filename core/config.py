@@ -38,16 +38,16 @@ ELECTRE_P: float = 0.06   # preference threshold
 ELECTRE_Q_FACTOR: float = 0.2   # indifference threshold  q = std(x) * Q_FACTOR
 ELECTRE_P_FACTOR: float = 0.8   # preference threshold    p = std(x) * P_FACTOR
 # ELECTRE TRI's 5-class boundaries (Very Low/Low/Medium/High/Very High cut points),
-# frozen from a Jenks natural-breaks calibration against a baseline run's capability
-# score distribution -- see analysis/calibrate_electre_boundaries.py. Recalibrating
-# means rerunning that script (set its CITY_SLUG) and pasting its output below.
+# currently set to uniform quintiles over [0, 1] rather than the Jenks natural-breaks
+# calibration that analysis/calibrate_electre_boundaries.py produces. To go back to a
+# data-driven set, rerun that script (set its CITY_SLUG) and paste its output below.
 # One set per calibration city; auto-follows study_city (mirrors PipelineConfig.study_city's
 # own default) rather than a separate manual knob, so the boundaries always match whichever
 # city CAP_STUDY_CITY/main.py's study_city selects. Falls back to "cagliari" for any city
 # without its own calibrated set.
 ELECTRE_BOUNDARIES_BY_PROFILE: dict[str, list[float]] = {
-    "cagliari": [0.35, 0.51, 0.66, 0.80],
-    "paris": [0.35, 0.51, 0.66, 0.80],
+    "cagliari": [0.2, 0.4, 0.6, 0.8],
+    "paris": [0.2, 0.4, 0.6, 0.8],
 }
 ELECTRE_BOUNDARIES_PROFILE: str = normalize_study_city(os.getenv("CAP_STUDY_CITY", "cagliari"))
 ELECTRE_BOUNDARIES: list[float] = ELECTRE_BOUNDARIES_BY_PROFILE.get(
@@ -186,17 +186,15 @@ class PipelineConfig:
     qgis_project_path: str = ""
     qgis_autostyle_project: bool = True
     default_capability: str = "capability_care"
-    # Which capability-score formula capability_stage.py writes into capability_<name>:
-    # "discrete" (default) = the ELECTRE TRI band midpoint (0.1/0.3/0.5/0.7/0.9, current
-    # production behavior, unchanged). "continuous" = utils.capabilities.
-    # electre_tri_continuous_score(), the raw outranking credibility averaged across the 4
-    # boundaries -- a statistics-only knob for testing whether scenario comparisons show more
-    # significant effects with the resolution the band midpoint collapses away (see
-    # analysis/scenarios.py's CAPABILITY_SCORE_MODE knob). Leave "discrete" for any run whose
-    # output should match the existing maps/legends.
+    # Capability assignment uses ELECTRE TRI. Separate service_mean_* outputs
+    # always use arithmetic means for scenario evaluation and significance tests.
+    # Alternative capability modes remain available for explicit experiments.
     capability_score_mode: str = "discrete"
     qgis_autostyle_ramp: str = "Viridis"
     show_basemap: bool = True
+    # Offline background (study-area fill, water, main roads) written into the gpkg, for
+    # viewing without tile servers (exports/offline_basemap.py).
+    qgis_offline_basemap: bool = True
     qgis_grid_enabled: bool = True
     hexagon_radius: float = 100.0
     # Signature colour for each capability, in the order capabilities are defined
@@ -306,7 +304,7 @@ class PipelineConfig:
     enable_progress: bool = True
 
     non_bus_cache_dir: str = ""
-    non_bus_cache_schema_version: int = 12
+    non_bus_cache_schema_version: int = 13
     # Shared per-poi_type {src_keys, source_coords} catalog -- written once by the live
     # pipeline and restored to this same path when an impedance bundle is loaded, so
     # both paths give the accessibility stage one place to resolve a node's kept_idx.

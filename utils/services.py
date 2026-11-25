@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import json
+import os
 import re
 import ast
 from collections import OrderedDict
@@ -9,8 +10,11 @@ from pathlib import Path
 from typing import Any
 
 
-CONFIG_CSV_PATH = Path(__file__).resolve().parents[1] / "config" / "poi_types.csv"
-SERVICES_CSV_PATH = Path(__file__).resolve().parents[1] / "config" / "services.csv"
+_CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
+# Overridable per process so a sensitivity-sweep worker reads its own perturbed copy
+# instead of the shared config/ files another concurrent run may be importing.
+CONFIG_CSV_PATH = Path(os.environ.get("CAP_POI_TYPES_CSV") or _CONFIG_DIR / "poi_types.csv")
+SERVICES_CSV_PATH = Path(os.environ.get("CAP_SERVICES_CSV") or _CONFIG_DIR / "services.csv")
 
 # Remaps the discrete contribution_coefficient tiers read from services.csv without
 # editing the file -- e.g. {5:15,10:30,30:90,50:150,80:240} for a run with a rescaled
@@ -412,7 +416,52 @@ def _build_runtime_structures(rows: list[dict[str, Any]]):
                 else:
                     # Use the mean when both directional entries are provided.
                     pair_val = float(sum(vals) / len(vals))
-                service_pairwise_m[service][(poi_types[i], poi_types[j])] = float(pair_val)
+                # Key alphabetically, matching how cap() builds its lookup key.
+                key_names = tuple(sorted((poi_types[i], poi_types[j])))
+                service_pairwise_m[service][key_names] = float(pair_val)
+
+    # services.csv holds Shapley importances (phi_i) and poi_types.csv holds Shapley
+    # interaction indices (I_ij). The Choquet integral consumes the Mobius form:
+    #     a_ij = I_ij                            (identity, for a 2-additive capacity)
+    #     a_i  = phi_i - 0.5 * sum_{j != i} I_ij
+    # This yields mu(N) == sum(phi_i) == 1.0 exactly, so the Choquet needs no
+    # output normalization. SERVICE_SINGLETON_M stays Shapley for the exports
+    # that use it as a plain importance weight.
+    service_mobius_m: "OrderedDict[str, dict[str, float]]" = OrderedDict()
+    for service, queries in service_poi_queries.items():
+        poi_types = [q.poi_type for q in queries]
+        phi = service_singleton_m[service]
+        pairwise = service_pairwise_m[service]
+
+        shapley_total = sum(float(phi[p]) for p in poi_types)
+        if abs(shapley_total - 1.0) > 1e-9:
+            raise _config_error(
+                None,
+                "choquet_capacity",
+                f"service {service!r}: Shapley importances must sum to 1.0, got {shapley_total:.6f}",
+            )
+
+        service_mobius_m[service] = {}
+        for poi in poi_types:
+            shared = sum(
+                float(pairwise.get(tuple(sorted((poi, other))), 0.0))
+                for other in poi_types
+                if other != poi
+            )
+            service_mobius_m[service][poi] = float(phi[poi]) - 0.5 * shared
+            neg_interactions = sum(
+                min(0.0, float(pairwise.get(tuple(sorted((poi, other))), 0.0)))
+                for other in poi_types
+                if other != poi
+            )
+            if service_mobius_m[service][poi] + neg_interactions < -1e-12:
+                raise _config_error(
+                    None,
+                    "choquet_interactions",
+                    f"service {service!r}, poi_type {poi!r}: capacity not monotone "
+                    f"(a_i={service_mobius_m[service][poi]:+.4f} + negative I_ij sum "
+                    f"{neg_interactions:+.4f} < 0)",
+                )
 
     return (
         dict(service_poi_queries),
@@ -420,6 +469,7 @@ def _build_runtime_structures(rows: list[dict[str, Any]]):
         decay_coefficients,
         dict(contribution_coefficients),
         dict(service_pairwise_m),
+        dict(service_mobius_m),
     )
 
 
@@ -534,6 +584,7 @@ _ROWS = _load_rows()
     POI_DECAY_COEFFICIENTS,
     SERVICE_CONTRIBUTION_COEFFICIENTS,
     SERVICE_PAIRWISE_M,
+    SERVICE_MOBIUS_M,
 ) = _build_runtime_structures(_ROWS)
 SERVICE_KEYS = list(SERVICE_POI_QUERIES.keys())
 _bootstrap_compatibility_checks()
@@ -710,7 +761,7 @@ def cap(S, service):
     mu = 0.0
     subset = list(S)
     for i, poi_i in enumerate(subset):
-        mu += float(SERVICE_SINGLETON_M[service][poi_i])
+        mu += float(SERVICE_MOBIUS_M[service][poi_i])
         for poi_j in subset[i + 1 :]:
             pair = (poi_i, poi_j) if poi_i < poi_j else (poi_j, poi_i)
             mu += float(SERVICE_PAIRWISE_M.get(service, {}).get(pair, 0.0))
@@ -719,6 +770,9 @@ def cap(S, service):
 
 def choquet_integral(x, service):
     """Aggregate POI-type accessibility values into one service score.
+
+    Uses the Mobius form of the 2-additive Choquet integral:
+        C(x) = sum_i a_i * x_i + sum_{i<j} I_ij * min(x_i, x_j)
 
     Inputs:
     - x: POI accessibility values aligned to service POI order.
@@ -732,83 +786,102 @@ def choquet_integral(x, service):
         return 0.0
     # Accessibility inputs are expected in [0, 1], but clamp defensively.
     x_clamped = [max(0.0, min(1.0, float(v))) for v in x]
-    order = sorted(range(n), key=lambda i: x_clamped[i])
-    x_sorted = [x_clamped[i] for i in order]
     poi_types = [q.poi_type for q in SERVICE_POI_QUERIES[service]]
+    mobius = SERVICE_MOBIUS_M[service]
+    pairwise = SERVICE_PAIRWISE_M.get(service, {})
 
+    # Mobius form of the 2-additive Choquet integral. mu(N) == 1 by construction
+    # (see _build_runtime_structures), so no normalization step is needed.
     total = 0.0
-    prev = 0.0
-    for j in range(n):
-        tail = [poi_types[i] for i in order[j:]]
-        total += (x_sorted[j] - prev) * cap(tail, service)
-        prev = x_sorted[j]
+    for i in range(n):
+        poi_i = poi_types[i]
+        total += float(mobius[poi_i]) * x_clamped[i]
+        for j in range(i + 1, n):
+            poi_j = poi_types[j]
+            pair = (poi_i, poi_j) if poi_i < poi_j else (poi_j, poi_i)
+            interaction = float(pairwise.get(pair, 0.0))
+            if interaction:
+                total += interaction * min(x_clamped[i], x_clamped[j])
 
-    # Normalize by measure of the full set so service scores are bounded in [0, 1].
-    mu_full = float(cap(poi_types, service))
-    if mu_full <= 0.0:
-        return 0.0
-    normalized = total / mu_full
-    return max(0.0, min(1.0, normalized))
+    return max(0.0, min(1.0, total))
 
 
 def choquet_integral_details(x, service):
-    """Return a detailed Choquet integral breakdown for debugging."""
+    """Return a detailed Choquet integral breakdown for debugging.
+
+    Mirrors `choquet_integral`: one entry per Mobius singleton term
+    (a_i * x_i) and one per non-zero pair term (I_ij * min(x_i, x_j)).
+    """
     n = len(x)
     if n == 0:
         return {
             "service": service,
             "input": [],
-            "sorted_indices": [],
-            "sorted_values": [],
             "poi_types": [],
-            "steps": [],
+            "singleton_terms": [],
+            "pair_terms": [],
+            "singleton_total": 0.0,
+            "pair_total": 0.0,
             "mu_full": 0.0,
             "total": 0.0,
             "normalized": 0.0,
         }
 
     x_clamped = [max(0.0, min(1.0, float(v))) for v in x]
-    order = sorted(range(n), key=lambda i: x_clamped[i])
-    x_sorted = [x_clamped[i] for i in order]
     poi_types = [q.poi_type for q in SERVICE_POI_QUERIES[service]]
+    mobius = SERVICE_MOBIUS_M[service]
+    pairwise = SERVICE_PAIRWISE_M.get(service, {})
 
-    steps = []
-    total = 0.0
-    prev = 0.0
-    for j in range(n):
-        tail_indices = order[j:]
-        tail = [poi_types[i] for i in tail_indices]
-        tail_cap = float(cap(tail, service))
-        delta = float(x_sorted[j] - prev)
-        term = delta * tail_cap
-        total += term
-        steps.append(
+    singleton_terms = []
+    pair_terms = []
+    singleton_total = 0.0
+    pair_total = 0.0
+
+    for i in range(n):
+        poi_i = poi_types[i]
+        a_i = float(mobius[poi_i])
+        term = a_i * x_clamped[i]
+        singleton_total += term
+        singleton_terms.append(
             {
-                "j": j,
-                "index": int(order[j]),
-                "value": float(x_sorted[j]),
-                "prev": float(prev),
-                "delta": float(delta),
-                "tail": tail,
-                "capacity": tail_cap,
+                "index": i,
+                "poi_type": poi_i,
+                "mobius": a_i,
+                "value": float(x_clamped[i]),
                 "term": float(term),
-                "running_total": float(total),
             }
         )
-        prev = x_sorted[j]
+        for j in range(i + 1, n):
+            poi_j = poi_types[j]
+            pair = (poi_i, poi_j) if poi_i < poi_j else (poi_j, poi_i)
+            interaction = float(pairwise.get(pair, 0.0))
+            if not interaction:
+                # Non-interacting pairs contribute nothing; omitted to keep output readable.
+                continue
+            weaker = min(x_clamped[i], x_clamped[j])
+            term = interaction * weaker
+            pair_total += term
+            pair_terms.append(
+                {
+                    "pair": [poi_i, poi_j],
+                    "interaction": interaction,
+                    "min_value": float(weaker),
+                    "term": float(term),
+                }
+            )
 
-    mu_full = float(cap(poi_types, service))
-    normalized = 0.0 if mu_full <= 0.0 else total / mu_full
+    total = singleton_total + pair_total
     return {
         "service": service,
         "input": [float(v) for v in x_clamped],
-        "sorted_indices": [int(i) for i in order],
-        "sorted_values": [float(v) for v in x_sorted],
         "poi_types": list(poi_types),
-        "steps": steps,
-        "mu_full": float(mu_full),
+        "singleton_terms": singleton_terms,
+        "pair_terms": pair_terms,
+        "singleton_total": float(singleton_total),
+        "pair_total": float(pair_total),
+        "mu_full": float(cap(poi_types, service)),
         "total": float(total),
-        "normalized": float(max(0.0, min(1.0, normalized))),
+        "normalized": float(max(0.0, min(1.0, total))),
     }
 
 

@@ -633,6 +633,20 @@ def _hide_gpkg_layer(gpkg_path: Path, table_name: str) -> None:
     try:
         conn.execute("DELETE FROM gpkg_contents WHERE table_name = ?", (table_name,))
         conn.execute("DELETE FROM gpkg_geometry_columns WHERE table_name = ?", (table_name,))
+        # GDAL's GPKG driver still lists unregistered tables (LIST_ALL_TABLES=AUTO) unless
+        # the file carries its aspatial-extension marker, so add it: QGIS imports then show
+        # only registered layers. GDAL readers of the hidden table pass LIST_ALL_TABLES=YES;
+        # plain sqlite3 readers are unaffected.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS gpkg_extensions (table_name TEXT, column_name TEXT, "
+            "extension_name TEXT NOT NULL, definition TEXT NOT NULL, scope TEXT NOT NULL, "
+            "CONSTRAINT ge_tce UNIQUE (table_name, column_name, extension_name))"
+        )
+        conn.execute(
+            "INSERT INTO gpkg_extensions (table_name, column_name, extension_name, definition, scope) "
+            "SELECT NULL, NULL, 'gdal_aspatial', 'http://gdal.org/geopackage_aspatial.html', 'read-write' "
+            "WHERE NOT EXISTS (SELECT 1 FROM gpkg_extensions WHERE extension_name = 'gdal_aspatial')"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -675,7 +689,13 @@ def _create_service_grid_views(gpkg_path: Path) -> list[str]:
         # grid_mean_<capability> columns; service views from grid_mean_service_*.
         view_specs: list[tuple[str, str, str]] = []
         for column in columns:
-            if column.startswith("grid_mean_service_"):
+            if column.startswith("grid_mean_service_mean_"):
+                view_specs.append((
+                    "service_mean_" + column[len("grid_mean_service_mean_"):],
+                    column,
+                    "Arithmetic mean of constituent services for scenario evaluation",
+                ))
+            elif column.startswith("grid_mean_service_"):
                 view_specs.append((
                     "service_" + column[len("grid_mean_service_"):],
                     column,

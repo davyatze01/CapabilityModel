@@ -59,14 +59,14 @@ DEBUG_REPORT_ONLY = False
 ROBUSTNESS_REPORT = False
 # If true, main will generate a dashboard that evaluates the model's sensitivity when changing the parameters
 SENSITIVITY_REPORT = False
-# PAID_POI_AFFORDABILITY: general affordability multiplier u(y) applied to paid poi_types
-#   (core.profiles.PAID_POI_TYPES) — e.g. 0.7 discounts every paid POI's contribution to
-#   accessibility by 30%, same mechanism scenarios.py's personas use. None = baseline (1.0,
-#   no discount). Free/public POIs are always u=1 regardless of this knob. Does NOT bucket
-#   the artifact namespace like POI_RADIUS_KM does, and the accessibility-matrix cache's
-#   signature doesn't account for this value (see core.profiles.Profile.affordability) —
-#   delete artifacts/<slug>/ before a run where you change this, per project convention.
-PAID_POI_AFFORDABILITY: float | None = 1
+# PAID_POI_AFFORDABILITY_BY_CITY: affordability multiplier u(y) for paid poi_types
+#   (core.profiles.PAID_POI_TYPES), per study city -- e.g. 0.7 discounts every paid POI's
+#   contribution to accessibility by 30%. Used by every run of that city (main, scenarios'
+#   baseline/disruption passes, sensitivity sweep); personas with their own affordability
+#   (student/elderly) override it. Cities not listed: 1.0. Free/public POIs are always u=1.
+#   The accessibility-matrix cache's signature doesn't account for this value -- delete
+#   artifacts/<slug>/ before a run where you change it, per project convention.
+PAID_POI_AFFORDABILITY_BY_CITY: dict[str, float] = {"cagliari": 1.0, "paris": 0.7}
 
 def _reexec_under_run_safe_if_needed() -> None:
     """Re-run this entrypoint through run_safe.sh when not already in a cgroup scope.
@@ -181,15 +181,6 @@ def main():
         return
 
     ctx = build_context(cfg)
-    if PAID_POI_AFFORDABILITY is not None:
-        from core.profiles import Profile
-        ctx.profile = Profile(
-            key="paid_poi_affordability_override",
-            enabled_modes=frozenset({"walk", "bike", "drive", "bus"}),
-            walk_speed_kmh=cfg.speed_walk_kmh,
-            affordability=PAID_POI_AFFORDABILITY,
-            canteen_utility=1.0,
-        )
     snap = None
 
     loaded = load_impedance_bundle(ctx)
@@ -268,6 +259,13 @@ def main():
         write_impedance_bundle(ctx, bus, non_bus)
         print(f"[Artifact] Wrote impedance bundle: {cfg.impedance_artifact_path}", flush=True)
 
+    # Accessibility only writes the per-node POI files the score report needs if
+    # pois_used.gpkg already exists, but the pre-routing export above runs only when no
+    # cached impedance bundle was found -- create it here when the bundle skipped it.
+    if not light_output and not os.path.exists(cfg.poi_export_geopackage_path):
+        print("[Stage] POI Export (pre-accessibility, cached impedance bundle)", flush=True)
+        generate_poi_exports(ctx)
+
     # We compute impedances, decay and accessibilities for each Origin-Destination pair based on the routing results.
     # The Accessibility values are then aggregated for POI type.
     print("[Stage] Accessibility", flush=True)
@@ -343,6 +341,15 @@ def main():
         run_upstream()
         print("\n[Stage] Generating sensitivity HTML dashboard...", flush=True)
         build_sensitivity_report()
+
+    if ROBUSTNESS_REPORT or SENSITIVITY_REPORT:
+        from exports.sensitivity_bundle import write_raw_data_zip
+        from analysis.sensitivity_analysis import default_experiment_csv
+        zip_path = write_raw_data_zip(
+            cfg.artifact_slug, default_experiment_csv(cfg.artifact_slug),
+            robustness=ROBUSTNESS_REPORT, sensitivity=SENSITIVITY_REPORT,
+        )
+        print(f"[Output] Robustness/sensitivity raw data zip: {zip_path}", flush=True)
 
 if __name__ == "__main__":
     from routing.public_transport_routing_stage import RscriptNotFoundError

@@ -1064,8 +1064,9 @@ function getHeavyData(hexId){
 
 // ---- Map ----
 const map = L.map("map");
-L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{
-  maxZoom:19,attribution:"&copy; OpenStreetMap contributors"
+L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",{
+  maxZoom:20,maxNativeZoom:16,
+  attribution:"Tiles &copy; Esri &mdash; Esri, HERE, Garmin, &copy; OpenStreetMap contributors"
 }).addTo(map);
 
 let activeHexId = null;
@@ -1271,17 +1272,23 @@ function renderChain(chain){
         </tr>`).join("");
       p3.body.insertAdjacentHTML("beforeend",`<table><thead><tr><th>POI type</th><th>Accessibility input</th></tr></thead><tbody>${inputRows}</tbody></table>`);
 
-      const stepRows = sc.steps.map(step => `
+      // 2-additive Choquet, Mobius form: C(x) = sum a_i*x_i + sum I_ij*min(x_i, x_j)
+      const termRow = (label, coef, val, term) => `
         <div class="choquet-step">
-          <span style="width:22px;color:#6b7280">${step.j}</span>
-          <span style="width:120px"><b>${sc.poi_types[step.index]}</b></span>
-          <span style="width:60px">val=${step.value.toFixed(3)}</span>
-          <span style="width:50px">Δ=${step.delta.toFixed(3)}</span>
-          <span style="width:60px">μ(tail)=${step.capacity.toFixed(3)}</span>
-          <span style="width:60px">term=${step.term.toFixed(4)}</span>
-          <span style="color:#6b7280">tail=[${step.tail.join(",")}]</span>
-        </div>`).join("");
-      p3.body.insertAdjacentHTML("beforeend",`<div style="margin:8px 0">${stepRows}</div>`);
+          <span style="width:220px"><b>${label}</b></span>
+          <span style="width:80px">coef=${coef.toFixed(3)}</span>
+          <span style="width:70px">x=${val.toFixed(3)}</span>
+          <span style="width:80px">term=${term.toFixed(4)}</span>
+        </div>`;
+      const singletonRows = (sc.singleton_terms || []).map(t =>
+        termRow(t.poi_type, t.mobius, t.value, t.term)).join("");
+      const pairRows = (sc.pair_terms || []).map(t =>
+        termRow(`${t.pair[0]} × ${t.pair[1]}`, t.interaction, t.min_value, t.term)).join("");
+      p3.body.insertAdjacentHTML("beforeend",`
+        <div style="margin:8px 0">
+          <div class="muted">Singletons a<sub>i</sub>·x<sub>i</sub> (Σ=${(sc.singleton_total ?? 0).toFixed(4)})</div>${singletonRows}
+          <div class="muted" style="margin-top:6px">Interactions I<sub>ij</sub>·min(x<sub>i</sub>,x<sub>j</sub>) (Σ=${(sc.pair_total ?? 0).toFixed(4)})</div>${pairRows || '<div class="muted">none</div>'}
+        </div>`);
     });
   }
   el.appendChild(p3.panel);

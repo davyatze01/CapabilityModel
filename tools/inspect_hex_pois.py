@@ -493,9 +493,10 @@ def _write_html_map(
   ></script>
   <script>
     const map = L.map("map");
-    L.tileLayer("https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
-      maxZoom: 19,
-      attribution: "&copy; OpenStreetMap contributors"
+    L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{{z}}/{{y}}/{{x}}", {{
+      maxZoom: 20,
+      maxNativeZoom: 16,
+      attribution: "Tiles &copy; Esri &mdash; Esri, HERE, Garmin, &copy; OpenStreetMap contributors"
     }}).addTo(map);
 
     const poiData = {poi_js};

@@ -128,8 +128,10 @@ def _blend_capacity(rows: list[dict], blend: float) -> None:
         values = [float(v) for v in ast.literal_eval(row["choquet_capacity"])]
         n = len(values)
         uniform = 1.0 / n
-        blended = [round((1 - blend) * v + blend * uniform, 4) for v in values]
-        row["choquet_capacity"] = "[" + ", ".join(f"{v:g}" for v in blended) + "]"
+        blended = [(1 - blend) * v + blend * uniform for v in values]
+        rounded = [round(v, 4) for v in blended[:-1]]
+        rounded.append(1.0 - sum(rounded))
+        row["choquet_capacity"] = "[" + ", ".join(repr(v) for v in rounded) + "]"
 
 
 def _exaggerate_capacity(rows: list[dict], factor: float) -> None:
@@ -144,8 +146,10 @@ def _exaggerate_capacity(rows: list[dict], factor: float) -> None:
         uniform = 1.0 / n
         exaggerated = [max(0.0, uniform + (1 + factor) * (v - uniform)) for v in values]
         total = sum(exaggerated)
-        normalized = [round(v / total, 4) for v in exaggerated]
-        row["choquet_capacity"] = "[" + ", ".join(f"{v:g}" for v in normalized) + "]"
+        normalized = [v / total for v in exaggerated]
+        rounded = [round(v, 4) for v in normalized[:-1]]
+        rounded.append(1.0 - sum(rounded))
+        row["choquet_capacity"] = "[" + ", ".join(repr(v) for v in rounded) + "]"
 
 
 
@@ -234,20 +238,21 @@ def _write_csv(path: Path, fieldnames: list[str], rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def _sha1(path: Path) -> str:
-    return hashlib.sha1(path.read_bytes()).hexdigest()
-
-
 def _config_hash() -> str:
     """sha1 of poi_types.csv + services.csv concatenated -- identifies the exact
     config state a cached sweep was computed against."""
+    from core.config import PipelineConfig
+    from core.profiles import city_paid_poi_affordability
+
     h = hashlib.sha1()
     for name in MUTABLE_CSVS:
         h.update((CONFIG_DIR / name).read_bytes())
+    # Workers apply the city's paid-POI affordability, so a change must invalidate the cache.
+    h.update(f"affordability={city_paid_poi_affordability(PipelineConfig().study_city):g}".encode())
     return h.hexdigest()
 
 
-# ── Worker: runs inside the subprocess with mutated CSVs in place ────────────
+# ── Worker: runs inside the subprocess with its own variant CSVs (see run_configs) ──
 
 def run_worker(config_name: str) -> int:
     """Run accessibility + service stages into the per-config workspace."""
@@ -368,15 +373,9 @@ def run_configs(only: str | None) -> None:
             shutil.rmtree(_work_root() / name, ignore_errors=True)
     hash_path.write_text(current_hash)
 
-    backup_dir = _work_root() / "_config_backup"
-    backup_dir.mkdir(exist_ok=True)
-
-    pristine: dict[str, tuple[list[str], list[dict], str]] = {}
-    for name in MUTABLE_CSVS:
-        src = CONFIG_DIR / name
-        shutil.copy2(src, backup_dir / name)
-        fieldnames, rows = _read_csv(src)
-        pristine[name] = (fieldnames, rows, _sha1(src))
+    pristine: dict[str, tuple[list[str], list[dict]]] = {
+        name: _read_csv(CONFIG_DIR / name) for name in MUTABLE_CSVS
+    }
 
     # Freeze the candidate node/graph set across the whole sweep: get_global_radius_m()
     # derives its buffer from poi_types.csv's decay_coefficient, which the decay axis
@@ -388,56 +387,53 @@ def run_configs(only: str | None) -> None:
     from utils.services import get_global_radius_m
     baseline_radius_m = get_global_radius_m(PipelineConfig())
 
-    def restore() -> None:
-        for name in MUTABLE_CSVS:
-            shutil.copy2(backup_dir / name, CONFIG_DIR / name)
-        for name in MUTABLE_CSVS:
-            if _sha1(CONFIG_DIR / name) != pristine[name][2]:
-                raise RuntimeError(f"config/{name} restore verification FAILED — check {backup_dir}")
+    for config_name, mutation in CONFIGS.items():
+        if only and config_name != only:
+            continue
+        done_marker = _work_root() / config_name / "service_scores.csv"
+        if done_marker.exists():
+            print(f"[skip] {config_name}: already computed ({done_marker})", flush=True)
+            continue
 
-    try:
-        for config_name, mutation in CONFIGS.items():
-            if only and config_name != only:
-                continue
-            done_marker = _work_root() / config_name / "service_scores.csv"
-            if done_marker.exists():
-                print(f"[skip] {config_name}: already computed ({done_marker})", flush=True)
-                continue
-
-            # Start from pristine CSVs, apply this config's single mutation.
-            restore()
-            if mutation is not None:
-                csv_name, fn = mutation
-                fieldnames, rows, _ = pristine[csv_name]
+        # This config's private copy of both CSVs, handed to the worker via env vars.
+        # config/ itself is never written, so a concurrent main.py/scenarios.py run can't
+        # import a perturbed variant mid-sweep (2026-10-01: scenarios silently ran on
+        # decay_x0.8). Unmutated CSVs are byte copies so worker config signatures match.
+        variant_dir = _work_root() / config_name / "_config"
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        for name in MUTABLE_CSVS:
+            if mutation is not None and mutation[0] == name:
+                fieldnames, rows = pristine[name]
                 rows_copy = [dict(r) for r in rows]
-                fn(rows_copy)
-                _write_csv(CONFIG_DIR / csv_name, fieldnames, rows_copy)
-                print(f"[config] {config_name}: mutated config/{csv_name}", flush=True)
+                mutation[1](rows_copy)
+                _write_csv(variant_dir / name, fieldnames, rows_copy)
+                print(f"[config] {config_name}: mutated {variant_dir / name}", flush=True)
+            else:
+                shutil.copyfile(CONFIG_DIR / name, variant_dir / name)
 
-            _check_disk_space()
+        _check_disk_space()
 
-            env_overrides = ENV_CONFIGS.get(config_name)
-            if env_overrides:
-                print(f"[config] {config_name}: worker env {env_overrides}", flush=True)
-            worker_env = {
-                **os.environ, WORKER_ENV_VAR: config_name,
-                "CAP_POI_RADIUS_M": str(baseline_radius_m),
-                **(env_overrides or {}),
-            }
+        env_overrides = ENV_CONFIGS.get(config_name)
+        if env_overrides:
+            print(f"[config] {config_name}: worker env {env_overrides}", flush=True)
+        worker_env = {
+            **os.environ, WORKER_ENV_VAR: config_name,
+            "CAP_POI_RADIUS_M": str(baseline_radius_m),
+            "CAP_POI_TYPES_CSV": str((variant_dir / "poi_types.csv").resolve()),
+            "CAP_SERVICES_CSV": str((variant_dir / "services.csv").resolve()),
+            **(env_overrides or {}),
+        }
 
-            t0 = time.time()
-            print(f"[run] {config_name}: launching stage subprocess...", flush=True)
-            result = subprocess.run(
-                [sys.executable, __file__],
-                timeout=UPSTREAM_CONFIG_TIMEOUT_S,
-                env=worker_env,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(f"config {config_name} failed (exit {result.returncode}) — aborting sweep.")
-            print(f"[run] {config_name}: done in {(time.time() - t0) / 60:.1f} min", flush=True)
-    finally:
-        restore()
-        print("[config] pristine CSVs restored and verified.", flush=True)
+        t0 = time.time()
+        print(f"[run] {config_name}: launching stage subprocess...", flush=True)
+        result = subprocess.run(
+            [sys.executable, __file__],
+            timeout=UPSTREAM_CONFIG_TIMEOUT_S,
+            env=worker_env,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"config {config_name} failed (exit {result.returncode}) — aborting sweep.")
+        print(f"[run] {config_name}: done in {(time.time() - t0) / 60:.1f} min", flush=True)
 
 
 # ── Comparison / report ──────────────────────────────────────────────────────

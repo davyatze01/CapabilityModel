@@ -1,12 +1,39 @@
-"""Generic line-geometry helpers: merging connected line-like ways into components and
-sampling points along them at a fixed spacing. Used by stages/snapping_stage.py to turn
-any line-like POI's raw OSM vertices into evenly-spaced access-point candidates.
+"""Generic line-geometry helpers: rebuilding line parts from a POI item, merging connected
+line-like ways into components, and sampling points along them at a fixed spacing. Used by
+stages/snapping_stage.py to turn any line-like POI's raw OSM vertices into evenly-spaced
+access-point candidates, and by utils/graphml.py to split the coastline into point POIs.
 """
 
 import geopandas as gpd
 import shapely.ops
-from shapely.geometry import Point
+from shapely.geometry import LineString, Point
 from shapely.geometry.base import BaseGeometry
+
+
+def line_parts_from_item(geom):
+    """Return line-like parts (EPSG:4326 LineStrings) of this item's geometry, if any."""
+    if isinstance(geom, dict):
+        gtype = geom.get("geometry_type")
+        if gtype == "MultiLineString":
+            parts = geom.get("line_parts") or []
+            return [
+                LineString([(float(lon), float(lat)) for lat, lon in part])
+                for part in parts
+                if isinstance(part, list) and len(part) > 1
+            ]
+        if gtype != "LineString":
+            return []
+        vertices_raw = geom.get("snap_vertices")
+        if not isinstance(vertices_raw, list) or len(vertices_raw) < 2:
+            return []
+        return [LineString([(float(v[1]), float(v[0])) for v in vertices_raw])]
+    if not isinstance(geom, BaseGeometry):
+        return []
+    if geom.geom_type == "LineString":
+        return [geom]
+    if geom.geom_type == "MultiLineString":
+        return list(geom.geoms)
+    return []
 
 
 def merge_connected_lines(lines: list[BaseGeometry]):

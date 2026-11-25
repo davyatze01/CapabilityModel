@@ -353,6 +353,13 @@ def load_impedance_bundle(
             flush=True,
         )
         return None
+    if int(man["non_bus_cache_schema_version"]) != int(cfg.non_bus_cache_schema_version):
+        print(
+            f"[Artifact] Bundle non_bus_cache_schema_version={man['non_bus_cache_schema_version']} != "
+            f"{cfg.non_bus_cache_schema_version}; recomputing.",
+            flush=True,
+        )
+        return None
     if cfg.enable_subway and not man["has_subway"]:
         print(
             "[Artifact] Bundle has no subway data but subway is enabled; recomputing.",
